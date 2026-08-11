@@ -65,7 +65,28 @@ before the worker runs, so the count is *accepted* calls only and a round's
 true offered load is not visible here. A round with zero accepted extends is
 rendered in red and says so explicitly, rather than showing a blank.
 
-### 4. Shred path — leader vs our simulator
+### 4. Program cache, per round
+
+The seven `program_cache_*` fields ride on the same `sim-extend` point as
+`index`, so they are round-attributed structurally — no timestamp matching.
+
+Two kinds of number, deliberately not one row of sums:
+
+- **Costs** — `program_cache_us`, `compile_us`, `clone_us` — are per extend and
+  add up across the round. Like the other stage timings they accumulate across
+  replay workers, so they are CPU time and can exceed wall clock. Read them
+  against `exec sum`; never subtract them from `body`.
+- **Sizes** — `entries`, `entries_cloned` — are snapshots taken *inside* one
+  extend (cache length at fork time, and at end of batch), so summing them
+  would be meaningless. Reported as maxima.
+
+The cache fork is copy-on-write and fires only when an admitted order actually
+**modifies** a program — a deploy or upgrade landing in the batch. So `forks`
+and `clone us` are 0 on almost every round; a non-zero value is the signal, not
+the baseline. Compiles and forks raise a pill in the header and turn their
+cells amber.
+
+### 5. Shred path — leader vs our simulator
 
 Per slot, when each side saw it: slot complete, bank frozen, optimistic
 confirmed, with the sim-minus-leader delta. Positive (we were later) is amber,

@@ -297,7 +297,10 @@ def slot_extends(slot, stamps):
           ).strftime("%Y-%m-%dT%H:%M:%SZ")
     cols, rows = influx(
         'SELECT "index","body_us","queue_us","orders","applied","status",'
-        '"exec_wall_us" '
+        '"exec_wall_us","program_cache_us","program_cache_clone_us",'
+        '"program_cache_compile_us","program_cache_compiles",'
+        '"program_cache_entries","program_cache_entries_cloned",'
+        '"program_cache_loaded" '
         f'FROM "sim-extend" WHERE slot = {int(slot)} '
         + "".join(f"AND \"host_id\" != '{h}' " for h in OFF_CHAIN)
         + f"AND time >= '{lo}' AND time <= '{hi}'")
@@ -315,7 +318,14 @@ def slot_extends(slot, stamps):
             "t": _rfc3339_ns(r[at["time"]]), "body": num("body_us"),
             "queue": num("queue_us"), "orders": num("orders"),
             "applied": num("applied"), "status": num("status"),
-            "exec": num("exec_wall_us")})
+            "exec": num("exec_wall_us"),
+            "pc_us": num("program_cache_us"),
+            "pc_clone_us": num("program_cache_clone_us"),
+            "pc_compile_us": num("program_cache_compile_us"),
+            "pc_compiles": num("program_cache_compiles"),
+            "pc_entries": num("program_cache_entries"),
+            "pc_cloned": num("program_cache_entries_cloned"),
+            "pc_loaded": num("program_cache_loaded")})
     out = {}
     for idx, calls in buckets.items():
         calls.sort(key=lambda c: c["t"])
@@ -335,6 +345,16 @@ def slot_extends(slot, stamps):
                 ((EXT_STATUS.get(s, str(s)),
                   sum(1 for c in calls if c["status"] == s))
                  for s in {c["status"] for c in calls}), key=lambda kv: -kv[1]),
+            # Program cache. Costs are per-call and sum; sizes are snapshots
+            # taken inside one call and do not, so they are reported as maxima.
+            "pc_us": sum(c["pc_us"] for c in calls),
+            "pc_compile_us": sum(c["pc_compile_us"] for c in calls),
+            "pc_compiles": sum(c["pc_compiles"] for c in calls),
+            "pc_loaded": sum(c["pc_loaded"] for c in calls),
+            "pc_clone_us": sum(c["pc_clone_us"] for c in calls),
+            "pc_forks": sum(1 for c in calls if c["pc_clone_us"] or c["pc_cloned"]),
+            "pc_cloned_max": max(c["pc_cloned"] for c in calls),
+            "pc_entries_max": max(c["pc_entries"] for c in calls),
         }
     return out
 
@@ -570,6 +590,57 @@ def detail_table(title, items, show_won=False):
             f"<table><thead>{head}</thead><tbody>{body}</tbody></table></div>")
 
 
+def pcache_table(stat):
+    """Program cache, per round.
+
+    Two kinds of number, which is why they are not one row of sums:
+
+      costs   program_cache_us, compile_us and clone_us are per extend and add
+              up across the round. The first two are accumulated across replay
+              workers, so like the other stage timings they are CPU time and
+              can exceed wall clock -- read them against exec sum, never
+              subtract them from body.
+
+      sizes   entries and entries_cloned are snapshots taken inside a single
+              extend (cache length at fork time, and at end of batch), so
+              summing them would be meaningless. Reported as maxima.
+
+    The fork is copy-on-write and only happens when an admitted order actually
+    MODIFIES a program -- a deploy or upgrade landing in the batch. So `forks`
+    is normally 0 and clone cost with it; a non-zero fork is the interesting
+    case, not the default one."""
+    if stat is None:
+        return ""
+    hot = stat["pc_compiles"] > 0 or stat["pc_forks"] > 0
+    head = ("<tr><th class=n>cache us</th><th class=n>compiles</th>"
+            "<th class=n>compile us</th><th class=n>programs loaded</th>"
+            "<th class=n>forks</th><th class=n>clone us</th>"
+            "<th class=n>entries cloned</th><th class=n>entries</th></tr>")
+    cell = lambda v, warn=False: (
+        f"<td class='n m{' bad' if warn and v else ''}'>{v}</td>")
+    row = ("<tr>"
+           + cell(ms(stat["pc_us"]))
+           + cell(f"{stat['pc_compiles']:,}", warn=True)
+           + cell(ms(stat["pc_compile_us"]), warn=stat["pc_compiles"] > 0)
+           + cell(f"{stat['pc_loaded']:,}")
+           + cell(stat["pc_forks"], warn=True)
+           + cell(ms(stat["pc_clone_us"]), warn=stat["pc_forks"] > 0)
+           + cell(f"{stat['pc_cloned_max']:,}")
+           + cell(f"{stat['pc_entries_max']:,}")
+           + "</tr>")
+    note = ("<span class='note'>costs are per-extend sums and accumulate across "
+            "replay workers, so they are CPU time, not wall &middot; entries and "
+            "entries cloned are snapshots inside one extend, so they are maxima "
+            "&middot; a fork happens only when an admitted order modifies a "
+            "program, so 0 is the normal case</span>")
+    return ('<div class="dtl"><div class="dtlhead">program cache'
+            + ("<span class='warnpill'>compiled</span>" if stat["pc_compiles"]
+               else "")
+            + ("<span class='warnpill'>forked</span>" if stat["pc_forks"] else "")
+            + note + "</div>"
+            f"<table><thead>{head}</thead><tbody>{row}</tbody></table></div>")
+
+
 def rounds_html(slot, sel_round):
     try:
         data = slot_data(slot)
@@ -611,6 +682,7 @@ def rounds_html(slot, sel_round):
         if open_:
             detail = ('<div class="detail">'
                       + extend_table(stat)
+                      + pcache_table(stat)
                       + detail_table(f"our offers &mdash; {len(r['offers'])}", r["offers"])
                       + detail_table("winner miniblock", [w] if w else [], show_won=True)
                       + "</div>")
@@ -717,6 +789,9 @@ a.rnd.open{border-color:#14b8a6;background:#0f1a22;border-bottom-left-radius:0;
 .chev{margin-left:auto;color:#5b6b80;font-family:ui-monospace,Menlo,monospace}
 .dtlhead .note{text-transform:none;letter-spacing:0;color:#4d5c70;font-size:10px;
   margin-left:10px}
+.warnpill{margin-left:8px;color:#fbbf24;font-size:9.5px;letter-spacing:.04em;
+  border:1px solid #78350f;background:#78350f22;border-radius:4px;padding:1px 6px}
+.detail .bad{color:#fbbf24}
 
 /* shred-path panel */
 .panel{margin:0 28px 14px;background:#0c141b;border:1px solid #1e2937;
