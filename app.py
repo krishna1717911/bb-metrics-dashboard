@@ -1,63 +1,61 @@
 #!/usr/bin/env python3
 """
-simbench - the sim-extend measurement, viewed through its slot column.
+simbench — rebuild, step 1: the produced-slot strip.
 
-InfluxDB only. Standard library only: no pip installs, no CDN, no build step.
+Every slot we actually produced the block for, newest on the left, scrolling
+right into the past. Nothing is selected and nothing is plotted yet; panels get
+added back one at a time.
 
     python3 app.py                 # http://127.0.0.1:8899
     python3 app.py --port 9000
-    INFLUX_PASS=... python3 app.py
 
-A slot only exists here if the builder registered it in a leader window
-(state.rs:257) AND the connector announced its parent (state.rs:175) AND that
-parent froze locally (state.rs:279). No context, no datapoint - so every slot
-below is one this simulator actually worked.
+The InfluxDB client is kept below so the next steps can use it; right now only
+ClickHouse is read, for the produced-slot list.
 """
 
 import argparse
 import base64
+import datetime as dt
 import html
 import json
-import math
 import os
 import socket
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-# ---------------------------------------------------------------- influx client
+# ------------------------------------------------------------------- clients
 
-def _require(name, hint):
-    value = os.environ.get(name)
-    if not value:
-        raise SystemExit(
-            f"{name} is not set. {hint}\n"
-            "Copy .env.example to .env and fill it in, then:  set -a; . ./.env; set +a"
-        )
-    return value
-
-
-# Comma-separated; tried in order, so list a MagicDNS name and its IP fallback.
-INFLUX_HOSTS = [h.strip() for h in
-                _require("INFLUX_HOSTS", "comma-separated, e.g. INFLUX_HOSTS=host-a,host-b").split(",")
+# Comma-separated and tried in order, so a DNS name can carry an IP fallback.
+INFLUX_HOSTS = [h.strip() for h in os.environ.get("INFLUX_HOSTS", "").split(",")
                 if h.strip()]
 INFLUX_PORT = int(os.environ.get("INFLUX_PORT", "8086"))
 INFLUX_DB = os.environ.get("INFLUX_DB", "solana")
-INFLUX_USER = os.environ.get("INFLUX_USER", "metrics")  # read-only user
-INFLUX_PASS = _require("INFLUX_PASS", "read-only InfluxDB password.")
-MEASUREMENT = "sim-extend"
+INFLUX_USER = os.environ.get("INFLUX_USER", "")
+INFLUX_PASS = os.environ.get("INFLUX_PASS", "")
+
+CH_URL = os.environ.get("CH_URL", "")
+CH_USER = os.environ.get("CH_USER", "")
+CH_PASS = os.environ.get("CH_PASS", "")
+CH_DB = os.environ.get("CH_DB", "block_builder")
+CH_BUILDER = os.environ.get("CH_BUILDER", "")
 
 _auth = base64.b64encode(f"{INFLUX_USER}:{INFLUX_PASS}".encode()).decode()
 _good_host = None
 
 
-def influx(query):
-    """Run InfluxQL, returning (columns, rows). Sticks to the first host that answers."""
+def influx_series(query):
+    """Run InfluxQL and return every series.
+
+    One query can span several measurements and GROUP BY host_id, which yields
+    one series per (measurement, host) pair -- `name` and `tags` identify it.
+    Taking only series[0] would silently drop all but one host."""
     global _good_host
     hosts = ([_good_host] if _good_host else []) + [
-        h for h in INFLUX_HOSTS if h != _good_host
-    ]
+        h for h in INFLUX_HOSTS if h != _good_host]
     last = None
     for host in hosts:
         try:
@@ -70,32 +68,32 @@ def influx(query):
             result = payload["results"][0]
             if "error" in result:
                 raise RuntimeError(result["error"])
-            series = result.get("series")
-            if not series:
-                return [], []
-            return series[0]["columns"], series[0]["values"]
+            return result.get("series") or []
         except (urllib.error.URLError, socket.timeout, OSError) as err:
             last = err
-            continue
     raise RuntimeError(f"no influx host reachable ({last})")
 
 
-# --------------------------------------------------- clickhouse (drill-down only)
-# The main page is Influx-only. These two tables are consulted for the per-slot
-# detail view and one summary card, where "what did the builder actually offer,
-# and who won" is exactly the question.
-CH_URL = os.environ.get("CH_URL", "")  # blank disables the drill-down panels
-CH_USER = os.environ.get("CH_USER", "")
-CH_PASS = os.environ.get("CH_PASS", "")
-CH_DB = os.environ.get("CH_DB", "block_builder")
+def influx(query):
+    """Single-series convenience wrapper -> (columns, rows)."""
+    series = influx_series(query)
+    return (series[0]["columns"], series[0]["values"]) if series else ([], [])
+
+
+def clickhouse(sql):
+    """-> (columns, rows). No CTEs: bb_read is readonly=1 and WITH needs a temp table."""
+    qs = urllib.parse.urlencode({"user": CH_USER, "password": CH_PASS,
+                                 "database": CH_DB,
+                                 "query": sql + " FORMAT TabSeparatedWithNames"})
+    with urllib.request.urlopen(CH_URL + "?" + qs, timeout=120) as resp:
+        text = resp.read().decode()
+    lines = [ln for ln in text.split("\n") if ln]
+    if not lines:
+        return [], []
+    return lines[0].split("\t"), [ln.split("\t") for ln in lines[1:]]
 
 
 TRUEISH = {"1", "true", "True"}
-
-
-def ch_bool(v):
-    """won_by_us is Bool, which TabSeparated renders as true/false - not 1/0."""
-    return str(v).strip() in TRUEISH
 
 
 def ch_int(v, default=0):
@@ -106,738 +104,856 @@ def ch_int(v, default=0):
         return default
 
 
-def clickhouse(sql):
-    """-> (columns, rows). Raises if unconfigured; callers degrade the panel."""
-    if not CH_URL or not CH_PASS:
-        raise RuntimeError("CH_URL / CH_PASS not set - ClickHouse panels disabled")
-    qs = urllib.parse.urlencode(
-        {"user": CH_USER, "password": CH_PASS, "database": CH_DB,
-         "query": sql + " FORMAT TabSeparatedWithNames"}
-    )
-    with urllib.request.urlopen(CH_URL + "?" + qs, timeout=120) as resp:
-        text = resp.read().decode()
-    lines = [ln for ln in text.split("\n") if ln]
-    if not lines:
-        return [], []
-    return lines[0].split("\t"), [ln.split("\t") for ln in lines[1:]]
+# ------------------------------------------------------------ produced slots
+
+_cache = {"windows": None, "at": 0.0}
+
+WINDOW = 4  # a Solana leader window is four consecutive slots
 
 
-_host_cache = {"host": None, "at": 0.0}
+def window_of(slot):
+    return (slot // WINDOW) * WINDOW
 
 
-def active_host():
-    """host_id is the validator identity (validator/.../run/execute.rs:160), stamped on
-    every point. TELEMETRY_MAP.md: always bind it - several nodes write the same
-    measurement names. Pick whichever wrote most recently."""
+def produced_windows(days=30):
+    """Contested slots folded into their leader windows, newest window first.
+
+    A leader owns four consecutive slots, so four rows in the strip were always
+    four views of one assignment. We fold them into one entry keyed by the
+    window's first slot and keep the individual slots for the expansion.
+
+    Scope is every slot we *competed* in — at least one kind='selected' offer —
+    not only the ones we produced. Winning is rare and connector-specific: over
+    30 days a single connector identity accounts for every slot we have ever
+    won, so a won-only list shows one leader and hides all the others.
+
+    `won_by_us` (set on kind='winner' rows) marks the ones we did produce.
+    `connector_identity` is the validator identity holding the window, i.e. the
+    leader."""
     import time as _time
 
     now = _time.time()
-    if _host_cache["host"] and now - _host_cache["at"] < 300:
-        return _host_cache["host"]
-    _, rows = influx(f'SHOW TAG VALUES FROM "{MEASUREMENT}" WITH KEY = "host_id"')
-    best, best_ts = None, ""
+    if _cache["windows"] is not None and now - _cache["at"] < 300:
+        return _cache["windows"]
+    _, rows = clickhouse(
+        "SELECT slot, toString(min(ts)) AS first_ts, any(connector_identity) AS leader, "
+        "       max(won_by_us) AS won, countIf(kind = 'selected') AS offers "
+        "FROM bifrost_miniblocks "
+        f"WHERE ts > now() - INTERVAL {int(days)} DAY "
+        f"  AND local_builder_id = '{CH_BUILDER}' "
+        "GROUP BY slot HAVING offers > 0 OR won ORDER BY slot DESC")
+    windows = {}
     for r in rows:
-        h = r[1]
-        _, last = influx(
-            f'SELECT "slot" FROM "{MEASUREMENT}" WHERE "host_id" = \'{h}\' '
-            "ORDER BY time DESC LIMIT 1"
-        )
-        if last and str(last[0][0]) > best_ts:
-            best, best_ts = h, str(last[0][0])
-    _host_cache.update(host=best, at=now)
-    return best
-
-
-# ---------------------------------------------------------------------- fetch
-
-RANGES = ["1h", "6h", "24h", "7d", "30d"]
-SLOT_PRESETS = [10, 25, 50, 100, 250, 500, 1000]
-SLOT_LOOKBACK = os.environ.get("SLOT_LOOKBACK", "30d")
-
-# measurement -> (fields, extra WHERE). age_us is a 500ms gauge that reads 0 while
-# the lane is idle, so it is only meaningful on busy samples.
-SOURCES = {
-    "sim-extend": (["slot", "body_us", "queue_us", "layer_count", "max_layer_width",
-                    "exec_wall_us", "execute_us", "load_us", "exec_pool",
-                    "account_cache_clone_us", "account_cache_entries_cloned",
-                    "program_cache_us", "program_cache_clone_us",
-                    "program_cache_entries", "program_cache_loaded"], None),
-    "sim-commit": (["slot", "body_us", "layer_count", "max_layer_width",
-                    "exec_wall_us", "execute_us", "load_us",
-                    "account_cache_clone_us", "account_cache_entries_cloned",
-                    "program_cache_us"], None),
-    "sim-mutation-lane": (["slot", "age_us"], "busy = 1"),
-}
-
-
-def fetch_one(measurement, fields, extra, rng, host):
-    where = f'time > now() - {rng}'
-    if host:
-        where += f" AND \"host_id\" = '{host}'"
-    if extra:
-        where += f" AND {extra}"
-    cols, rows = influx(
-        f'SELECT {", ".join(chr(34) + f + chr(34) for f in fields)} '
-        f'FROM "{measurement}" WHERE {where}'
-    )
-    if not rows:
-        return []
-    ix = {c: i for i, c in enumerate(cols)}
+        slot = int(r[0])
+        win = windows.setdefault(window_of(slot),
+                                 {"win": window_of(slot), "slots": [], "leaders": set()})
+        win["slots"].append({"slot": slot, "ts": r[1], "won": r[3] in TRUEISH,
+                             "offers": ch_int(r[4])})
+        if r[2]:
+            win["leaders"].add(r[2])
     out = []
-    for r in rows:
-        slot = r[ix["slot"]] if "slot" in ix else None
-        if not slot:
-            continue
-        point = {"time": r[0], "slot": int(slot)}
-        for f in fields:
-            if f != "slot":
-                point[f] = r[ix[f]] if (f in ix and r[ix[f]] is not None) else 0
-        out.append(point)
+    for win in (windows[k] for k in sorted(windows, reverse=True)):
+        win["slots"].sort(key=lambda s: s["slot"])
+        win["ts"] = min(s["ts"] for s in win["slots"])
+        win["won"] = sum(1 for s in win["slots"] if s["won"])
+        leaders = sorted(win.pop("leaders"))
+        # one leader per window is the invariant; surface a violation rather than
+        # silently picking one with any().
+        win["leader"] = leaders[0] if leaders else ""
+        win["leader_split"] = len(leaders) > 1
+        out.append(win)
+    _cache.update(windows=out, at=now)
     return out
 
 
-def fetch_all(rng, host):
-    data, errs = {}, []
-    for meas, (fields, extra) in SOURCES.items():
-        try:
-            data[meas] = fetch_one(meas, fields, extra, rng, host)
-        except Exception as exc:
-            data[meas] = []
-            errs.append(f"{meas}: {html.escape(str(exc))}")
-    return data, errs
+def copy_btn(value):
+    """A copy affordance that lives inside the chip's <a>. It is a span, not a
+    button, because a button nested in an anchor is invalid HTML; the click is
+    intercepted in JS so copying never navigates."""
+    return (f'<span class="cp" data-c="{html.escape(str(value), quote=True)}" '
+            f'role="button" tabindex="0" title="copy {html.escape(str(value))}"'
+            f'>copy</span>')
 
 
-def percentile(sorted_vals, p):
-    if not sorted_vals:
-        return 0.0
-    k = (len(sorted_vals) - 1) * p / 100.0
-    lo = int(math.floor(k))
-    hi = min(lo + 1, len(sorted_vals) - 1)
-    return sorted_vals[lo] + (sorted_vals[hi] - sorted_vals[lo]) * (k - lo)
+def short_id(identity):
+    """Chip-sized rendering. The full identity is always in the title attribute
+    and is printed in full in the expanded panel."""
+    return identity if len(identity) <= 14 else f"{identity[:6]}…{identity[-4:]}"
 
 
-def stats(vals):
-    if not vals:
+def epoch(ts_utc):
+    """Epoch seconds from a ClickHouse naive-UTC string, or None."""
+    try:
+        return dt.datetime.fromisoformat(ts_utc[:26]).replace(tzinfo=dt.UTC).timestamp()
+    except (ValueError, TypeError):
         return None
-    s = sorted(vals)
-    return {"n": len(s), "mean": sum(s) / len(s), "p50": percentile(s, 50),
-            "p90": percentile(s, 90), "p95": percentile(s, 95),
-            "p99": percentile(s, 99), "max": s[-1]}
 
 
-def slot_runs(slots):
-    """Consecutive slot numbers, collapsed. Solana leases leadership in blocks of
-    NUM_CONSECUTIVE_LEADER_SLOTS = 4, so the run-length histogram says whether we
-    see whole windows or fragments of them."""
-    runs, cur = [], None
-    for s in sorted(slots):
-        if cur is not None and s == cur[1] + 1:
-            cur = (cur[0], s)
+def age_html(ts_utc, suffix=" ago"):
+    """A live-ticking age. The rendered text is the server's answer at render
+    time and stands on its own without JS; `data-t` lets the browser keep
+    counting from there."""
+    at = epoch(ts_utc)
+    stamp = "" if at is None else f' data-t="{at:.0f}"'
+    return f'<span class="age"{stamp}>{ago(ts_utc)}{suffix}</span>'
+
+
+def ago(ts_utc):
+    """'3h 12m' style age. ClickHouse hands back naive UTC strings."""
+    at = epoch(ts_utc)
+    if at is None:
+        return "?"
+    secs = int(dt.datetime.now(dt.UTC).timestamp() - at)
+    if secs < 0:
+        return "now"
+    days, rem = divmod(secs, 86400)
+    hours, rem = divmod(rem, 3600)
+    mins, sec = divmod(rem, 60)
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {mins}m"
+    if mins:
+        return f"{mins}m {sec}s"
+    return f"{sec}s"
+
+
+# --------------------------------------------------------------------- rounds
+
+def slot_rounds(slot):
+    """One entry per auction round: our offers, and the winner echo.
+    Rounds where the relay never echoed a winner simply have winner=None."""
+    _, rows = clickhouse(
+        "SELECT index_in_slot, kind, toString(ts) AS ts, order_count, transaction_count, "
+        "       bundle_count, reward, execution_cost, selected_cu, is_last, "
+        "       won_by_us, uuid, connector_identity "
+        f"FROM bifrost_miniblocks WHERE slot = {int(slot)} ORDER BY index_in_slot, kind, ts")
+    rounds = {}
+    for r in rows:
+        idx = ch_int(r[0])
+        item = {"ts": r[2], "orders": ch_int(r[3]), "txs": ch_int(r[4]),
+                "bundles": ch_int(r[5]), "reward": ch_int(r[6]),
+                "exec_cost": ch_int(r[7]), "sel_cu": ch_int(r[8]),
+                "is_last": r[9] in TRUEISH, "won": r[10] in TRUEISH,
+                "uuid": r[11], "connector": r[12]}
+        slot_round = rounds.setdefault(idx, {"round": idx, "offers": [], "winner": None})
+        if r[1] == "winner":
+            slot_round["winner"] = item
         else:
-            if cur:
-                runs.append(cur)
-            cur = (s, s)
-    if cur:
-        runs.append(cur)
-    return runs
+            slot_round["offers"].append(item)
+    return [rounds[k] for k in sorted(rounds)]
 
 
-# ------------------------------------------------------------------- rendering
-
-W, H, PAD = 660, 200, 34
-WARN_US, CRIT_US = 25_000, 47_000
-BANDS = {
-    "queue_us": (1_000, 5_000),
-    # A worker count has no "too high"; never colour it.
-    "exec_pool": (1 << 30, 1 << 30),
-    # Overlays run a few thousand accounts; flag an order of magnitude past that.
-    "acct_entries": (20_000, 100_000),
-    "depth": (16, 48), "depth_commit": (16, 48),
-    "width": (8, 24), "width_commit": (8, 24),
-    "pc_entries": (1_000, 5_000), "pc_loaded": (1_000, 5_000),
-}
-COUNTS = {"depth", "depth_commit", "width", "width_commit",
-          "pc_entries", "pc_loaded", "exec_pool", "acct_entries"}
+def sol(lamports):
+    return f"{lamports/1e9:.6f}"
 
 
-def bands_for(key):
-    return BANDS.get(key, (WARN_US, CRIT_US))
+# ------------------------------------------------------- extends, per round
+
+# Status enum as the simulator reports it on the wire.
+EXT_STATUS = {0: "UNKNOWN", 1: "SUCCESS", 2: "NOT_READY", 3: "REJECTED",
+              4: "THROTTLED", 5: "UNAVAILABLE"}
 
 
-def band(v, key=None):
-    warn, crit = bands_for(key)
-    return "crit" if v > crit else ("hot" if v > warn else "")
+def _rfc3339_ns(stamp):
+    """InfluxDB RFC3339 -> epoch nanoseconds, kept integral so sub-ms survives."""
+    import calendar
+    date, _, rest = stamp.partition("T")
+    clock, _, frac = rest.rstrip("Z").partition(".")
+    y, mo, d = (int(x) for x in date.split("-"))
+    h, mi, s = (int(x) for x in clock.split(":"))
+    return (calendar.timegm((y, mo, d, h, mi, s, 0, 0, 0)) * 10**9
+            + int((frac + "0" * 9)[:9]))
 
 
-def fmt_us(v):
-    if v is None:
-        return "-"
-    if v >= 1_000_000:
-        return f"{v/1_000_000:.2f} s"
-    if v >= 1_000:
-        return f"{v/1_000:.1f} ms"
-    return f"{v:.0f} us"
+def _p50(values):
+    ordered = sorted(values)
+    return ordered[(len(ordered) - 1) // 2] if ordered else 0
 
 
-def fmt_val(v, key=None):
-    if key in COUNTS:
-        return f"{v:,.0f}" if float(v).is_integer() else f"{v:,.1f}"
-    return fmt_us(v)
+def slot_extends(slot, stamps):
+    """sim-extend points for one slot, bucketed by auction round.
+
+    Exact attribution, not a timestamp join: workers.rs emits
+    ("index", round.index_in_slot) on every point.
+
+    `slot` and `index` are FIELDS, not tags, so InfluxQL cannot GROUP BY them
+    and an unbounded predicate would walk the whole 720h retention -- hence the
+    window, taken from the slot's own miniblock timestamps.
+
+    Refused extends emit no datapoint at all: a THROTTLED request is rejected
+    before the worker runs, so `n` counts ACCEPTED calls only."""
+    if not stamps:
+        return {}
+    # The window is derived from ClickHouse timestamps but applied to InfluxDB,
+    # and the two stores are not always in step: normally within +-50ms, but
+    # an 11.5s divergence has been observed in practice. The margin has to
+    # cover that or the panel silently reports "0 ext" for a round that
+    # really did extend.
+    pad = dt.timedelta(seconds=150)
+    lo = (dt.datetime.fromisoformat(min(stamps)[:26]) - pad
+          ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    hi = (dt.datetime.fromisoformat(max(stamps)[:26]) + pad
+          ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    cols, rows = influx(
+        'SELECT "index","body_us","queue_us","orders","applied","status",'
+        '"exec_wall_us" '
+        f'FROM "sim-extend" WHERE slot = {int(slot)} '
+        + "".join(f"AND \"host_id\" != '{h}' " for h in OFF_CHAIN)
+        + f"AND time >= '{lo}' AND time <= '{hi}'")
+    if not rows:
+        return {}
+    at = {name: i for i, name in enumerate(cols)}
+    buckets = {}
+    for r in rows:
+        def num(field):
+            try:
+                return int(r[at[field]] or 0)
+            except (TypeError, ValueError):
+                return 0
+        buckets.setdefault(num("index"), []).append({
+            "t": _rfc3339_ns(r[at["time"]]), "body": num("body_us"),
+            "queue": num("queue_us"), "orders": num("orders"),
+            "applied": num("applied"), "status": num("status"),
+            "exec": num("exec_wall_us")})
+    out = {}
+    for idx, calls in buckets.items():
+        calls.sort(key=lambda c: c["t"])
+        body = [c["body"] for c in calls]
+        # a point is written AFTER the body finishes, so its time is the
+        # extend's completion; back out the first call's start to get the span
+        start = calls[0]["t"] - calls[0]["body"] * 1000
+        wall = max(1, (calls[-1]["t"] - start) // 1000)
+        out[idx] = {
+            "n": len(calls), "body_sum": sum(body), "body_max": max(body),
+            "body_p50": _p50(body), "queue_sum": sum(c["queue"] for c in calls),
+            "exec_sum": sum(c["exec"] for c in calls), "wall": wall,
+            "busy": 100.0 * sum(body) / wall,
+            "orders": sum(c["orders"] for c in calls),
+            "applied": sum(c["applied"] for c in calls),
+            "statuses": sorted(
+                ((EXT_STATUS.get(s, str(s)),
+                  sum(1 for c in calls if c["status"] == s))
+                 for s in {c["status"] for c in calls}), key=lambda kv: -kv[1]),
+        }
+    return out
 
 
-def histogram_svg(vals, key=None):
-    if not vals:
-        return '<div class="empty">no data</div>'
-    if key in COUNTS:
-        hi = max(vals) or 1
-        nb = min(40, max(6, int(hi)))
-        buckets = [0] * nb
-        for v in vals:
-            buckets[min(nb - 1, int(max(0, v - 1) / max(hi, 1) * nb))] += 1
+# ------------------------------------------- shred path: dogo vs simulator
 
-        def tick_at(f):
-            return fmt_val(1 + hi * f, key)
+# host_id is the validator identity. Several nodes write the same measurement
+# names, so anything unbound silently blends machines. These are deployment
+# facts, not code -- supply them via the environment.
+#   SHRED_LEADER_ID   the leader whose slots you are studying
+#   SHRED_SIM_ID      the host running the simulator
+#   SHRED_EXCLUDE_IDS comma-separated identities to drop entirely. Use this for
+#                     any node on a different chain or replaying history: such a
+#                     node can write the same measurement names at a wildly
+#                     different slot height and will pollute unpinned queries.
+DOGO = os.environ.get("SHRED_LEADER_ID", "")
+SIM = os.environ.get("SHRED_SIM_ID", "")
+OFF_CHAIN = [h.strip() for h in os.environ.get("SHRED_EXCLUDE_IDS", "").split(",")
+             if h.strip()]
+HOST_NAME = {DOGO: "leader", SIM: "our simulator"}
+# measurement -> (row label, sort key). The timestamp IS the datum for all four.
+SHRED_STAGES = [("retransmit-first-shred", "first shred received"),
+                ("shred_insert_is_full", "slot complete"),
+                ("bank_frozen", "bank frozen"),
+                ("optimistic_slot", "optimistic confirmed")]
+
+
+def slot_shreds(slot, stamps):
+    """Per-host shred-path timeline for one slot, in two queries.
+
+    Joined on `slot`, never on time: the stores are not always in step -- we
+    have seen ClickHouse run 11.5s ahead of three Influx hosts that agreed with
+    each other -- so a time join would be quietly wrong.
+
+    `retransmit-stage-slot-stats` is flushed minutes after the slot -- its row
+    time is meaningless, so it gets its own wide window and its `outset_timestamp`
+    field (epoch ms) is the real anchor."""
+    if not stamps:
+        return {}
+    lo = (dt.datetime.fromisoformat(min(stamps)[:26])
+          - dt.timedelta(seconds=150)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    hi = (dt.datetime.fromisoformat(max(stamps)[:26])
+          + dt.timedelta(seconds=150)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    series = influx_series(
+        'SELECT "slot","total_time_ms","num_repaired","num_recovered" FROM '
+        + ",".join(f'"{m}"' for m, _ in SHRED_STAGES)
+        + f" WHERE slot = {int(slot)} AND time >= '{lo}' AND time <= '{hi}' "
+        'GROUP BY "host_id"')
+    out = {}
+    for ser in series:
+        host = ser["tags"]["host_id"]
+        if host in OFF_CHAIN or host not in (DOGO, SIM):
+            continue
+        col = {name: i for i, name in enumerate(ser["columns"])}
+        row = ser["values"][0]
+
+        def val(name):
+            v = row[col[name]] if name in col else None
+            return None if v is None else int(v)
+
+        out.setdefault(ser["name"], {})[host] = {
+            "t": _rfc3339_ns(row[0]), "total_time_ms": val("total_time_ms"),
+            "num_repaired": val("num_repaired"), "num_recovered": val("num_recovered")}
+    return out
+
+
+def shred_html(slot, shreds):
+    """A stage x host grid, with the sim-minus-dogo delta called out."""
+    if not shreds:
+        return ('<div class="panel"><div class="dtlhead">shred path &mdash; dogo vs '
+                'our simulator</div><div class="none">no shred-path rows for this '
+                "slot</div></div>")
+    hosts = [h for h in (DOGO, SIM) if h]   # the leader and us, nothing else
+    head = ("<tr><th>stage</th>"
+            + "".join(f"<th class=n>{html.escape(HOST_NAME[h])}</th>" for h in hosts)
+            + "<th class=n>sim &minus; leader</th><th>detail</th></tr>")
+    body = []
+    for meas, label in SHRED_STAGES:
+        seen = {h: e for h, e in (shreds.get(meas) or {}).items() if h in hosts}
+        if not seen:                    # neither side reported this stage
+            continue
+        cells = []
+        for h in hosts:
+            e = seen.get(h)
+            cells.append(f"<td class='n m'>{dt.datetime.fromtimestamp(e['t']/1e9, dt.UTC).strftime('%H:%M:%S.%f')[:-3]}</td>"
+                         if e else "<td class='n m dim'>&mdash;</td>")
+        if DOGO in seen and SIM in seen:
+            d = (seen[SIM]["t"] - seen[DOGO]["t"]) / 1e6
+            cls = "bad" if d > 0 else "good"
+            delta = f"<td class='n m {cls}'>{d:+.1f} ms</td>"
+        else:
+            delta = "<td class='n m dim'>&mdash;</td>"
+        note = "; ".join(
+            f"{HOST_NAME[h]}: {e['total_time_ms']} ms"
+            + (f", {e['num_recovered']} recovered" if e.get("num_recovered") else "")
+            + (f", {e['num_repaired']} repaired" if e.get("num_repaired") else "")
+            for h in hosts if (e := seen.get(h)) and e.get("total_time_ms") is not None)
+        body.append(f"<tr><td class=m>{label}</td>{''.join(cells)}{delta}"
+                    f"<td class='m dim'>{note}</td></tr>")
+    if not body:
+        return ('<div class="panel"><div class="dtlhead">shred path &mdash; dogo vs '
+                'our simulator</div><div class="none">neither the leader nor our '
+                "simulator reported the shred path for this slot</div></div>")
+    missing = ""
+    if not any(DOGO in v for v in shreds.values()):
+        # A leader's metric submission can be intermittent while peers report
+        # continuously, so an empty leader column is a reporting gap rather
+        # than evidence of a slow node. Say so, rather than let it read as a
+        # measurement.
+        missing = ('<span class="warn">the leader wrote no shred metrics for this slot '
+                   "&mdash; its submission is intermittent, so this is a gap in "
+                   "reporting rather than a slow node</span>")
+    elif not any(SIM in v for v in shreds.values()):
+        missing = '<span class="note">our simulator host wrote nothing here</span>'
+    return ('<div class="panel"><div class="dtlhead">shred path &mdash; dogo vs our '
+            'simulator'
+            '<span class="note">positive delta = our simulator was later &middot; '
+            'joined on slot, not on time &middot; our host does not emit '
+            "retransmit-first-shred</span>" + missing + "</div>"
+            f"<table><thead>{head}</thead><tbody>{''.join(body)}</tbody></table></div>")
+
+
+# ------------------------------------------------ one fetch per slot, cached
+
+_slot_cache = {}                       # slot -> (monotonic_at, data)
+_slot_lock = threading.Lock()
+SLOT_CACHE_TTL = 300
+SLOT_CACHE_MAX = 64
+
+
+def slot_data(slot):
+    """Everything the rounds view needs for one slot: two queries, all rounds.
+
+    Neither query was ever per-round -- ClickHouse returns the whole slot and
+    is bucketed by index_in_slot here, and the InfluxDB one is bucketed by
+    `index`. What cost us was that opening a round re-ran both. This caches the
+    pair, so clicking through the rounds of a slot is free after the first hit.
+
+    A finished slot is immutable, so the TTL only matters for one still in
+    flight. A failed sim-extend fetch is not cached -- it should be retried,
+    not pinned for five minutes."""
+    now = time.monotonic()
+    with _slot_lock:
+        hit = _slot_cache.get(slot)
+        if hit and now - hit[0] < SLOT_CACHE_TTL:
+            return hit[1]
+
+    rounds = slot_rounds(slot)
+    stamps = [i["ts"] for r in rounds
+              for i in r["offers"] + ([r["winner"]] if r["winner"] else [])]
+    # The two InfluxDB queries are independent and each costs seconds against a
+    # 300s window, so run them together rather than back to back.
+    import concurrent.futures as cf
+
+    with cf.ThreadPoolExecutor(max_workers=2) as pool:
+        fut = {"ext": pool.submit(slot_extends, slot, stamps),
+               "shred": pool.submit(slot_shreds, slot, stamps)}
+    try:
+        extends, ext_err = fut["ext"].result(), None
+    except Exception as exc:
+        extends, ext_err = {}, str(exc)[:140]
+    try:
+        shreds, shred_err = fut["shred"].result(), None
+    except Exception as exc:
+        shreds, shred_err = {}, str(exc)[:140]
+    data = {"rounds": rounds, "extends": extends, "ext_err": ext_err,
+            "shreds": shreds, "shred_err": shred_err}
+
+    if ext_err is None and shred_err is None:
+        with _slot_lock:
+            if len(_slot_cache) >= SLOT_CACHE_MAX:
+                _slot_cache.pop(min(_slot_cache, key=lambda k: _slot_cache[k][0]),
+                                None)
+            _slot_cache[slot] = (now, data)
+    return data
+
+
+def ms(micros):
+    return f"{micros/1000:.1f} ms" if micros >= 1000 else f"{micros} &micro;s"
+
+
+def extend_table(stat):
+    if stat is None:
+        return ('<div class="dtl"><div class="dtlhead">mutation lane &mdash; '
+                'extends</div><div class="none">no sim-extend points for this '
+                'round &mdash; every extend was refused, or none was attempted'
+                "</div></div>")
+    head = ("<tr><th class=n>extends</th><th class=n>orders</th>"
+            "<th class=n>applied</th><th class=n>body sum</th>"
+            "<th class=n>body max</th><th class=n>body p50</th>"
+            "<th class=n>queue sum</th><th class=n>exec sum</th>"
+            "<th class=n>wall</th><th class=n>busy</th><th>status</th></tr>")
+    row = (f"<tr><td class='n m'>{stat['n']}</td>"
+           f"<td class='n m'>{stat['orders']:,}</td>"
+           f"<td class='n m'>{stat['applied']:,}</td>"
+           f"<td class='n m'>{ms(stat['body_sum'])}</td>"
+           f"<td class='n m'>{ms(stat['body_max'])}</td>"
+           f"<td class='n m'>{ms(stat['body_p50'])}</td>"
+           f"<td class='n m'>{ms(stat['queue_sum'])}</td>"
+           f"<td class='n m'>{ms(stat['exec_sum'])}</td>"
+           f"<td class='n m'>{ms(stat['wall'])}</td>"
+           f"<td class='n m'>{stat['busy']:.0f}%</td>"
+           f"<td class='m dim'>"
+           + ", ".join(f"{name}&times;{count}" for name, count in stat["statuses"])
+           + "</td></tr>")
+    return ('<div class="dtl"><div class="dtlhead">mutation lane &mdash; extends'
+            '<span class="note">body = the extend itself (sanitize, check, DAG '
+            'execute, overlay commit) &middot; queue = wait on the single '
+            'mutation lane &middot; wall = round span, so busy% is how much of '
+            'it the lane was working &middot; refused extends emit nothing'
+            "</span></div>"
+            f"<table><thead>{head}</thead><tbody>{row}</tbody></table></div>")
+
+
+def detail_table(title, items, show_won=False):
+    if not items:
+        return f'<div class="dtl"><div class="dtlhead">{title}</div>' \
+               '<div class="none">none</div></div>'
+    head = ("<tr><th>time (UTC)</th><th class=n>orders</th><th class=n>txs</th>"
+            "<th class=n>bundles</th><th class=n>reward SOL</th>"
+            "<th class=n>exec cost</th><th class=n>selected cu</th><th>uuid</th>"
+            + ("<th>won</th>" if show_won else "") + "</tr>")
+    body = "".join(
+        f"<tr><td class=m>{html.escape(i['ts'][11:23])}</td>"
+        f"<td class='n m'>{i['orders']:,}</td><td class='n m'>{i['txs']:,}</td>"
+        f"<td class='n m'>{i['bundles']:,}</td><td class='n m'>{sol(i['reward'])}</td>"
+        f"<td class='n m'>{i['exec_cost']:,}</td><td class='n m'>{i['sel_cu']:,}</td>"
+        f"<td class='m dim'>{html.escape(i['uuid'][:8])}&hellip;</td>"
+        + (f"<td class=m>{'YES' if i['won'] else '-'}</td>" if show_won else "")
+        + "</tr>"
+        for i in items)
+    return (f'<div class="dtl"><div class="dtlhead">{title}</div>'
+            f"<table><thead>{head}</thead><tbody>{body}</tbody></table></div>")
+
+
+def rounds_html(slot, sel_round):
+    try:
+        data = slot_data(slot)
+    except Exception as exc:
+        return f'<div class="err">rounds unavailable: {html.escape(str(exc))[:150]}</div>'
+    rounds, extends, ext_err = data["rounds"], data["extends"], data["ext_err"]
+    if not rounds:
+        return f'<div class="empty">no miniblock rows for slot <b>{slot}</b></div>'
+
+    out = []
+    if data["shred_err"]:
+        out.append('<div class="err" style="margin:0 28px 8px">shred path '
+                   f"unavailable: {html.escape(data['shred_err'])}</div>")
     else:
-        lo = max(1.0, min(vals))
-        hi = max(max(vals), lo * 10)
-        lo_e, hi_e = math.log10(lo), math.log10(hi)
-        span = (hi_e - lo_e) or 1.0
-        nb = 36
-        buckets = [0] * nb
-        for v in vals:
-            idx = int((math.log10(max(v, 1.0)) - lo_e) / span * nb)
-            buckets[max(0, min(nb - 1, idx))] += 1
-
-        def tick_at(f):
-            return fmt_val(10 ** (lo_e + span * f), key)
-
-    peak = max(buckets) or 1
-    bw = (W - 2 * PAD) / nb
-    bars = "".join(
-        f'<rect x="{PAD + i*bw:.1f}" y="{H - PAD - (H-2*PAD)*(c/peak):.1f}" '
-        f'width="{max(1.0, bw-1.5):.1f}" height="{(H-2*PAD)*(c/peak):.1f}" rx="1" '
-        f'fill="url(#g1)"><title>{c} points</title></rect>'
-        for i, c in enumerate(buckets) if c
-    )
-    ticks = "".join(
-        f'<text x="{PAD + (W-2*PAD)*f:.1f}" y="{H-10}" class="tick" '
-        f'text-anchor="middle">{tick_at(f)}</text>'
-        for f in (0, 0.25, 0.5, 0.75, 1.0)
-    )
-    return (
-        f'<svg viewBox="0 0 {W} {H}" class="chart" preserveAspectRatio="none">'
-        f'<defs><linearGradient id="g1" x1="0" y1="0" x2="0" y2="1">'
-        f'<stop offset="0%" stop-color="#5eead4"/><stop offset="100%" stop-color="#0f766e"/>'
-        f'</linearGradient></defs>'
-        f'<line x1="{PAD}" y1="{H-PAD}" x2="{W-PAD}" y2="{H-PAD}" class="axis"/>'
-        + bars + ticks + "</svg>"
-    )
+        out.append(shred_html(slot, data["shreds"]))
+    if ext_err:
+        out.append('<div class="err" style="margin:0 28px 8px">sim-extend '
+                   f"unavailable: {html.escape(ext_err)}</div>")
+    for r in rounds:
+        w = r["winner"]
+        stat = extends.get(r["round"])
+        open_ = r["round"] == sel_round
+        base = f"/?win={window_of(slot)}&slot={slot}"
+        href = base if open_ else f"{base}&round={r['round']}"
+        summary = (
+            f'<a class="rnd {"open" if open_ else ""}" href="{href}">'
+            f'<span class="rid">round {r["round"]}</span>'
+            f'<span class="cnt">{len(r["offers"])} offer'
+            f'{"" if len(r["offers"]) == 1 else "s"}</span>'
+            + (f'<span class="won">won</span>' if w and w["won"]
+               else '<span class="lost">not ours</span>' if w
+               else '<span class="nowin">no winner echo</span>')
+            + (f'<span class="last">is_last</span>' if w and w["is_last"] else "")
+            + (f'<span class="ext">{stat["n"]} ext &middot; '
+               f'{ms(stat["body_sum"])}</span>' if stat
+               else '<span class="noext">0 ext</span>' if not ext_err else "")
+            + f'<span class="chev">{"&minus;" if open_ else "+"}</span></a>')
+        detail = ""
+        if open_:
+            detail = ('<div class="detail">'
+                      + extend_table(stat)
+                      + detail_table(f"our offers &mdash; {len(r['offers'])}", r["offers"])
+                      + detail_table("winner miniblock", [w] if w else [], show_won=True)
+                      + "</div>")
+        out.append(f'<div class="rndwrap">{summary}{detail}</div>')
+    return "".join(out)
 
 
-def slot_series_svg(points, field, key=None):
-    """Value against slot number - the slot column as the x axis."""
-    if not points:
-        return '<div class="empty">no data</div>'
-    pts = sorted(points, key=lambda p: p["slot"])
-    lo_s, hi_s = pts[0]["slot"], pts[-1]["slot"]
-    span = max(1, hi_s - lo_s)
-    hi_v = max(p[field] for p in pts) or 1
-    step = max(1, len(pts) // 2500)
-    dots = "".join(
-        f'<circle cx="{PAD + (W-2*PAD)*((p["slot"]-lo_s)/span):.1f}" '
-        f'cy="{H - PAD - (H-2*PAD)*(p[field]/hi_v):.1f}" r="1.6" fill="#5eead4" '
-        f'fill-opacity=".5"><title>slot {p["slot"]}: {fmt_val(p[field], key)}</title></circle>'
-        for p in pts[::step]
-    )
-    return (
-        f'<svg viewBox="0 0 {W} {H}" class="chart" preserveAspectRatio="none">'
-        f'<line x1="{PAD}" y1="{H-PAD}" x2="{W-PAD}" y2="{H-PAD}" class="axis"/>'
-        f'{dots}'
-        f'<text x="{PAD}" y="{H-10}" class="tick">{lo_s}</text>'
-        f'<text x="{W-PAD}" y="{H-10}" class="tick" text-anchor="end">{hi_s}</text>'
-        f'<text x="{PAD}" y="16" class="tick">peak {fmt_val(hi_v, key)}</text>'
-        "</svg>"
-    )
-
+# ------------------------------------------------------------------ rendering
 
 CSS = """
 *{box-sizing:border-box}
 body{margin:0;background:#0b1016;color:#dbe4ee;
   font:14px/1.55 ui-sans-serif,-apple-system,"SF Pro Text",Segoe UI,sans-serif}
-header{padding:22px 28px 16px;border-bottom:1px solid #1e2937;
-  display:flex;flex-wrap:wrap;gap:16px;align-items:baseline}
+header{padding:20px 28px 14px;display:flex;gap:16px;align-items:baseline;
+  border-bottom:1px solid #1e2937}
 h1{margin:0;font-size:17px;font-weight:650;letter-spacing:-.01em}
 h1 span{color:#5eead4}
 .sub{color:#6b7f96;font-size:12.5px}
-main{padding:20px 28px 60px;max-width:none}
-.ctl{margin-left:auto;display:flex;flex-direction:column;gap:6px;align-items:flex-end}
-.row{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
-.cap{color:#61748b;font-size:10.5px;text-transform:uppercase;letter-spacing:.07em;
-  min-width:78px;text-align:right}
-form.inline{display:flex;gap:6px;align-items:center}
-input[type=number]{background:#0c1219;border:1px solid #263243;color:#dbe4ee;width:74px;
-  padding:5px 8px;border-radius:7px;font-size:12.5px;font-family:ui-monospace,Menlo,monospace}
-a.rng,button{background:#151d27;border:1px solid #263243;color:#9fb2c8;
-  padding:5px 11px;border-radius:7px;text-decoration:none;font-size:12.5px;cursor:pointer}
-a.rng.on{background:#0f766e;border-color:#14b8a6;color:#eafffb;font-weight:600}
-.scope{background:#0d1620;border:1px solid #1e2937;border-radius:9px;padding:10px 15px;
-  margin-bottom:16px;font-size:12.5px;color:#9fb2c8}
-.scope b{color:#5eead4}
-.err{background:#1e0d0d;border-color:#7f1d1d;color:#fca5a5}
-.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:18px;align-items:start}
-.grid.one{grid-template-columns:1fr}
-.charts{display:grid;grid-template-columns:1fr 1fr;gap:18px;align-items:start}
-.pane{min-width:0}
-/* Two cards per row halves the card width, so drop each card's charts to a
-   single column before they get too narrow to read. */
-@media (max-width:1500px){.charts{grid-template-columns:1fr}}
-@media (max-width:1100px){.grid{grid-template-columns:1fr}
-  .charts{grid-template-columns:1fr 1fr}}
-@media (max-width:820px){.charts{grid-template-columns:1fr}}
-.card{background:#111823;border:1px solid #1e2937;border-radius:12px;padding:17px 19px;
-  min-width:0;overflow:hidden}
-.card h2{margin:0 0 3px;font-size:14.5px;font-weight:620;
-  font-family:ui-monospace,Menlo,monospace;color:#5eead4}
-.blurb{color:#7d90a6;font-size:12px;margin-bottom:13px}
-.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(72px,1fr));
-  gap:7px;margin-bottom:15px}
-.kpi{background:#0c1219;border:1px solid #1c2634;border-radius:8px;padding:8px 6px;
-  text-align:center}
-.kpi .k{color:#61748b;font-size:10px;text-transform:uppercase;letter-spacing:.06em}
-.kpi .v{font-family:ui-monospace,Menlo,monospace;font-size:13.5px;margin-top:3px;color:#e6eef8}
-.kpi .ksub{color:#6b7f96;font-size:9.5px;margin-top:2px;font-family:ui-monospace,Menlo,monospace}
-.kpi.hot .v{color:#fbbf24}
-.kpi.crit .v{color:#f87171}
-.lbl{color:#61748b;font-size:11px;text-transform:uppercase;letter-spacing:.06em;margin:12px 0 5px}
-.chart{width:100%;height:190px;display:block}
-.axis{stroke:#243040;stroke-width:1}
-.tick{fill:#5b6b80;font-size:9.5px;font-family:ui-monospace,Menlo,monospace}
-.empty{color:#4d5c70;padding:34px;text-align:center;font-size:12.5px}
-table.tail{width:100%;border-collapse:collapse;font-size:12px;margin-bottom:6px}
-table.tail th{color:#61748b;font-weight:500;text-align:left;padding:4px 8px;
-  border-bottom:1px solid #1e2937;font-size:10.5px;text-transform:uppercase;letter-spacing:.05em}
-table.tail td{padding:4px 8px;border-bottom:1px solid #151d27}
-table.tail tr.hot td.num{color:#fbbf24}
-table.tail tr.crit td.num{color:#f87171}
-.mono{font-family:ui-monospace,Menlo,monospace}
-a.slotlink{color:#5eead4;text-decoration:none;border-bottom:1px dotted #14b8a6}
-a.slotlink:hover{color:#eafffb;border-bottom-color:#5eead4}
-table.wide{width:100%;border-collapse:collapse;font-size:11.5px;margin-bottom:10px;
-  display:block;overflow-x:auto;white-space:nowrap}
-table.wide th{color:#61748b;font-weight:500;text-align:left;padding:4px 9px;
-  border-bottom:1px solid #1e2937;font-size:10px;text-transform:uppercase;letter-spacing:.05em}
-table.wide td{padding:4px 9px;border-bottom:1px solid #151d27;
+.striphead{display:flex;gap:12px;align-items:baseline;padding:12px 28px 0}
+.cap{color:#61748b;font-size:10.5px;text-transform:uppercase;letter-spacing:.07em}
+.hint{color:#4d5c70;font-size:11.5px;margin-left:auto}
+
+/* one row, scrolls horizontally: newest at the left, older to the right */
+.strip{display:flex;gap:8px;padding:12px 28px 18px;overflow-x:auto;overflow-y:hidden;
+  white-space:nowrap;border-bottom:1px solid #1e2937;scrollbar-width:thin;
+  scrollbar-color:#22303f #0b1016}
+.strip::-webkit-scrollbar{height:9px}
+.strip::-webkit-scrollbar-track{background:#0c121a}
+.strip::-webkit-scrollbar-thumb{background:#22303f;border-radius:5px}
+.strip::-webkit-scrollbar-thumb:hover{background:#2f4256}
+
+.chip{flex:0 0 auto;background:#141d28;border:1px solid #22303f;border-radius:8px;
+  padding:8px 12px;min-width:136px;user-select:none;text-decoration:none;display:block}
+.chip:hover{border-color:#14b8a6}
+.chip.on{background:#0f766e;border-color:#5eead4}
+.chip.on .slot,.chip.on .ageline,.chip.on .meta{color:#eafffb}
+.chip .slot{font-family:ui-monospace,Menlo,monospace;font-size:12.5px;color:#cfe0f0}
+.chip .ageline{font-size:11px;color:#6b7f96;margin-top:3px}
+.age{font-variant-numeric:tabular-nums}
+
+/* copy-on-hover; hidden until the row is hovered or the control is focused */
+.cp{opacity:0;margin-left:7px;padding:0 5px;border:1px solid #2b3a4b;border-radius:4px;
+  color:#6b7f96;font:9.5px/1.7 ui-sans-serif,sans-serif;text-transform:uppercase;
+  letter-spacing:.05em;cursor:pointer;vertical-align:1px;
+  transition:opacity .1s;display:inline-block}
+.chip:hover .cp,.hascp:hover .cp,.cp:focus{opacity:1}
+.cp:hover{color:#5eead4;border-color:#14b8a6;background:#0f766e22}
+.cp.ok{opacity:1;color:#5eead4;border-color:#14b8a6;background:#0f766e33}
+.cp.fail{opacity:1;color:#fca5a5;border-color:#7f1d1d}
+.chip.on .cp{color:#c8fff7;border-color:#7fe9dd88}
+@media (hover:none){.cp{opacity:.75}}
+.chip .meta{font-size:10.5px;color:#4d5c70;margin-top:2px;
   font-family:ui-monospace,Menlo,monospace}
-.prov{background:#12203a;border:1px solid #1d4ed8;border-radius:9px;padding:12px 16px;
-  margin-bottom:18px;font-size:13px;color:#bfdbfe}
-.prov b{color:#93c5fd}
-.prov .chip{display:inline-block;padding:2px 9px;border-radius:6px;font-weight:650;
-  font-family:ui-monospace,Menlo,monospace;margin:0 4px}
-.chip.ok{background:#0f766e;color:#eafffb}
-.chip.hot{background:#78350f;color:#fbbf24}
-.chip.crit{background:#7f1d1d;color:#fca5a5}
-.back{color:#7d90a6;text-decoration:none;font-size:12.5px}
-.back:hover{color:#5eead4}
-.num{text-align:right}
-.dim{color:#5b6b80}
-footer{color:#4d5c70;font-size:11.5px;padding:0 28px 40px;max-width:none}
+.chip .slot .n{color:#4d5c70;font-size:11px}
+.chip.on .slot .n{color:#a7f3ea}
+
+/* the open window's own slots, one step in */
+.winbar{display:flex;gap:14px;align-items:baseline;padding:14px 28px 0;flex-wrap:wrap}
+.winbar code{font-size:11.5px}
+.strip.sub2{padding:8px 28px 16px;background:#0a0f15}
+.chip.sm{min-width:150px;padding:7px 11px;background:#111823}
+.warn{color:#fbbf24}
+.okc{color:#5eead4}
+
+/* won == we produced the block; everything else we bid on and lost */
+.chip .tag{font-size:10px;color:#4d5c70;margin-top:3px}
+.chip.won{border-color:#14b8a655;background:#0f1c1f}
+.chip.won .tag{color:#5eead4}
+.chip.won:hover{border-color:#5eead4}
+.chip.on .tag{color:#c8fff7}
+
+main{padding:44px 28px 60px}
+main.rounds{padding:10px 0 60px}
+.empty{color:#4d5c70;font-size:13px;border:1px dashed #1e2937;border-radius:10px;
+  padding:40px;text-align:center}
+.empty b{color:#6b7f96}
+.err{background:#1e0d0d;border:1px solid #7f1d1d;color:#fca5a5;border-radius:9px;
+  padding:11px 15px;margin:16px 28px;font-size:13px}
 code{font-family:ui-monospace,Menlo,monospace;color:#8fa6bf}
+
+/* rounds */
+.slotbar{padding:20px 28px 4px;color:#9fb2c8;font-size:13px}
+.slotbar b{color:#5eead4;font-family:ui-monospace,Menlo,monospace}
+.rndwrap{margin:0 28px 8px}
+a.rnd{display:flex;gap:14px;align-items:center;background:#111823;
+  border:1px solid #1e2937;border-radius:9px;padding:10px 15px;text-decoration:none}
+a.rnd:hover{border-color:#2f4256}
+a.rnd.open{border-color:#14b8a6;background:#0f1a22;border-bottom-left-radius:0;
+  border-bottom-right-radius:0}
+.rid{font-family:ui-monospace,Menlo,monospace;font-size:13px;color:#cfe0f0;min-width:78px}
+.cnt{color:#7d90a6;font-size:12.5px;min-width:74px}
+.won{color:#5eead4;font-size:11px;font-weight:650;letter-spacing:.04em;
+  background:#0f766e33;border:1px solid #14b8a655;border-radius:5px;padding:1px 7px}
+.lost{color:#fbbf24;font-size:11px;background:#78350f33;border:1px solid #78350f;
+  border-radius:5px;padding:1px 7px}
+.nowin{color:#5b6b80;font-size:11px;border:1px solid #22303f;border-radius:5px;
+  padding:1px 7px}
+.last{color:#93c5fd;font-size:11px;border:1px solid #1d4ed855;border-radius:5px;
+  padding:1px 7px}
+.ext{color:#a5b4fc;font-size:11px;border:1px solid #3730a355;background:#312e8122;
+  border-radius:5px;padding:1px 7px;font-family:ui-monospace,Menlo,monospace}
+.noext{color:#7f5a5a;font-size:11px;border:1px solid #7f1d1d55;border-radius:5px;
+  padding:1px 7px;font-family:ui-monospace,Menlo,monospace}
+.chev{margin-left:auto;color:#5b6b80;font-family:ui-monospace,Menlo,monospace}
+.dtlhead .note{text-transform:none;letter-spacing:0;color:#4d5c70;font-size:10px;
+  margin-left:10px}
+
+/* shred-path panel */
+.panel{margin:0 28px 14px;background:#0c141b;border:1px solid #1e2937;
+  border-radius:9px;padding:12px 15px 14px}
+.panel table{width:100%;border-collapse:collapse;font-size:11.5px}
+.panel th{color:#61748b;font-weight:500;text-align:left;padding:4px 9px;
+  border-bottom:1px solid #1e2937;font-size:10px;text-transform:uppercase}
+.panel td{padding:4px 9px;border-bottom:1px solid #141d27}
+.panel .m{font-family:ui-monospace,Menlo,monospace}
+.panel .n{text-align:right}
+.panel .dim{color:#5b6b80}
+.panel .good{color:#5eead4}
+.panel .bad{color:#fbbf24}
+.panel .none{color:#4d5c70;font-size:12px;padding:6px 0 0}
+.detail{border:1px solid #14b8a6;border-top:none;border-radius:0 0 9px 9px;
+  background:#0c141b;padding:12px 15px 14px}
+.dtl{margin-bottom:12px}
+.dtl:last-child{margin-bottom:0}
+.dtlhead{color:#61748b;font-size:10.5px;text-transform:uppercase;letter-spacing:.06em;
+  margin-bottom:6px}
+.detail table{width:100%;border-collapse:collapse;font-size:11.5px}
+.detail th{color:#61748b;font-weight:500;text-align:left;padding:4px 9px;
+  border-bottom:1px solid #1e2937;font-size:10px;text-transform:uppercase}
+.detail td{padding:4px 9px;border-bottom:1px solid #141d27}
+.detail .m{font-family:ui-monospace,Menlo,monospace}
+.detail .n{text-align:right}
+.detail .dim{color:#5b6b80}
+.none{color:#4d5c70;font-size:12px;padding:6px 9px}
 """
 
 
-def kpi(name, value, cls="", sub=None):
-    extra = f'<div class="ksub">{sub}</div>' if sub else ""
-    return (f'<div class="kpi {cls}"><div class="k">{name}</div>'
-            f'<div class="v">{value}</div>{extra}</div>')
+# Ages keep counting after the page is rendered. The browser clock is not
+# trusted on its own -- a machine several minutes off would show ages that
+# disagree with the server's own numbers -- so we take the server's timestamp
+# once at load and carry the difference as a fixed offset.
+TICK_JS = """
+(function(){
+  var skew = __SERVER_NOW__ * 1000 - Date.now();   // server clock minus ours
+  var nodes = [].slice.call(document.querySelectorAll('.age[data-t]'));
+  if (!nodes.length) return;
+  function fmt(s){
+    if (s < 0) return 'now';
+    var d = Math.floor(s/86400), h = Math.floor(s%86400/3600),
+        m = Math.floor(s%3600/60), sec = s%60;
+    if (d) return d+'d '+h+'h';
+    if (h) return h+'h '+m+'m';
+    if (m) return m+'m '+sec+'s';
+    return sec+'s';
+  }
+  function tick(){
+    var now = (Date.now() + skew) / 1000;
+    for (var i = 0; i < nodes.length; i++){
+      var n = nodes[i], suffix = n.dataset.suffix;
+      if (suffix === undefined){
+        // whatever trailed the server's number, usually ' ago'
+        suffix = n.dataset.suffix = (n.textContent.match(/(\\s*ago)$/) || ['',''])[1];
+      }
+      n.textContent = fmt(Math.floor(now - (+n.dataset.t))) + suffix;
+    }
+  }
+  tick();
+  setInterval(tick, 1000);
+  // a backgrounded tab throttles timers; resync the moment it comes back
+  document.addEventListener('visibilitychange', function(){
+    if (!document.hidden) tick();
+  });
+})();
+
+// Copy-on-hover. The controls sit inside chip anchors, so the click must be
+// swallowed or copying would also navigate. navigator.clipboard needs a secure
+// context -- localhost qualifies, a bare LAN IP does not -- hence the fallback.
+(function(){
+  function flash(el, cls, label){
+    var was = el.textContent;
+    el.textContent = label; el.classList.add(cls);
+    setTimeout(function(){ el.textContent = was; el.classList.remove(cls); }, 1100);
+  }
+  function legacy(text){
+    var ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.cssText = 'position:fixed;top:-1000px;opacity:0';
+    document.body.appendChild(ta); ta.select();
+    var ok = false;
+    try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
+    document.body.removeChild(ta);
+    return ok;
+  }
+  function fallback(el, text){          // one attempt, one verdict
+    var ok = legacy(text);
+    flash(el, ok ? 'ok' : 'fail', ok ? 'copied' : 'failed');
+  }
+  function copy(el){
+    var text = el.dataset.c;
+    if (navigator.clipboard && window.isSecureContext){
+      navigator.clipboard.writeText(text).then(
+        function(){ flash(el, 'ok', 'copied'); },
+        function(){ fallback(el, text); });
+    } else {
+      fallback(el, text);
+    }
+  }
+  document.addEventListener('click', function(ev){
+    var el = ev.target.closest('.cp');
+    if (!el) return;
+    ev.preventDefault(); ev.stopPropagation();
+    copy(el);
+  });
+  document.addEventListener('keydown', function(ev){
+    if (ev.key !== 'Enter' && ev.key !== ' ') return;
+    var el = ev.target.closest && ev.target.closest('.cp');
+    if (!el) return;
+    ev.preventDefault(); ev.stopPropagation();
+    copy(el);
+  });
+})();
+"""
 
 
-def slot_link(slot, key=None, val=None, stat=None, rng=None):
-    q = {"slot": slot}
-    if key:
-        q.update(**{"from": key, "val": f"{val:.0f}", "stat": stat or "",
-                    "band": band(val, key) or "ok"})
-    if rng:
-        q["rng"] = rng
-    return f'<a class="slotlink" href="/slot?{urllib.parse.urlencode(q)}">{slot}</a>'
+def strip_html(windows, sel_win, sel_slot):
+    """One chip per leader window, newest at the left."""
+    def chip(w):
+        on = w["win"] == sel_win
+        href = "/" if on else f"/?win={w['win']}"
+        cls = "chip" + (" on" if on else "") + (" won" if w["won"] else "")
+        return (f'<a class="{cls}" href="{href}" '
+                f'title="{html.escape(w["ts"][:19])} UTC &mdash; leader '
+                f'{html.escape(w["leader"])} &mdash; '
+                f'{w["won"]}/{len(w["slots"])} slots won">'
+                f'<div class="slot">{w["win"]}<span class="n">'
+                f'&nbsp;+{len(w["slots"]) - 1}</span>{copy_btn(w["win"])}</div>'
+                f'<div class="ageline">{age_html(w["ts"])}</div>'
+                f'<div class="meta">{html.escape(short_id(w["leader"]))}'
+                f'{" &#9888;" if w["leader_split"] else ""}</div>'
+                f'<div class="tag">{w["won"]}/{len(w["slots"])} won</div></a>')
+
+    chips = "".join(chip(w) for w in windows)
+    slots = sum(len(w["slots"]) for w in windows)
+    won = sum(w["won"] for w in windows)
+    leaders = len({w["leader"] for w in windows if w["leader"]})
+    return (f'<div class="striphead"><span class="cap">leader windows</span>'
+            f'<span class="sub">{len(windows)} windows &middot; {slots} slots contested '
+            f'&middot; <b class="okc">{won} won</b> &middot; {leaders} leaders '
+            f'&middot; last 30d on <code>{CH_BUILDER}</code></span>'
+            f'<span class="hint">newest at the left &mdash; scroll right for older</span>'
+            f'</div><div class="strip">{chips}</div>'
+            + window_html(windows, sel_win, sel_slot))
 
 
-def tail_block(points, field, key, p99, rng=None):
-    trips = [(p[field], p["slot"], p["time"]) for p in points if p[field] >= p99]
-    if not trips:
+def window_html(windows, sel_win, sel_slot):
+    """The expansion under the strip: the individual slots of the open window."""
+    if sel_win is None:
         return ""
-    per_slot = {}
-    for val, sl, ts in trips:
-        prev = per_slot.get(sl)
-        per_slot[sl] = (max(val, prev[0]) if prev else val,
-                        prev[1] if prev else ts,
-                        (prev[2] + 1) if prev else 1)
-    ordered = sorted(per_slot.items(), key=lambda kv: kv[1][0], reverse=True)[:25]
-    rows = "".join(
-        f'<tr class="{band(v, key)}">'
-        f'<td class="mono">{slot_link(sl, key, v, "tail", rng)}</td>'
-        f'<td class="mono num">{fmt_val(v, key)}</td><td class="num">{n}</td>'
-        f'<td class="mono dim">{str(ts)[:19].replace("T"," ")}Z</td></tr>'
-        for sl, (v, ts, n) in ordered
-    )
-    return (f'<div class="lbl">p99 tail &mdash; {len(trips)} point(s) &ge; '
-            f'{fmt_val(p99, key)}, across {len(per_slot)} slot(s)</div>'
-            '<table class="tail"><thead><tr><th>slot</th><th class="num">peak</th>'
-            f'<th class="num">pts</th><th>when (UTC)</th></tr></thead>'
-            f'<tbody>{rows}</tbody></table>')
+    win = next((w for w in windows if w["win"] == sel_win), None)
+    if win is None:
+        return (f'<div class="err">window {sel_win} is not in the produced list</div>')
+    missing = WINDOW - len(win["slots"])
+    def slotchip(s):
+        on = s["slot"] == sel_slot
+        href = f"/?win={sel_win}" if on else f"/?win={sel_win}&slot={s['slot']}"
+        cls = "chip sm" + (" on" if on else "") + (" won" if s["won"] else "")
+        return (f'<a class="{cls}" href="{href}">'
+                f'<div class="slot">{s["slot"]}{copy_btn(s["slot"])}</div>'
+                f'<div class="ageline">+{s["slot"] - sel_win} &middot; '
+                f'{age_html(s["ts"])}</div>'
+                f'<div class="tag">{"we produced" if s["won"] else "lost"} '
+                f'&middot; {s["offers"]} offers</div></a>')
+
+    return (f'<div class="winbar"><span class="cap hascp">window {sel_win}'
+            f'{copy_btn(sel_win)}</span>'
+            f'<span class="sub">slots {sel_win}&ndash;{sel_win + WINDOW - 1} &middot; '
+            f'{len(win["slots"])} contested &middot; '
+            f'<b class="okc">{win["won"]} won</b>'
+            + (f' &middot; <span class="warn">{missing} with no offers from us</span>'
+               if missing else "")
+            + f'</span><span class="sub hascp">leader '
+              f'<code>{html.escape(win["leader"])}</code>{copy_btn(win["leader"])}'
+            + ('<span class="warn"> &#9888; more than one leader identity in this '
+               'window</span>' if win["leader_split"] else "")
+            + f'</span></div><div class="strip sub2">'
+            + "".join(slotchip(s) for s in win["slots"]) + "</div>")
 
 
-def card(points, field, key, title, blurb, rng=None):
-    vals = [p[field] for p in points]
-    st = stats(vals)
-    head = f'<h2>{html.escape(title)}</h2><div class="blurb">{blurb}</div>'
-    if not st:
-        return f'<div class="card">{head}<div class="empty">no points in range</div></div>'
-    p95_cls = band(st["p95"], key)
-    p99_cls, max_cls = band(st["p99"], key), band(st["max"], key)
-    peak_sub = None
-    if max_cls:
-        peak = max(points, key=lambda p: p[field])
-        peak_sub = f'slot {slot_link(peak["slot"], key, st["max"], "max", rng)}'
-    tail = tail_block(points, field, key, st["p99"], rng) if (max_cls or p99_cls) else ""
-    return f"""<div class="card">{head}
-      <div class="kpis">
-        {kpi("points", f'{st["n"]:,}')}
-        {kpi("mean", fmt_val(st["mean"], key))}
-        {kpi("p50", fmt_val(st["p50"], key))}
-        {kpi("p90", fmt_val(st["p90"], key))}
-        {kpi("p95", fmt_val(st["p95"], key), p95_cls)}
-        {kpi("p99", fmt_val(st["p99"], key), p99_cls)}
-        {kpi("max", fmt_val(st["max"], key), max_cls, peak_sub)}
-      </div>
-      {tail}
-      <div class="charts">
-        <div class="pane"><div class="lbl">distribution</div>
-          {histogram_svg(vals, key)}</div>
-        <div class="pane"><div class="lbl">by slot number</div>
-          {slot_series_svg(points, field, key)}</div>
-      </div>
-    </div>"""
-
-
-def table(cols, rows, cls="wide", limit=200):
-    if not rows:
-        return '<div class="empty">no rows</div>'
-    head = "".join(f"<th>{html.escape(c)}</th>" for c in cols)
-    body = "".join(
-        "<tr>" + "".join(
-            f'<td>{html.escape("" if str(c) == chr(92) + "N" else str(c))[:64]}</td>'
-            for c in r) + "</tr>"
-        for r in rows[:limit]
-    )
-    more = (f'<div class="dim" style="font-size:11.5px">+{len(rows)-limit} more rows</div>'
-            if len(rows) > limit else "")
-    return f'<table class="{cls}"><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>{more}'
-
-
-CARDS = [
-    ("sim-extend", "body_us", "body_us",
-     "body_us (extend)",
-     "Wall clock inside <code>state.extend</code> (<code>workers.rs:283-285</code>). "
-     "The round's critical path - the mutation lane is blocked this long."),
-    ("sim-commit", "body_us", "body_us_commit",
-     "body_us (commit)",
-     "Wall clock inside <code>state.commit_round</code> (<code>workers.rs:331-333</code>). "
-     "A promote is a pointer move and costs microseconds; a replay re-executes a whole "
-     "winning block."),
-    ("sim-extend", "exec_wall_us", "exec_wall", "exec_wall_us (extend)",
-     "Wall clock of <code>run_stream</code> alone (<code>replay.rs</code>, "
-     "<code>stats.exec_wall_us</code>) - the execution phase without sanitize, the slot "
-     "lock or checkpointing. Same axis as <code>body_us</code>, so "
-     "<code>exec_wall_us / body_us</code> is the share of the call that was actually "
-     "executing, and everything else is the unmeasured remainder."),
-    ("sim-commit", "exec_wall_us", "exec_wall_commit", "exec_wall_us (commit)",
-     "The same execution-phase wall clock on the commit side. A promote runs no stream "
-     "and records 0."),
-    ("sim-extend", "execute_us", "execute_us", "execute_us (extend)",
-     "BPF execution summed across replay workers - <b>CPU time, not wall clock</b>, so it "
-     "routinely exceeds <code>exec_wall_us</code>. The ratio "
-     "<code>execute_us / exec_wall_us</code> is the effective parallelism actually "
-     "achieved, against <code>exec_pool</code> = 8 available."),
-    ("sim-extend", "load_us", "load_us", "load_us (extend)",
-     "Account loading, also a CPU sum across workers. Since the override map is now "
-     "consulted lazily in <code>do_load</code> rather than copied per loader, this no "
-     "longer scales with overlay size."),
-    ("sim-extend", "exec_pool", "exec_pool", "exec_pool (extend)",
-     "Replay workers available to the batch. Constant at 8 when a stream ran; <b>0 means "
-     "<code>run_stream</code> was never called</b> - a refusal or a promote. That makes it "
-     "the cleanest \"did this batch execute\" predicate, cleaner than "
-     "<code>layer_count &gt; 0</code>."),
-    ("sim-mutation-lane", "age_us", "age_us",
-     "age_us",
-     "Age of the in-flight mutation, sampled every 500ms by the watchdog thread "
-     "(<code>metrics.rs:109-114</code>), busy samples only. Not per-call: it is the only "
-     "signal that can see a job which never returns, since a hung call emits no point."),
-    ("sim-extend", "queue_us", "queue_us",
-     "queue_us",
-     "Wait in the bounded(1) mutation channel before the worker took the job "
-     "(<code>workers.rs:192-280</code>). Lane-busy requests emit no point at all."),
-    ("sim-extend", "layer_count", "depth",
-     "layer_count \u2014 critical path (extend)",
-     "Wire name <code>layer_count</code>, but since the DAG-stream migration it carries "
-     "<code>stream.critical_path</code> = <code>max(height) + 1</code>: the <b>longest "
-     "dependency chain</b> in the batch (<code>replay.rs</code> build_stream). That is the "
-     "batch's serial floor - no amount of workers executes it faster. Zero means the batch "
-     "executed nothing: a refusal or a promote."),
-    ("sim-extend", "max_layer_width", "width",
-     "max_layer_width \u2014 initial width (extend)",
-     "Wire name <code>max_layer_width</code>, but it now carries "
-     "<code>stream.initial_width</code>: orders with <b>in-degree zero</b>, i.e. how many "
-     "could dispatch immediately. It is <b>not</b> the widest wave - orders unblock as "
-     "verdicts land, so peak concurrency can exceed this. Compare against "
-     "<code>exec_pool</code> = 8: below that, the pool starts partly idle."),
-    ("sim-commit", "layer_count", "depth_commit",
-     "layer_count \u2014 critical path (commit)",
-     "Same measure on the commit side. A promote executes nothing and records 0; a replay "
-     "carries a whole winning block, so its chains run far deeper than an extend's."),
-    ("sim-commit", "max_layer_width", "width_commit",
-     "max_layer_width \u2014 initial width (commit)",
-     "Independent orders at the head of a commit replay. Wide here means the winner's "
-     "block had a lot of mutually disjoint orders to start on."),
-    ("sim-extend", "account_cache_clone_us", "acct_clone", "account_cache_clone_us (extend)",
-     "Time spent copying the reactor's private overlay into the immutable snapshot the "
-     "workers read (<code>replay.rs</code>, <code>working.clone()</code>). Taken "
-     "<b>once per wave and only when the overlay changed</b> - the DAG-stream rewrite "
-     "replaced the old per-layer <code>Arc::make_mut</code>, and this is the field that "
-     "made the cost visible."),
-    ("sim-extend", "account_cache_entries_cloned", "acct_entries",
-     "account_cache_entries_cloned (extend)",
-     "How many accounts those snapshots carried, summed over the batch's waves. Divide by "
-     "the wave count for the overlay size; against <code>overlay_len</code> it says how "
-     "many times the batch re-copied the same state."),
-    ("sim-commit", "account_cache_clone_us", "acct_clone_commit",
-     "account_cache_clone_us (commit)",
-     "The same per-wave overlay snapshot on the commit-replay side, where batches are "
-     "far wider and the overlay is larger."),
-    ("sim-extend", "program_cache_us", "pc_us",
-     "program_cache_us (extend)",
-     "Time in <code>replenish_program_cache_for_simulation</code> "
-     "(<code>transaction_processor.rs:585</code>): take the global cache read lock, "
-     "extract hits, compile the misses. A fresh <code>ProgramCacheForTxBatch</code> is "
-     "built per order (<code>replay.rs:127</code>), so this recurs every order."),
-    ("sim-extend", "program_cache_clone_us", "pc_clone_us",
-     "program_cache_clone_us",
-     "Cost of forking the shared <code>ProgramCacheSnapshot</code> "
-     "(<code>replay.rs:441-450</code>). The fork is copy-on-write and happens at most "
-     "once per batch, only if some order modified a program - so this is zero on the "
-     "overwhelming majority of batches."),
-    ("sim-commit", "program_cache_us", "pc_us_commit",
-     "program_cache_us (commit)",
-     "The same program-cache path on the commit-replay side."),
-]
-
-
-def page(rng, mode, nslots):
-    errs, host, data = [], None, {}
+def page(sel_win=None, sel_slot=None, sel_round=None):
     try:
-        host = active_host()
+        windows = produced_windows()
     except Exception as exc:
-        errs.append(html.escape(str(exc)))
-    data, ferrs = fetch_all(SLOT_LOOKBACK if mode == "slots" else rng, host)
-    errs += ferrs
+        strip = (f'<div class="err">produced-window list unavailable: '
+                 f"{html.escape(str(exc))[:160]}</div>")
+        windows = []
+    else:
+        if not windows:
+            strip = '<div class="err">no produced slots in the last 30 days</div>'
+        else:
+            if sel_slot is not None and sel_win is None:
+                sel_win = window_of(sel_slot)
+            strip = strip_html(windows, sel_win, sel_slot)
 
-    scope_note = f"time window <b>last {rng}</b>"
-    if mode == "slots":
-        # The slot window is defined by sim-extend, then applied to every source.
-        base = sorted({p["slot"] for p in data.get("sim-extend", [])}, reverse=True)
-        keep = set(base[:nslots])
-        if keep:
-            data = {m: [p for p in pts if p["slot"] in keep] for m, pts in data.items()}
-            scope_note = (f"last <b>{len(keep)}</b> slots with an extend &mdash; "
-                          f"<code>{min(keep)}</code> &rarr; <code>{max(keep)}</code>"
-                          f" (resolved over a {SLOT_LOOKBACK} lookback)")
-
-    rngs = "".join(
-        f'<a class="rng {"on" if mode=="time" and r==rng else ""}" '
-        f'href="/?mode=time&range={r}&n={nslots}">{r}</a>' for r in RANGES
-    )
-    slot_btns = "".join(
-        f'<a class="rng {"on" if mode=="slots" and n==nslots else ""}" '
-        f'href="/?mode=slots&range={rng}&n={n}">{n}</a>' for n in SLOT_PRESETS
-    )
-    cards = [card(data.get(m, []), f, k, t, b, rng) for m, f, k, t, b in CARDS]
-    err_html = f'<div class="scope err">{"; ".join(errs)}</div>' if errs else ""
+    if sel_slot is None:
+        note = ("Pick a leader window above, then a slot inside it."
+                if sel_win is None else "Pick a slot from this window.")
+        body = (f'<main><div class="empty"><b>No slot selected.</b><br>{note}'
+                "</div></main>")
+    else:
+        body = (f'<div class="slotbar hascp">slot <b>{sel_slot}</b>'
+                f'{copy_btn(sel_slot)} &mdash; auction rounds. '
+                f"Click a round for its offers and the winning miniblock.</div>"
+                f"<main class=rounds>{rounds_html(sel_slot, sel_round)}</main>")
+    title = f" &middot; slot {sel_slot}" if sel_slot else \
+            f" &middot; window {sel_win}" if sel_win else ""
     return f"""<!doctype html><html><head><meta charset="utf-8">
-<title>simbench - sim-extend by slot</title>
+<title>simbench{title}</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>{CSS}</style></head><body>
 <header>
   <h1>sim<span>bench</span></h1>
-  <div class="sub">{MEASUREMENT} &middot; host_id {html.escape((host or "?")[:12])}&hellip;
-    &middot; influx {INFLUX_DB}@{_good_host or INFLUX_HOSTS[0]}</div>
-  <div class="ctl">
-    <div class="row"><span class="cap">by time</span>{rngs}</div>
-    <div class="row"><span class="cap">last N slots</span>{slot_btns}
-      <form method="get" class="inline">
-        <input type="hidden" name="mode" value="slots">
-        <input type="hidden" name="range" value="{rng}">
-        <input type="number" name="n" min="1" max="20000" value="{nslots}">
-        <button type="submit">go</button>
-      </form>
-    </div>
-  </div>
+  <div class="sub">block-builder slot explorer</div>
 </header>
-<main>{err_html}<div class="scope">{scope_note}</div>
-<div class="grid">{"".join(cards)}</div></main>
-<footer>Every point is one <b>accepted</b> Extend; lane-busy requests are refused
-before the worker and emit nothing. Refusals and promotes record all-zero stage
-stats (<code>state.rs:52</code>). Amber &gt; 25 ms
-(<code>STALL_WARN_US</code>, metrics.rs:20) &middot; red &gt; 47 ms (one round);
-<code>queue_us</code> amber &gt; 1 ms, depth &gt; 16, width &gt; 8 (the pool size).
-</footer></body></html>"""
-
-
-def influx_rows(measurement, slot, host, fields="*"):
-    where = f'"slot" = {slot}'
-    if host:
-        where += f" AND \"host_id\" = '{host}'"
-    cols, rows = influx(f'SELECT {fields} FROM "{measurement}" WHERE {where} ORDER BY time')
-    drop = {"host_id"}
-    keep = [i for i, c in enumerate(cols) if c not in drop]
-    trim = lambda v: (str(v)[11:23] if v and str(v)[:2] == "20" else v)
-    return ([cols[i] for i in keep],
-            [[trim(r[i]) if i == 0 else (r[i] if r[i] is not None else "") for i in keep]
-             for r in rows])
-
-
-def slot_page(slot, prov, rng):
-    panels, errs = [], []
-    host = None
-    try:
-        host = active_host()
-    except Exception as exc:
-        errs.append(f"influx host: {html.escape(str(exc))}")
-
-    # --- why you are here -------------------------------------------------
-    if prov.get("from"):
-        b = prov.get("band") or "ok"
-        try:
-            shown = fmt_val(float(prov["val"]), prov["from"])
-        except (TypeError, ValueError):
-            shown = prov.get("val", "?")
-        label = {"crit": "RED", "hot": "AMBER", "ok": "green"}.get(b, b)
-        prov_html = (
-            f'<div class="prov">You arrived from <b>{html.escape(prov["from"])}</b>'
-            f' &mdash; the <b>{html.escape(prov.get("stat") or "value")}</b> for this slot was'
-            f'<span class="chip {b}">{shown}</span>'
-            f'({label}; thresholds for this metric are '
-            f'{fmt_val(bands_for(prov["from"])[0], prov["from"])} amber / '
-            f'{fmt_val(bands_for(prov["from"])[1], prov["from"])} red).</div>')
-    else:
-        prov_html = ""
-
-    # --- sim-extend -------------------------------------------------------
-    try:
-        c, r = influx_rows("sim-extend", slot, host)
-        panels.append(("sim-extend &mdash; every accepted Extend on this slot",
-                       "One row per accepted Extend (<code>workers.rs:288</code>). "
-                       "<code>layer_count = 0</code> means the batch executed nothing.",
-                       table(c, r)))
-    except Exception as exc:
-        errs.append(f"sim-extend: {html.escape(str(exc))}")
-
-    # --- sim-commit -------------------------------------------------------
-    try:
-        c, r = influx_rows("sim-commit", slot, host)
-        panels.append(("sim-commit &mdash; how each round closed",
-                       "<code>winner</code>: 0 empty / 1 promote (our prefix won) / 2 replay. "
-                       "<code>promoted_len</code> is -1 unless an applied promote. "
-                       "<code>refusal</code> 5 = PREFIX_LEN_MISMATCH, which forces a replay "
-                       "of a round we did win (<code>state.rs:669</code>).",
-                       table(c, r)))
-    except Exception as exc:
-        errs.append(f"sim-commit: {html.escape(str(exc))}")
-
-    # --- bifrost_miniblocks ----------------------------------------------
-    try:
-        c, r = clickhouse(
-            "SELECT ts, kind, index_in_slot, is_last, won_by_us, reward, order_count, "
-            "transaction_count, bundle_count, execution_cost, selected_cu, "
-            "local_builder_id, connector_identity, uuid "
-            f"FROM bifrost_miniblocks WHERE slot = {slot} ORDER BY ts")
-        panels.append(("bifrost_miniblocks &mdash; offers shipped and the winner echo",
-                       "<code>kind=selected</code> is an offer we sent; "
-                       "<code>kind=winner</code> is the relay's echo of what won. "
-                       "<code>won_by_us</code> is the authoritative ownership flag.",
-                       table(c, r)))
-    except Exception as exc:
-        errs.append(f"miniblocks: {html.escape(str(exc))}")
-
-    # --- bifrost_events ---------------------------------------------------
-    try:
-        c, r = clickhouse(
-            "SELECT stage, event, reason, count() AS rows, uniqExact(entity) AS entities, "
-            "min(ts) AS first_ts, max(ts) AS last_ts FROM bifrost_events "
-            f"WHERE nums['slot'] = {slot} GROUP BY stage, event, reason "
-            "ORDER BY rows DESC LIMIT 60")
-        panels.append(("bifrost_events &mdash; what the builder did on this slot",
-                       "Grouped by stage/event/reason. <code>check_dropped</code> reasons are "
-                       "simulator error text; <code>validator:executed</code> is the "
-                       "connector's per-transaction result.",
-                       table(c, r)))
-    except Exception as exc:
-        errs.append(f"events: {html.escape(str(exc))}")
-
-    body = "".join(
-        f'<div class="card"><h2>{t}</h2><div class="blurb">{b}</div>{content}</div>'
-        for t, b, content in panels)
-    err_html = f'<div class="scope err">{"; ".join(errs)}</div>' if errs else ""
-    back = f'/?mode=time&range={rng}' if rng else '/'
-    return f"""<!doctype html><html><head><meta charset="utf-8">
-<title>slot {slot} - simbench</title>
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<style>{CSS}</style></head><body>
-<header>
-  <h1>sim<span>bench</span> &middot; slot {slot}</h1>
-  <div class="sub">everything three stores know about this slot</div>
-  <div class="ctl"><a class="back" href="{back}">&larr; back to the overview</a></div>
-</header>
-<main>{prov_html}{err_html}<div class="grid one">{body}</div></main>
-<footer>Sources: InfluxDB <code>sim-extend</code> / <code>sim-commit</code> (host_id
-{html.escape((host or "?")[:12])}&hellip;), ClickHouse
-<code>block_builder.bifrost_miniblocks</code> and <code>bifrost_events</code>.</footer>
+{strip}
+{body}
+<script>{TICK_JS.replace("__SERVER_NOW__", f"{dt.datetime.now(dt.UTC).timestamp():.3f}")}</script>
 </body></html>"""
 
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
-        qs = urllib.parse.parse_qs(parsed.query)
-        if parsed.path == "/slot":
-            try:
-                slot = int(qs.get("slot", ["0"])[0])
-            except ValueError:
-                slot = 0
-            prov = {k: qs.get(k, [""])[0] for k in ("from", "val", "stat", "band")}
-            try:
-                body = slot_page(slot, prov, qs.get("rng", [""])[0]).encode()
-            except Exception as exc:
-                body = f"<pre>{html.escape(str(exc))}</pre>".encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-            return
         if parsed.path not in ("/", "/index.html"):
             self.send_error(404)
             return
-        rng = qs.get("range", ["24h"])[0]
-        if rng not in RANGES:
-            rng = "24h"
-        mode = qs.get("mode", ["time"])[0]
-        if mode not in ("time", "slots"):
-            mode = "time"
+        qs = urllib.parse.parse_qs(parsed.query)
+        def as_int(name):
+            try:
+                return int(qs.get(name, [""])[0])
+            except ValueError:
+                return None
         try:
-            nslots = max(1, min(20000, int(qs.get("n", ["100"])[0])))
-        except ValueError:
-            nslots = 100
-        try:
-            body = page(rng, mode, nslots).encode()
+            body = page(as_int("win"), as_int("slot"), as_int("round")).encode()
         except Exception as exc:
             body = f"<pre>{html.escape(str(exc))}</pre>".encode()
         self.send_response(200)
