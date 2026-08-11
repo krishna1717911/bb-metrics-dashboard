@@ -7,9 +7,10 @@ mutation lane and the validator's shred path were doing underneath.
 Standard library only. No `pip install`, no CDN, no build step, no framework.
 
 ```bash
-cp .env.example .env      # fill in hosts + credentials
-./run.sh                  # http://127.0.0.1:8899
+cp .env.example .env         # fill in hosts + credentials
+./run.sh                     # binds 0.0.0.0:8899 - see Network below
 ./run.sh --port 9000
+BIND_HOST=127.0.0.1 ./run.sh # loopback only
 ```
 
 ## What it shows
@@ -109,4 +110,16 @@ validator identities in the source. See `.env.example`.
 
 The datastores are typically reachable on a private network only. The dashboard
 must run somewhere that can reach them — it does not proxy or tunnel on your
-behalf. Bind to `127.0.0.1` (the default) unless you have a reason not to.
+behalf.
+
+`run.sh` binds **`0.0.0.0`**, so the page is reachable from other machines. The
+dashboard has **no authentication** and will serve anything the configured
+credentials can read, so expose it on a private interface (a tailnet, a VPN),
+not a public one. To narrow it:
+
+```bash
+BIND_HOST=127.0.0.1 ./run.sh     # loopback only
+./run.sh --host 100.x.y.z        # a specific interface; --host wins over BIND_HOST
+```
+
+Running `python3 app.py` directly still defaults to `127.0.0.1`.
