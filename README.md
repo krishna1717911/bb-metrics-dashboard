@@ -33,13 +33,29 @@ Ages keep counting after render. The page carries the server's clock and the
 browser holds the difference as a fixed offset, so a machine whose clock is off
 still shows ages consistent with the server rather than its own drift.
 
-### 2. Auction rounds
+### 2. Builder run
+
+`run_id` is one builder **process lifetime**, so it changes on every restart. It
+is constant within a (slot, instance) pair, but a slot can carry two runs when
+two instances were live at once — so the panel renders a row per run.
+
+The column that earns its place is **how far into the run this slot fell**. A
+slot served shortly after a restart ran against a cold program cache and a cold
+account overlay; its extend timings are not comparable to one served hours in,
+and without this the panels below would look anomalous for no visible reason.
+Under ten minutes raises a `cold start` pill.
+
+Also carried: the run's instance, start time, total slots and wins, its slot
+span, and this slot's row count and `seq_id` range (`seq_id` is global across
+the run, not per slot, so gaps are visible).
+
+### 3. Auction rounds
 
 Click a window to expand its slots; click a slot for its rounds. Each round
 collapses to one line — offer count, won / not ours / no winner echo, `is_last`,
 and an extend badge — and expands to the detail.
 
-### 3. Mutation lane, per round
+### 4. Mutation lane, per round
 
 `sim-extend` points bucketed by round. Attribution is exact rather than a
 timestamp join: the simulator emits `("index", round.index_in_slot)` on every
@@ -65,7 +81,7 @@ before the worker runs, so the count is *accepted* calls only and a round's
 true offered load is not visible here. A round with zero accepted extends is
 rendered in red and says so explicitly, rather than showing a blank.
 
-### 4. Program cache, per round
+### 5. Program cache, per round
 
 The seven `program_cache_*` fields ride on the same `sim-extend` point as
 `index`, so they are round-attributed structurally — no timestamp matching.
@@ -86,7 +102,7 @@ and `clone us` are 0 on almost every round; a non-zero value is the signal, not
 the baseline. Compiles and forks raise a pill in the header and turn their
 cells amber.
 
-### 5. Shred path — leader vs our simulator
+### 6. Shred path — leader vs our simulator
 
 Per slot, when each side saw it: slot complete, bank frozen, optimistic
 confirmed, with the sim-minus-leader delta. Positive (we were later) is amber,
@@ -116,7 +132,8 @@ cell must not read as a measurement.
 
 ## Performance
 
-A slot costs two queries — one ClickHouse, one InfluxDB — run concurrently and
+A slot costs three queries — two ClickHouse, one InfluxDB, the slow pair run
+concurrently — and they are
 cached for five minutes (64 slots, oldest evicted). Neither query was ever
 per-round; both return the whole slot and are bucketed client-side. Clicking
 between rounds of a cached slot is ~5 ms and issues no query at all. A failed

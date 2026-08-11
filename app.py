@@ -226,7 +226,7 @@ def slot_rounds(slot):
     _, rows = clickhouse(
         "SELECT index_in_slot, kind, toString(ts) AS ts, order_count, transaction_count, "
         "       bundle_count, reward, execution_cost, selected_cu, is_last, "
-        "       won_by_us, uuid, connector_identity "
+        "       won_by_us, uuid, connector_identity, run_id, instance_id, seq_id "
         f"FROM bifrost_miniblocks WHERE slot = {int(slot)} ORDER BY index_in_slot, kind, ts")
     rounds = {}
     for r in rows:
@@ -235,7 +235,8 @@ def slot_rounds(slot):
                 "bundles": ch_int(r[5]), "reward": ch_int(r[6]),
                 "exec_cost": ch_int(r[7]), "sel_cu": ch_int(r[8]),
                 "is_last": r[9] in TRUEISH, "won": r[10] in TRUEISH,
-                "uuid": r[11], "connector": r[12]}
+                "uuid": r[11], "connector": r[12], "run_id": r[13],
+                "instance": r[14], "seq_id": ch_int(r[15])}
         slot_round = rounds.setdefault(idx, {"round": idx, "offers": [], "winner": None})
         if r[1] == "winner":
             slot_round["winner"] = item
@@ -359,7 +360,116 @@ def slot_extends(slot, stamps):
     return out
 
 
-# ------------------------------------------- shred path: dogo vs simulator
+# ---------------------------------------------------------- builder runs
+
+def slot_runs(rounds):
+    """The builder process(es) that served this slot.
+
+    `run_id` is one process lifetime, so it changes on every restart. It is
+    constant within a (slot, instance) pair, but a slot can carry more than one
+    run when two instances were live at once -- so this returns a list, not a
+    single run.
+
+    What makes it worth showing is position: how far into the run this slot
+    fell. A slot served minutes after a restart ran against a cold program
+    cache and a cold account overlay, and its timings are not comparable to one
+    served hours in."""
+    seen = {}
+    for r in rounds:
+        for item in r["offers"] + ([r["winner"]] if r["winner"] else []):
+            rid = item.get("run_id")
+            if not rid:
+                continue
+            slot_run = seen.setdefault(rid, {
+                "run_id": rid, "instance": item.get("instance", ""),
+                "first_ts": item["ts"], "last_ts": item["ts"], "rows": 0,
+                "seq_lo": item["seq_id"], "seq_hi": item["seq_id"]})
+            slot_run["rows"] += 1
+            slot_run["first_ts"] = min(slot_run["first_ts"], item["ts"])
+            slot_run["last_ts"] = max(slot_run["last_ts"], item["ts"])
+            slot_run["seq_lo"] = min(slot_run["seq_lo"], item["seq_id"])
+            slot_run["seq_hi"] = max(slot_run["seq_hi"], item["seq_id"])
+    if not seen:
+        return []
+    quoted = ",".join("'" + rid.replace("'", "") + "'" for rid in seen)
+    _, rows = clickhouse(
+        "SELECT run_id, any(instance_id) AS instance, toString(min(ts)) AS started, "
+        "       toString(max(ts)) AS ended, uniqExact(slot) AS slots, "
+        "       min(slot) AS slot_lo, max(slot) AS slot_hi, "
+        "       uniqExactIf(slot, won_by_us) AS won "
+        f"FROM bifrost_miniblocks WHERE run_id IN ({quoted}) "
+        f"  AND local_builder_id = '{CH_BUILDER}' GROUP BY run_id")
+    for r in rows:
+        if r[0] in seen:
+            seen[r[0]].update(instance=r[1], started=r[2], ended=r[3],
+                              slots=ch_int(r[4]), slot_lo=ch_int(r[5]),
+                              slot_hi=ch_int(r[6]), won=ch_int(r[7]))
+    return sorted(seen.values(), key=lambda s: s["first_ts"])
+
+
+def since(a, b):
+    """b - a as a coarse duration, both naive-UTC ClickHouse strings."""
+    start, end = epoch(a), epoch(b)
+    if start is None or end is None:
+        return "?"
+    secs = max(0, int(end - start))
+    d, rem = divmod(secs, 86400)
+    h, rem = divmod(rem, 3600)
+    m, s = divmod(rem, 60)
+    if d:
+        return f"{d}d {h}h"
+    if h:
+        return f"{h}h {m}m"
+    if m:
+        return f"{m}m {s}s"
+    return f"{s}s"
+
+
+# A slot served shortly after a restart ran against cold caches.
+COLD_RUN_SECONDS = 600
+
+
+def runs_html(slot, runs):
+    if not runs:
+        return ""
+    rows = []
+    for run in runs:
+        started = run.get("started")
+        into = since(started, run["first_ts"]) if started else "?"
+        age = epoch(run["first_ts"]) - epoch(started) if started else None
+        cold = age is not None and age < COLD_RUN_SECONDS
+        span = (f'{run.get("slot_lo","?")} &ndash; {run.get("slot_hi","?")}'
+                if started else "?")
+        num = lambda key: (f"{run[key]:,}" if isinstance(run.get(key), int)
+                           else "?")
+        rows.append(
+            "<tr>"
+            f'<td class=m>{html.escape(run["run_id"])}{copy_btn(run["run_id"])}</td>'
+            f'<td class=m>{html.escape(run.get("instance", ""))}</td>'
+            f'<td class=m>{html.escape((started or "?")[:19])}</td>'
+            f'<td class="n m{" bad" if cold else ""}">{into}'
+            + ("<span class='warnpill'>cold start</span>" if cold else "")
+            + "</td>"
+            f'<td class="n m">{num("slots")}</td>'
+            f'<td class="n m">{num("won")}</td>'
+            f'<td class="n m">{span}</td>'
+            f'<td class="n m">{run["rows"]} rows, seq '
+            f'{run["seq_lo"]}&ndash;{run["seq_hi"]}</td></tr>')
+    head = ("<tr><th>run_id</th><th>instance</th><th>run started (UTC)</th>"
+            "<th class=n>slot is this far in</th><th class=n>run slots</th>"
+            "<th class=n>run wins</th><th class=n>run slot span</th>"
+            "<th class=n>this slot</th></tr>")
+    return ('<div class="panel"><div class="dtlhead">builder run'
+            + ("s" if len(runs) > 1 else "")
+            + "<span class='note'>run_id is one builder process lifetime, so it "
+              "changes on every restart &middot; a slot served soon after a "
+              "restart ran against cold caches and its timings are not "
+              "comparable to one served hours in</span></div>"
+            f"<table><thead>{head}</thead><tbody>{''.join(rows)}</tbody></table>"
+            "</div>")
+
+
+# ----------------------------------------- shred path: leader vs simulator
 
 # host_id is the validator identity. Several nodes write the same measurement
 # names, so anything unbound silently blends machines. These are deployment
@@ -370,11 +480,11 @@ def slot_extends(slot, stamps):
 #                     any node on a different chain or replaying history: such a
 #                     node can write the same measurement names at a wildly
 #                     different slot height and will pollute unpinned queries.
-DOGO = os.environ.get("SHRED_LEADER_ID", "")
+LEADER = os.environ.get("SHRED_LEADER_ID", "")
 SIM = os.environ.get("SHRED_SIM_ID", "")
 OFF_CHAIN = [h.strip() for h in os.environ.get("SHRED_EXCLUDE_IDS", "").split(",")
              if h.strip()]
-HOST_NAME = {DOGO: "leader", SIM: "our simulator"}
+HOST_NAME = {LEADER: "leader", SIM: "our simulator"}
 # measurement -> (row label, sort key). The timestamp IS the datum for all four.
 SHRED_STAGES = [("retransmit-first-shred", "first shred received"),
                 ("shred_insert_is_full", "slot complete"),
@@ -406,7 +516,7 @@ def slot_shreds(slot, stamps):
     out = {}
     for ser in series:
         host = ser["tags"]["host_id"]
-        if host in OFF_CHAIN or host not in (DOGO, SIM):
+        if host in OFF_CHAIN or host not in (LEADER, SIM):
             continue
         col = {name: i for i, name in enumerate(ser["columns"])}
         row = ser["values"][0]
@@ -422,12 +532,12 @@ def slot_shreds(slot, stamps):
 
 
 def shred_html(slot, shreds):
-    """A stage x host grid, with the sim-minus-dogo delta called out."""
+    """A stage x host grid, with the sim-minus-leader delta called out."""
     if not shreds:
-        return ('<div class="panel"><div class="dtlhead">shred path &mdash; dogo vs '
+        return ('<div class="panel"><div class="dtlhead">shred path &mdash; leader vs '
                 'our simulator</div><div class="none">no shred-path rows for this '
                 "slot</div></div>")
-    hosts = [h for h in (DOGO, SIM) if h]   # the leader and us, nothing else
+    hosts = [h for h in (LEADER, SIM) if h]   # the leader and us, nothing else
     head = ("<tr><th>stage</th>"
             + "".join(f"<th class=n>{html.escape(HOST_NAME[h])}</th>" for h in hosts)
             + "<th class=n>sim &minus; leader</th><th>detail</th></tr>")
@@ -441,8 +551,8 @@ def shred_html(slot, shreds):
             e = seen.get(h)
             cells.append(f"<td class='n m'>{dt.datetime.fromtimestamp(e['t']/1e9, dt.UTC).strftime('%H:%M:%S.%f')[:-3]}</td>"
                          if e else "<td class='n m dim'>&mdash;</td>")
-        if DOGO in seen and SIM in seen:
-            d = (seen[SIM]["t"] - seen[DOGO]["t"]) / 1e6
+        if LEADER in seen and SIM in seen:
+            d = (seen[SIM]["t"] - seen[LEADER]["t"]) / 1e6
             cls = "bad" if d > 0 else "good"
             delta = f"<td class='n m {cls}'>{d:+.1f} ms</td>"
         else:
@@ -455,11 +565,11 @@ def shred_html(slot, shreds):
         body.append(f"<tr><td class=m>{label}</td>{''.join(cells)}{delta}"
                     f"<td class='m dim'>{note}</td></tr>")
     if not body:
-        return ('<div class="panel"><div class="dtlhead">shred path &mdash; dogo vs '
+        return ('<div class="panel"><div class="dtlhead">shred path &mdash; leader vs '
                 'our simulator</div><div class="none">neither the leader nor our '
                 "simulator reported the shred path for this slot</div></div>")
     missing = ""
-    if not any(DOGO in v for v in shreds.values()):
+    if not any(LEADER in v for v in shreds.values()):
         # A leader's metric submission can be intermittent while peers report
         # continuously, so an empty leader column is a reporting gap rather
         # than evidence of a slow node. Say so, rather than let it read as a
@@ -469,7 +579,7 @@ def shred_html(slot, shreds):
                    "reporting rather than a slow node</span>")
     elif not any(SIM in v for v in shreds.values()):
         missing = '<span class="note">our simulator host wrote nothing here</span>'
-    return ('<div class="panel"><div class="dtlhead">shred path &mdash; dogo vs our '
+    return ('<div class="panel"><div class="dtlhead">shred path &mdash; leader vs our '
             'simulator'
             '<span class="note">positive delta = our simulator was later &middot; '
             'joined on slot, not on time &middot; our host does not emit '
@@ -520,10 +630,15 @@ def slot_data(slot):
         shreds, shred_err = fut["shred"].result(), None
     except Exception as exc:
         shreds, shred_err = {}, str(exc)[:140]
+    try:
+        runs, runs_err = slot_runs(rounds), None
+    except Exception as exc:
+        runs, runs_err = [], str(exc)[:140]
     data = {"rounds": rounds, "extends": extends, "ext_err": ext_err,
-            "shreds": shreds, "shred_err": shred_err}
+            "shreds": shreds, "shred_err": shred_err,
+            "runs": runs, "runs_err": runs_err}
 
-    if ext_err is None and shred_err is None:
+    if ext_err is None and shred_err is None and runs_err is None:
         with _slot_lock:
             if len(_slot_cache) >= SLOT_CACHE_MAX:
                 _slot_cache.pop(min(_slot_cache, key=lambda k: _slot_cache[k][0]),
@@ -651,6 +766,11 @@ def rounds_html(slot, sel_round):
         return f'<div class="empty">no miniblock rows for slot <b>{slot}</b></div>'
 
     out = []
+    if data["runs_err"]:
+        out.append('<div class="err" style="margin:0 28px 8px">builder run '
+                   f"unavailable: {html.escape(data['runs_err'])}</div>")
+    else:
+        out.append(runs_html(slot, data["runs"]))
     if data["shred_err"]:
         out.append('<div class="err" style="margin:0 28px 8px">shred path '
                    f"unavailable: {html.escape(data['shred_err'])}</div>")
