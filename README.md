@@ -156,6 +156,11 @@ and red cutoffs, and **the basis for each cutoff**, alongside this deployment's
 own p50/p90/p99 over the last 24 hours so a threshold can be judged against the
 distribution it is supposed to describe.
 
+Every health cell in the header also carries an **i** affordance, opening on
+hover or keyboard focus, with the same meaning / healthy / amber / red / gotcha
+text. Both are rendered from one `METRIC_DOCS` table, so the header and this
+page cannot drift apart.
+
 Cutoffs are tagged by provenance, because they are not equally trustworthy:
 
 | tag | meaning |

@@ -136,6 +136,8 @@ def ch_int(v, default=0):
 # signal: sim-extend / sim-commit / sim-context counts. Work is bursty by leader
 # window, so zero between windows is normal and only a long zero run is a stall.
 WORK_WINDOW_MIN = 20
+# The pool only fills during a leader window, so this must span several.
+SCHED_WINDOW_H = 6
 _health_cache = {"at": 0.0, "data": None}
 HEALTH_TTL = 30
 
@@ -201,22 +203,26 @@ def health_probe():
         return [{"connectors": x[0], "relays": x[1], "n": ch_int(x[2])} for x in r]
 
     def scheduler():
-        # pool oscillates on the ~10s log cadence, so a single sample flaps
-        # between "busy" and "nothing to build". Judge on the peak across the
-        # window and show the latest alongside it.
+        # The pool only fills during a leader window. Measured over an hour it
+        # is non-zero in ~6 of 360 samples, so a short zero run is the normal
+        # off-window resting state, not a fault -- judging it over 15 minutes
+        # sat on amber permanently. Peak over a span covering several windows.
         r = otel("SELECT max(toUInt64OrZero(LogAttributes['pool'])) AS pool_max, "
                  "argMax(LogAttributes['pool'], Timestamp) AS pool_last, "
                  "argMax(LogAttributes['prefix'], Timestamp) AS prefix_last, "
                  "argMax(LogAttributes['inflight_probes'], Timestamp) AS inflight, "
                  "max(toUInt64OrZero(LogAttributes['probe_queue'])) AS queue_max, "
+                 "countIf(toUInt64OrZero(LogAttributes['pool']) > 0) AS busy, "
                  "count() AS samples, toString(max(Timestamp)) AS at "
-                 "FROM otel_logs WHERE Timestamp > now() - INTERVAL 15 MINUTE "
+                 "FROM otel_logs WHERE Timestamp > now() - INTERVAL "
+                 f"{SCHED_WINDOW_H} HOUR "
                  f"AND ServiceName = '{OTEL_SERVICE}' AND Body = 'scheduler status'")
-        if not r or not ch_int(r[0][5]):
+        if not r or not ch_int(r[0][6]):
             return None
         return {"pool_max": ch_int(r[0][0]), "pool": r[0][1], "prefix": r[0][2],
                 "inflight": r[0][3], "queue_max": ch_int(r[0][4]),
-                "samples": ch_int(r[0][5]), "at": r[0][6]}
+                "busy": ch_int(r[0][5]), "samples": ch_int(r[0][6]),
+                "at": r[0][7]}
 
     for name, fn in (("work", work), ("ingest", ingest), ("restart", restart),
                      ("connector", connector), ("network", network),
@@ -234,8 +240,32 @@ def health_html():
                 f"{html.escape(str(exc))[:160]}</div>")
     cells = []
 
+    def info(label):
+        """The i affordance. Text comes from METRIC_DOCS, the same source the
+        reference page renders, so the two cannot disagree."""
+        d = DOC_BY_NAME.get(label)
+        if not d:
+            return ""
+        rows = "".join(
+            f'<div class="pr"><span class="pk {cls}">{k}</span>'
+            f'<span class="pv">{v}</span></div>'
+            for k, v, cls in (("healthy", d["good"], "greenc"),
+                              ("amber", d["amber"], "amberc"),
+                              ("red", d["red"], "redc"))
+            if v and v != "&mdash;")
+        cls, plabel = PROV[d["prov"]]
+        return (f'<span class="info" tabindex="0" role="button" '
+                f'aria-label="what {label} means">i'
+                f'<span class="pop"><span class="pm">{d["meaning"]}</span>'
+                f"{rows}"
+                f'<span class="pg">{d["gotcha"]}</span>'
+                f'<span class="pf">cutoffs: <span class="{cls}">{plabel}</span>'
+                f' &middot; <a href="/reference">full reference</a></span>'
+                "</span></span>")
+
     def cell(label, value, state, detail=""):
-        cells.append(f'<div class="hc {state}"><div class="hl">{label}</div>'
+        cells.append(f'<div class="hc {state}"><div class="hl">{label}'
+                     f"{info(label)}</div>"
                      f'<div class="hv">{value}</div>'
                      f'<div class="hd">{detail}</div></div>')
 
@@ -281,13 +311,15 @@ def health_html():
     s = h["scheduler"]
     if s["ok"] and s["v"]:
         v = s["v"]
-        # only a peak of zero across the whole window means nothing to build
+        # zero only counts as a fault across a span covering several leader
+        # windows; off-window zero is the normal resting state
         idle = v["pool_max"] == 0
         cell("scheduler", f'pool {v["pool_max"]:,}', "warn" if idle else "good",
-             f'peak over 15m &middot; latest {v["pool"]} &middot; prefix '
-             f'{v["prefix"]} &middot; inflight {v["inflight"]} &middot; queue peak '
-             f'{v["queue_max"]:,} &middot; {v["samples"]} samples'
-             + (" &mdash; nothing to build" if idle else ""))
+             f'peak over {SCHED_WINDOW_H}h &middot; latest {v["pool"]} &middot; '
+             f'busy in {v["busy"]}/{v["samples"]} samples &middot; queue peak '
+             f'{v["queue_max"]:,}'
+             + (f" &mdash; nothing to build in {SCHED_WINDOW_H}h" if idle
+                else " &mdash; 0 off-window is normal"))
     elif s["ok"]:
         cell("scheduler", "silent", "warn", "no scheduler status in 15m")
     else:
@@ -1060,9 +1092,31 @@ a.navlink:hover{background:#0f766e22;border-color:#5eead4}
   background:#78350f33;border-radius:4px;padding:1px 6px;text-transform:uppercase}
 .panel th{vertical-align:bottom}
 .panel td{vertical-align:top}
+/* the i affordance on a health cell */
+.info{display:inline-flex;align-items:center;justify-content:center;width:13px;
+  height:13px;margin-left:6px;border:1px solid #2f4256;border-radius:50%;
+  color:#7d90a6;font-size:9px;font-style:italic;font-weight:700;cursor:help;
+  position:relative;vertical-align:middle;font-family:Georgia,serif}
+.info:hover,.info:focus{border-color:#5eead4;color:#5eead4;outline:none}
+.info .pop{display:none;position:absolute;left:-8px;top:20px;z-index:60;
+  width:310px;background:#0d151d;border:1px solid #2f4256;border-radius:9px;
+  padding:11px 13px;box-shadow:0 10px 30px #000a;text-transform:none;
+  letter-spacing:0;font-style:normal;font-weight:400;cursor:default}
+.info:hover .pop,.info:focus .pop,.info:focus-within .pop{display:block}
+.pm{display:block;color:#c3d3e6;font-size:11.5px;line-height:1.55}
+.pr{display:flex;gap:8px;margin-top:6px;align-items:baseline}
+.pk{flex:0 0 52px;font-size:9px;text-transform:uppercase;letter-spacing:.06em}
+.pv{color:#9fb2c8;font-size:11px;font-family:ui-monospace,Menlo,monospace}
+.pg{display:block;margin-top:9px;padding-top:8px;border-top:1px solid #1e2937;
+  color:#7d90a6;font-size:10.5px;font-style:italic;line-height:1.5}
+.pf{display:block;margin-top:8px;color:#5b6b80;font-size:10px}
+.pf a{color:#5eead4;text-decoration:none}
+.pf a:hover{text-decoration:underline}
+.greenc{color:#5eead4}
+.hc{overflow:visible}
 .health{display:flex;gap:10px;padding:14px 28px 4px;flex-wrap:wrap}
 .hc{flex:1 1 190px;background:#111823;border:1px solid #1e2937;border-radius:9px;
-  padding:9px 13px;border-left-width:3px}
+  padding:9px 13px;border-left-width:3px;position:relative;overflow:visible}
 .hc.good{border-left-color:#14b8a6}
 .hc.warn{border-left-color:#fbbf24}
 .hc.dead{border-left-color:#dc2626;background:#1a1114}
@@ -1357,86 +1411,125 @@ def window_html(windows, sel_win, sel_slot):
 #               incident. These are the ones to argue with.
 DOC_WINDOW_H = 24
 
+def _doc(panel, name, meas, field, meaning, good, amber, red, prov, gotcha):
+    return {"panel": panel, "name": name, "meas": meas, "field": field,
+            "meaning": meaning, "good": good, "amber": amber, "red": red,
+            "prov": prov, "gotcha": gotcha}
+
+
+# `name` matches the health cell label exactly, so the header tooltip and the
+# reference page are rendered from one source and cannot drift.
 METRIC_DOCS = [
- ("health", "building", None, None,
+ _doc("health", "building", None, None,
   "Count of sim-extend + sim-commit points in the last 20 minutes. The only "
   "honest liveness signal: a status heartbeat keeps ticking on a stalled "
   "builder, but work does not.",
-  "0 over a whole leader window", "0 for hours",
+  "any non-zero count", "0 over a whole leader window", "0 for hours",
   "provisional",
   "Work is bursty by leader window, so a short zero run is normal. Nobody has "
-  "pinned how long a zero run must be before it is a stall."),
- ("health", "connector live_slot", None, None,
-  "Count of connector-status log lines whose slot attribute is non-zero. An "
-  "idle connector still reports the live chain head, so this is the feed "
-  "health signal.",
-  "&mdash;", "0 across all identities",
+  "pinned how long a zero run must be before it counts as a stall."),
+ _doc("health", "connector feed", None, None,
+  "Connector-status log lines whose slot attribute is non-zero. An idle "
+  "connector still reports the live chain head, so this is the feed health "
+  "signal.",
+  "live_slot &gt; 0", "&mdash;", "live_slot 0 across all identities",
   "code",
   "active (leader_state != Inactive) is NOT the health signal -- it only rises "
-  "while a served validator leads, so 0 is normal off-window."),
- ("health", "event ingest lag", None, None,
-  "dateDiff between max(ts) in bifrost_events for this instance and now.",
-  "&gt; 60 s", "&gt; 300 s",
+  "while a served validator is leading, so active=0 is normal off-window and "
+  "must not be read as a fault."),
+ _doc("health", "topology", None, None,
+  "Connector and relay counts from builder-network-status lines over 10 "
+  "minutes.",
+  "one stable pair matching the deployed topology",
+  "more than one distinct pair in 10m (flapping)",
+  "a sustained drop below the deployed count",
   "provisional",
-  "Compare against the best peer instance in the same query -- a global "
+  "There is no deployed-topology value wired in, so this cannot tell a "
+  "legitimate scale-down from a degradation. It only flags instability."),
+ _doc("health", "scheduler", None, None,
+  "Peak scheduler pool depth over 6 hours, with how many samples were busy.",
+  "any non-zero peak; 0 between leader windows is the normal resting state",
+  "&mdash;", "peak 0 across the whole 6h span",
+  "provisional",
+  "The pool only fills during a leader window -- measured over an hour it is "
+  "non-zero in about 6 of 360 samples. Judging it over 15 minutes flagged "
+  "amber almost permanently, so the window has to span several windows."),
+ _doc("health", "event ingest", None, None,
+  "Seconds between the newest bifrost_events row for this instance and now.",
+  "under 60 s", "&gt; 60 s", "&gt; 300 s",
+  "provisional",
+  "Always read against the best peer instance shown alongside: a global "
   "ClickHouse stall and a single-instance stall look identical otherwise."),
- ("extends", "body_us", "sim-extend", "body_us",
+ _doc("health", "last restart", None, None,
+  "Most recent builder reconnect to the local sim on 127.0.0.1, which is the "
+  "restart signature.",
+  "hours to days ago",
+  "minutes ago -- caches are cold and timings are not comparable",
+  "repeated restarts in a short span (crash loop)",
+  "provisional",
+  "A restart is not itself a fault; it is context. Slot timings taken shortly "
+  "after one ran against a cold program cache and account overlay."),
+ _doc("extends", "body_us", "sim-extend", "body_us",
   "The extend itself: sanitize, check, DAG execute, and the commit of account "
   "diffs into the round overlay. Wall time on the mutation lane.",
-  "&gt; 25 ms", "&gt; 47 ms",
+  "at or below the observed p90", "&gt; 25 ms", "&gt; 47 ms",
   "provisional",
-  "47 ms is roughly one slot at 400 ms across the ~8 extends a round typically "
-  "runs, so it is an order-of-magnitude marker rather than a measured limit."),
- ("extends", "queue_us", "sim-extend", "queue_us",
+  "47 ms is roughly one slot at 400 ms across the ~8 extends a round runs, so "
+  "it is order-of-magnitude reasoning rather than a measured limit. Observed "
+  "p99 is far below it."),
+ _doc("extends", "queue_us", "sim-extend", "queue_us",
   "Wait before the work, on the single pinned mutation thread behind a "
   "bounded(1) channel shared with commit. Contention, not work.",
-  "&gt; 1 ms", "&gt; 5 ms",
+  "tens of microseconds", "&gt; 1 ms", "&gt; 5 ms",
   "provisional",
   "Refused extends never reach the worker and emit no datapoint at all, so "
   "queue_us understates contention by construction."),
- ("extends", "exec_wall_us", "sim-extend", "exec_wall_us",
-  "Wall time of the DAG execution inside the extend. Compare to body_us as a "
-  "ratio to see how much of the extend was actual execution.",
-  "&mdash;", "&mdash;",
-  "measured", "Tracks body_us closely; a large gap means time went to "
+ _doc("extends", "exec_wall_us", "sim-extend", "exec_wall_us",
+  "Wall time of the DAG execution inside the extend.",
+  "close to body_us", "&mdash;", "&mdash;",
+  "measured",
+  "Read as a ratio against body_us: a large gap means time went to "
   "sanitize/check/overlay rather than execution."),
- ("extends", "program_cache_us", "sim-extend", "program_cache_us",
-  "Program-cache time accumulated across replay workers. CPU time, not wall.",
-  "&mdash;", "&mdash;",
+ _doc("extends", "program_cache_us", "sim-extend", "program_cache_us",
+  "Program-cache time accumulated across replay workers.",
+  "microseconds", "&mdash;", "&mdash;",
   "code",
-  "Accumulated across workers, so it can exceed wall clock. Read against "
-  "exec_wall_us as a ratio; never subtract from body_us."),
- ("commits", "body_us", "sim-commit", "body_us",
+  "Accumulated across workers, so it is CPU time and can exceed wall clock. "
+  "Read against exec_wall_us as a ratio; never subtract from body_us."),
+ _doc("commits", "body_us", "sim-commit", "body_us",
   "Commit wall time. SIZE-CONFOUNDED: a commit of 400 orders is not slow "
   "relative to one of 40, it is bigger.",
-  "&mdash;", "&mdash;",
+  "n/a -- do not threshold raw", "&mdash;", "&mdash;",
   "code",
-  "Never threshold this raw. Normalize by replayed -- see per-order below."),
- ("commits", "per-order (body_us / replayed)", None, None,
+  "Never threshold this directly. Normalize by replayed; see per-order."),
+ _doc("commits", "per-order (body_us / replayed)", None, None,
   "The size-matched commit cost. This is the number to threshold.",
+  "111-149 us/order per the ops runbook",
   "&gt; 149 us/order", "&gt; 300 us/order",
   "provisional",
-  "111-149 us/order is quoted as healthy in the ops runbook. On this "
-  "deployment only 32% of commits land inside that band and p50 sits at 146, "
-  "right on its upper edge -- so either the band is a p50 target we barely "
-  "meet, or it is stale. This one most needs a second opinion."),
- ("commits", "replayed", "sim-commit", "replayed",
+  "On this deployment only 32% of commits land inside the quoted band and p50 "
+  "sits at 146, right on its upper edge -- so either the band is a p50 target "
+  "we barely meet, or it is stale. This one most needs a second opinion."),
+ _doc("commits", "replayed", "sim-commit", "replayed",
   "ORDER COUNT for the commit. Not a latency, despite the name.",
-  "&mdash;", "&mdash;",
+  "n/a", "&mdash;", "&mdash;",
   "code", "Used as the denominator for per-order cost."),
- ("shreds", "total_time_ms", "shred_insert_is_full", "total_time_ms",
+ _doc("shreds", "total_time_ms", "shred_insert_is_full", "total_time_ms",
   "Slot completion time, measured per node from its own first shred.",
-  "&gt; 600 ms", "&gt; 1000 ms",
+  "at or below ~400 ms, one slot", "&gt; 600 ms", "&gt; 1000 ms",
   "provisional",
   "A slot is 400 ms, so sustained completion above that means falling behind. "
-  "p50 here is ~369 ms. Never compare across a restart or deploy."),
- ("shreds", "sim - leader delta", None, None,
+  "Never compare across a restart or deploy."),
+ _doc("shreds", "sim - leader delta", None, None,
   "Our simulator's timestamp minus the leader's, per slot, per stage.",
+  "at or below 0 -- we saw it no later than the leader",
   "&gt; 0 (we are later)", "&gt; 50 ms",
   "provisional",
   "Joined on slot, never on time. An absent leader column is a reporting gap, "
   "not a slow node."),
 ]
+
+DOC_BY_NAME = {d["name"]: d for d in METRIC_DOCS}
 
 
 _doc_cache = {"at": 0.0, "data": None}
@@ -1450,9 +1543,9 @@ def doc_baselines():
         return _doc_cache["data"]
     out = {}
     wanted = {}
-    for _, _, meas, field, *_rest in METRIC_DOCS:
-        if meas and field:
-            wanted.setdefault(meas, []).append(field)
+    for d in METRIC_DOCS:
+        if d["meas"] and d["field"]:
+            wanted.setdefault(d["meas"], []).append(d["field"])
     for meas, fields in wanted.items():
         try:
             sel = ", ".join(
@@ -1539,13 +1632,15 @@ def reference_page():
         return f"{v/1000:,.1f} ms" if v >= 1000 else f"{v:,.0f} &micro;s"
 
     groups = {}
-    for panel, name, meas, field, meaning, amber, red, prov, gotcha in METRIC_DOCS:
-        groups.setdefault(panel, []).append(
-            (name, meas, field, meaning, amber, red, prov, gotcha))
+    for d in METRIC_DOCS:
+        groups.setdefault(d["panel"], []).append(d)
     out = []
     for panel, items in groups.items():
         rows = []
-        for name, meas, field, meaning, amber, red, prov, gotcha in items:
+        for d in items:
+            name, meas, field = d["name"], d["meas"], d["field"]
+            meaning, amber, red = d["meaning"], d["amber"], d["red"]
+            prov, gotcha, good = d["prov"], d["gotcha"], d["good"]
             key = (meas, field) if meas else (
                 ("derived", "per_order") if "per-order" in name else None)
             b = base.get(key) if key else None
@@ -1571,13 +1666,14 @@ def reference_page():
                 f"<tr><td><b>{name}</b><div class='mdesc'>{meaning}</div>"
                 f"<div class='mgotcha'>{gotcha}</div></td>"
                 f"<td class='m'>{src}</td>"
+                f"<td class='m greenc'>{good}</td>"
                 f"<td class='m amberc'>{amber}</td><td class='m redc'>{red}</td>"
                 f"<td><span class='{cls}'>{label}</span></td>"
                 f"<td class='m dim'>{shown}</td></tr>")
         out.append(
             f'<div class="panel"><div class="dtlhead">{panel}</div>'
             "<table><thead><tr><th>metric</th><th>source</th>"
-            "<th>amber</th><th>red</th><th>cutoff basis</th>"
+            "<th>healthy</th><th>amber</th><th>red</th><th>cutoff basis</th>"
             f"<th>this deployment, last {DOC_WINDOW_H}h</th></tr></thead>"
             f"<tbody>{''.join(rows)}</tbody></table></div>")
 
