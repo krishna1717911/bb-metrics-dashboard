@@ -149,6 +149,29 @@ with a note that it is a **reporting gap, not a slow node** — a leader's metri
 submission can be intermittent while peers report continuously, and an empty
 cell must not read as a measurement.
 
+## Metrics reference — `/reference`
+
+A page documenting every metric: what it measures, its source field, the amber
+and red cutoffs, and **the basis for each cutoff**, alongside this deployment's
+own p50/p90/p99 over the last 24 hours so a threshold can be judged against the
+distribution it is supposed to describe.
+
+Cutoffs are tagged by provenance, because they are not equally trustworthy:
+
+| tag | meaning |
+|---|---|
+| `from code` | forced by the source — a slot is 400 ms, the replay pool is 8 |
+| `measured` | taken from this deployment's own distribution |
+| `PROVISIONAL` | an inference, **not** validated against an SLO or an incident |
+
+Most are provisional. The page says so at the top rather than presenting
+inferred numbers as agreed limits.
+
+The one most in need of a second opinion is **per-order commit cost**. The ops
+runbook quotes 111–149 µs/order as healthy; on this deployment p50 sits at
+146 µs — right on the upper edge — and only **32%** of commits fall inside the
+band at all. Either it is a p50 target we barely meet, or it is stale.
+
 ## Things that will bite you
 
 - **Join on `slot`, never on time.** ClickHouse and InfluxDB normally agree to

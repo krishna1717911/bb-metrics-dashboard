@@ -1039,6 +1039,27 @@ header{padding:20px 28px 14px;display:flex;gap:16px;align-items:baseline;
 h1{margin:0;font-size:17px;font-weight:650;letter-spacing:-.01em}
 h1 span{color:#5eead4}
 .sub{color:#6b7f96;font-size:12.5px}
+a.navlink{margin-left:auto;color:#5eead4;font-size:12px;text-decoration:none;
+  border:1px solid #14b8a655;border-radius:6px;padding:4px 11px}
+a.navlink:hover{background:#0f766e22;border-color:#5eead4}
+.callout{margin:16px 28px;padding:12px 16px;border-radius:9px;
+  background:#2a1f06;border:1px solid #78350f;color:#fcd9a4;font-size:12.5px;
+  line-height:1.6}
+.callout b{color:#fbbf24}
+.mdesc{color:#8fa6bf;font-size:11px;margin-top:3px;font-weight:400;line-height:1.5}
+.mgotcha{color:#6b7f96;font-size:10.5px;margin-top:4px;font-style:italic;
+  line-height:1.5}
+.amberc{color:#fbbf24}
+.redc{color:#fca5a5}
+.warnt{color:#fbbf24}
+.prov-code{color:#5eead4;font-size:9.5px;border:1px solid #14b8a655;
+  border-radius:4px;padding:1px 6px;text-transform:uppercase}
+.prov-meas{color:#93c5fd;font-size:9.5px;border:1px solid #1d4ed855;
+  border-radius:4px;padding:1px 6px;text-transform:uppercase}
+.prov-prov{color:#fbbf24;font-size:9.5px;border:1px solid #78350f;
+  background:#78350f33;border-radius:4px;padding:1px 6px;text-transform:uppercase}
+.panel th{vertical-align:bottom}
+.panel td{vertical-align:top}
 .health{display:flex;gap:10px;padding:14px 28px 4px;flex-wrap:wrap}
 .hc{flex:1 1 190px;background:#111823;border:1px solid #1e2937;border-radius:9px;
   padding:9px 13px;border-left-width:3px}
@@ -1326,6 +1347,261 @@ def window_html(windows, sel_win, sel_slot):
             + "".join(slotchip(s) for s in win["slots"]) + "</div>")
 
 
+# ------------------------------------------------------- metrics reference
+
+# Every threshold below carries a PROVENANCE, because they are not equally
+# trustworthy and reviewers need to know which is which:
+#   code        forced by the source -- a slot is 400ms, the replay pool is 8
+#   measured    taken from this deployment's own distribution
+#   provisional an inference that has NOT been validated against an SLO or an
+#               incident. These are the ones to argue with.
+DOC_WINDOW_H = 24
+
+METRIC_DOCS = [
+ ("health", "building", None, None,
+  "Count of sim-extend + sim-commit points in the last 20 minutes. The only "
+  "honest liveness signal: a status heartbeat keeps ticking on a stalled "
+  "builder, but work does not.",
+  "0 over a whole leader window", "0 for hours",
+  "provisional",
+  "Work is bursty by leader window, so a short zero run is normal. Nobody has "
+  "pinned how long a zero run must be before it is a stall."),
+ ("health", "connector live_slot", None, None,
+  "Count of connector-status log lines whose slot attribute is non-zero. An "
+  "idle connector still reports the live chain head, so this is the feed "
+  "health signal.",
+  "&mdash;", "0 across all identities",
+  "code",
+  "active (leader_state != Inactive) is NOT the health signal -- it only rises "
+  "while a served validator leads, so 0 is normal off-window."),
+ ("health", "event ingest lag", None, None,
+  "dateDiff between max(ts) in bifrost_events for this instance and now.",
+  "&gt; 60 s", "&gt; 300 s",
+  "provisional",
+  "Compare against the best peer instance in the same query -- a global "
+  "ClickHouse stall and a single-instance stall look identical otherwise."),
+ ("extends", "body_us", "sim-extend", "body_us",
+  "The extend itself: sanitize, check, DAG execute, and the commit of account "
+  "diffs into the round overlay. Wall time on the mutation lane.",
+  "&gt; 25 ms", "&gt; 47 ms",
+  "provisional",
+  "47 ms is roughly one slot at 400 ms across the ~8 extends a round typically "
+  "runs, so it is an order-of-magnitude marker rather than a measured limit."),
+ ("extends", "queue_us", "sim-extend", "queue_us",
+  "Wait before the work, on the single pinned mutation thread behind a "
+  "bounded(1) channel shared with commit. Contention, not work.",
+  "&gt; 1 ms", "&gt; 5 ms",
+  "provisional",
+  "Refused extends never reach the worker and emit no datapoint at all, so "
+  "queue_us understates contention by construction."),
+ ("extends", "exec_wall_us", "sim-extend", "exec_wall_us",
+  "Wall time of the DAG execution inside the extend. Compare to body_us as a "
+  "ratio to see how much of the extend was actual execution.",
+  "&mdash;", "&mdash;",
+  "measured", "Tracks body_us closely; a large gap means time went to "
+  "sanitize/check/overlay rather than execution."),
+ ("extends", "program_cache_us", "sim-extend", "program_cache_us",
+  "Program-cache time accumulated across replay workers. CPU time, not wall.",
+  "&mdash;", "&mdash;",
+  "code",
+  "Accumulated across workers, so it can exceed wall clock. Read against "
+  "exec_wall_us as a ratio; never subtract from body_us."),
+ ("commits", "body_us", "sim-commit", "body_us",
+  "Commit wall time. SIZE-CONFOUNDED: a commit of 400 orders is not slow "
+  "relative to one of 40, it is bigger.",
+  "&mdash;", "&mdash;",
+  "code",
+  "Never threshold this raw. Normalize by replayed -- see per-order below."),
+ ("commits", "per-order (body_us / replayed)", None, None,
+  "The size-matched commit cost. This is the number to threshold.",
+  "&gt; 149 us/order", "&gt; 300 us/order",
+  "provisional",
+  "111-149 us/order is quoted as healthy in the ops runbook. On this "
+  "deployment only 32% of commits land inside that band and p50 sits at 146, "
+  "right on its upper edge -- so either the band is a p50 target we barely "
+  "meet, or it is stale. This one most needs a second opinion."),
+ ("commits", "replayed", "sim-commit", "replayed",
+  "ORDER COUNT for the commit. Not a latency, despite the name.",
+  "&mdash;", "&mdash;",
+  "code", "Used as the denominator for per-order cost."),
+ ("shreds", "total_time_ms", "shred_insert_is_full", "total_time_ms",
+  "Slot completion time, measured per node from its own first shred.",
+  "&gt; 600 ms", "&gt; 1000 ms",
+  "provisional",
+  "A slot is 400 ms, so sustained completion above that means falling behind. "
+  "p50 here is ~369 ms. Never compare across a restart or deploy."),
+ ("shreds", "sim - leader delta", None, None,
+  "Our simulator's timestamp minus the leader's, per slot, per stage.",
+  "&gt; 0 (we are later)", "&gt; 50 ms",
+  "provisional",
+  "Joined on slot, never on time. An absent leader column is a reporting gap, "
+  "not a slow node."),
+]
+
+
+_doc_cache = {"at": 0.0, "data": None}
+
+
+def doc_baselines():
+    """Live p50/p90/p99 for every documented field, so the proposed cutoffs can
+    be judged against what this deployment actually does."""
+    now = time.monotonic()
+    if _doc_cache["data"] is not None and now - _doc_cache["at"] < 600:
+        return _doc_cache["data"]
+    out = {}
+    wanted = {}
+    for _, _, meas, field, *_rest in METRIC_DOCS:
+        if meas and field:
+            wanted.setdefault(meas, []).append(field)
+    for meas, fields in wanted.items():
+        try:
+            sel = ", ".join(
+                f'percentile("{f}",50), percentile("{f}",90), percentile("{f}",99), '
+                f'max("{f}"), count("{f}")' for f in fields)
+            cols, rows = influx(
+                f'SELECT {sel} FROM "{meas}" WHERE "host_id" = {SIM!r} '
+                f"AND time > now() - {DOC_WINDOW_H}h")
+            if not rows:
+                continue
+            row = rows[0]
+            for i, f in enumerate(fields):
+                base = 1 + i * 5
+                out[(meas, f)] = {
+                    "p50": row[base], "p90": row[base + 1], "p99": row[base + 2],
+                    "max": row[base + 3], "n": row[base + 4]}
+        except Exception:
+            continue
+    # the derived one: per-order commit cost, computed per datapoint
+    try:
+        _, rows = influx(f'SELECT "body_us","replayed" FROM "sim-commit" '
+                         f'WHERE "host_id" = {SIM!r} AND time > now() - {DOC_WINDOW_H}h')
+        per = sorted(r[1] / r[2] for r in rows if r[1] and r[2])
+        if per:
+            pick = lambda p: per[min(len(per) - 1, int(round(p / 100 * (len(per) - 1))))]
+            out[("derived", "per_order")] = {
+                "p50": pick(50), "p90": pick(90), "p99": pick(99),
+                "max": per[-1], "n": len(per),
+                "in_band": sum(1 for x in per if 111 <= x <= 149)}
+    except Exception:
+        pass
+    _doc_cache.update(at=now, data=out)
+    return out
+
+
+PROV = {"code": ("prov-code", "from code"),
+        "measured": ("prov-meas", "measured"),
+        "provisional": ("prov-prov", "PROVISIONAL")}
+
+
+def reference_page():
+    base = doc_baselines()
+    # the health header already measures three of these; reuse rather than
+    # claiming they cannot be measured
+    live_health = {}
+    try:
+        h = health_probe()
+        if h["work"]["ok"]:
+            v = h["work"]["v"]
+            live_health["building"] = (
+                f'extend {v["sim-extend"]:,} &middot; commit {v["sim-commit"]:,} '
+                f'&middot; ctx {v["sim-context"]:,} &middot; probe '
+                f'{v["sim-probe"]:,} in {WORK_WINDOW_MIN}m')
+        if h["connector"]["ok"]:
+            v = h["connector"]["v"]
+            live_health["connector live_slot"] = (
+                f'live_slot {v["live_slot"]}/{v["total"]} &middot; active '
+                f'{v["active"]} (10m)')
+        if h["ingest"]["ok"] and h["ingest"]["v"]:
+            mine = next((x for x in h["ingest"]["v"]
+                         if x["instance"] == CH_INSTANCE), None)
+            peers = ", ".join(f'{x["instance"]} {x["lag"]}s'
+                              for x in h["ingest"]["v"][:3])
+            if mine:
+                live_health["event ingest lag"] = (
+                    f'{mine["lag"]}s for {html.escape(CH_INSTANCE)} &middot; '
+                    f"peers: {html.escape(peers)}")
+    except Exception:
+        pass
+
+    # `replayed` is an ORDER COUNT, not a duration. Formatting it as time is
+    # exactly the confusion this page exists to prevent.
+    COUNT_FIELDS = {"replayed", "orders", "applied", "program_cache_compiles",
+                    "program_cache_entries", "num_repaired", "num_recovered"}
+
+    def fmt(v, field):
+        if v is None:
+            return "&mdash;"
+        v = float(v)
+        if field in COUNT_FIELDS:
+            return f"{v:,.0f}"
+        if field and field.endswith("_ms"):
+            return f"{v:,.0f} ms"
+        return f"{v/1000:,.1f} ms" if v >= 1000 else f"{v:,.0f} &micro;s"
+
+    groups = {}
+    for panel, name, meas, field, meaning, amber, red, prov, gotcha in METRIC_DOCS:
+        groups.setdefault(panel, []).append(
+            (name, meas, field, meaning, amber, red, prov, gotcha))
+    out = []
+    for panel, items in groups.items():
+        rows = []
+        for name, meas, field, meaning, amber, red, prov, gotcha in items:
+            key = (meas, field) if meas else (
+                ("derived", "per_order") if "per-order" in name else None)
+            b = base.get(key) if key else None
+            if b and key == ("derived", "per_order"):
+                shown = (f'p50 {b["p50"]:.0f} &middot; p90 {b["p90"]:.0f} &middot; '
+                         f'p99 {b["p99"]:.0f} &micro;s/order &middot; n={b["n"]:,}'
+                         f'<br><span class="warnt">only '
+                         f'{100*b["in_band"]/b["n"]:.0f}% inside the quoted '
+                         f'111-149 band</span>')
+            elif b:
+                shown = (f'p50 {fmt(b["p50"], field)} &middot; p90 '
+                         f'{fmt(b["p90"], field)} &middot; p99 {fmt(b["p99"], field)}'
+                         f' &middot; max {fmt(b["max"], field)} &middot; n='
+                         f'{int(b["n"]):,}' if b["p50"] is not None else "&mdash;")
+            elif name in live_health:
+                shown = live_health[name]
+            else:
+                shown = ('<span class="dim">per-slot only &mdash; see the slot'
+                         " page</span>")
+            cls, label = PROV[prov]
+            src = f"<code>{meas}.{field}</code>" if meas else "&mdash;"
+            rows.append(
+                f"<tr><td><b>{name}</b><div class='mdesc'>{meaning}</div>"
+                f"<div class='mgotcha'>{gotcha}</div></td>"
+                f"<td class='m'>{src}</td>"
+                f"<td class='m amberc'>{amber}</td><td class='m redc'>{red}</td>"
+                f"<td><span class='{cls}'>{label}</span></td>"
+                f"<td class='m dim'>{shown}</td></tr>")
+        out.append(
+            f'<div class="panel"><div class="dtlhead">{panel}</div>'
+            "<table><thead><tr><th>metric</th><th>source</th>"
+            "<th>amber</th><th>red</th><th>cutoff basis</th>"
+            f"<th>this deployment, last {DOC_WINDOW_H}h</th></tr></thead>"
+            f"<tbody>{''.join(rows)}</tbody></table></div>")
+
+    return f"""<!doctype html><html><head><meta charset="utf-8">
+<title>simbench &middot; metrics reference</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>{CSS}</style></head><body>
+<header>
+  <h1>sim<span>bench</span></h1>
+  <div class="sub">metrics reference &mdash; what each number means and when it is bad</div>
+  <a class="navlink" href="/">&larr; back to slots</a>
+</header>
+<div class="callout">
+  <b>Thresholds marked PROVISIONAL are inferences, not agreed limits.</b>
+  They have not been validated against an SLO or a real incident, and several
+  are order-of-magnitude reasoning rather than measurement. The rightmost
+  column shows what this deployment actually does over the last
+  {DOC_WINDOW_H} hours, so you can judge each cutoff against its own
+  distribution. Corrections welcome &mdash; especially on per-order commit
+  cost, where the quoted healthy band and the observed distribution disagree.
+</div>
+{''.join(out)}
+</body></html>"""
+
 def page(sel_win=None, sel_slot=None, sel_round=None):
     try:
         windows = produced_windows()
@@ -1360,6 +1636,7 @@ def page(sel_win=None, sel_slot=None, sel_round=None):
 <header>
   <h1>sim<span>bench</span></h1>
   <div class="sub">block-builder slot explorer</div>
+  <a class="navlink" href="/reference">metrics reference &mdash; what is bad?</a>
 </header>
 {health_html()}
 {strip}
@@ -1371,6 +1648,17 @@ def page(sel_win=None, sel_slot=None, sel_round=None):
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/reference":
+            try:
+                body = reference_page().encode()
+            except Exception as exc:
+                body = f"<pre>{html.escape(str(exc))}</pre>".encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if parsed.path not in ("/", "/index.html"):
             self.send_error(404)
             return
