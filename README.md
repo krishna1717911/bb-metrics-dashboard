@@ -15,6 +15,41 @@ BIND_HOST=127.0.0.1 ./run.sh # loopback only
 
 ## What it shows
 
+### 0. Health header
+
+Six independent cells across the top. The load-bearing idea: **a process being
+up is not the same as it building.** A status heartbeat keeps ticking on a
+stalled builder, so liveness is judged on the **work stream** — `sim-extend`,
+`sim-commit`, `sim-context`, `sim-probe` counts over 20 minutes — not on any
+status message.
+
+| cell | source | reads |
+|---|---|---|
+| building | InfluxDB | work-stream counts; idle when extend+commit are 0 |
+| connector feed | otel | `live_slot > 0`, not `active > 0` |
+| topology | otel | connectors/relays, amber if it flaps in 10m |
+| scheduler | otel | pool **peak** over 15m, plus the latest sample |
+| event ingest | ClickHouse | this instance's lag, against the best peer |
+| last restart | ClickHouse | most recent local-sim (127.0.0.1) reconnect |
+
+Three of these are subtle enough to be worth spelling out:
+
+- **`active > 0` is not the health signal.** An idle connector still reports the
+  live chain-head slot, and `active` only rises when a served validator is
+  actually leading — so `active = 0` is normal off-window. `live_slot = 0`
+  across identities is the real "feed dead" signal.
+- **The connector query must pin `Body='connector status'`.** The
+  `builder network status` rows carry no `leader_state`/`slot` attributes, so
+  mixing them in counts absent data as inactive and makes a healthy feed look
+  dead.
+- **Scheduler pool is judged on its peak, not its latest sample.** It oscillates
+  on the ~10s log cadence (1,376 → 0 within a minute is normal), so a single
+  sample flaps between "busy" and "nothing to build". Only a peak of zero across
+  the whole window means there is genuinely nothing to build.
+
+Each cell degrades on its own: a dead otel cluster leaves the InfluxDB and
+ClickHouse cells intact, and vice versa. Cached 30s.
+
 ### 1. Leader windows
 
 A horizontally scrolling strip, newest on the left. A Solana leader owns four

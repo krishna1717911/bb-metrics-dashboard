@@ -42,6 +42,17 @@ CH_USER = os.environ.get("CH_USER", "")
 CH_PASS = os.environ.get("CH_PASS", "")
 CH_DB = os.environ.get("CH_DB", "block_builder")
 CH_BUILDER = os.environ.get("CH_BUILDER", "")
+# instance_id as it appears in bifrost_events / otel ServiceName
+CH_INSTANCE = os.environ.get("CH_INSTANCE", "")
+
+# ClickStack: otel structured logs. A separate cluster from block_builder.
+# Optional -- without it the health header keeps its InfluxDB and ClickHouse
+# rows and marks the connector/scheduler rows unconfigured.
+OTEL_URL = os.environ.get("OTEL_URL", "")
+OTEL_USER = os.environ.get("OTEL_USER", "")
+OTEL_PASS = os.environ.get("OTEL_PASS", "")
+OTEL_DB = os.environ.get("OTEL_DB", "default")
+OTEL_SERVICE = os.environ.get("OTEL_SERVICE", "")
 
 _auth = base64.b64encode(f"{INFLUX_USER}:{INFLUX_PASS}".encode()).decode()
 _good_host = None
@@ -93,6 +104,19 @@ def clickhouse(sql):
     return lines[0].split("\t"), [ln.split("\t") for ln in lines[1:]]
 
 
+def otel(sql):
+    """-> rows. ClickStack is a different cluster with different credentials."""
+    if not (OTEL_URL and OTEL_SERVICE):
+        raise RuntimeError("OTEL_URL / OTEL_SERVICE not configured")
+    qs = urllib.parse.urlencode({"user": OTEL_USER, "password": OTEL_PASS,
+                                 "database": OTEL_DB})
+    req = urllib.request.Request(OTEL_URL + "?" + qs,
+                                 data=(sql + " FORMAT TabSeparated").encode())
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        text = resp.read().decode()
+    return [ln.split("\t") for ln in text.split("\n") if ln]
+
+
 TRUEISH = {"1", "true", "True"}
 
 
@@ -102,6 +126,200 @@ def ch_int(v, default=0):
         return int(v)
     except (TypeError, ValueError):
         return default
+
+
+
+# --------------------------------------------------------------- health
+
+# A process being up is not the same as it building. The status heartbeat keeps
+# ticking on a stalled builder, so the WORK stream is the only honest liveness
+# signal: sim-extend / sim-commit / sim-context counts. Work is bursty by leader
+# window, so zero between windows is normal and only a long zero run is a stall.
+WORK_WINDOW_MIN = 20
+_health_cache = {"at": 0.0, "data": None}
+HEALTH_TTL = 30
+
+
+def health_probe():
+    """Six independent checks. Every one degrades on its own -- a dead otel
+    cluster must not blank the InfluxDB rows, and vice versa."""
+    now = time.monotonic()
+    if _health_cache["data"] is not None and now - _health_cache["at"] < HEALTH_TTL:
+        return _health_cache["data"]
+    out = {}
+
+    def run(name, fn):
+        try:
+            out[name] = {"ok": True, "v": fn()}
+        except Exception as exc:
+            out[name] = {"ok": False, "err": str(exc)[:120]}
+
+    def work():
+        got = {}
+        for meas, field in (("sim-extend", "body_us"), ("sim-commit", "body_us"),
+                            ("sim-context", "parent_slot"), ("sim-probe", "body_us")):
+            series = influx_series(
+                f'SELECT count("{field}") FROM "{meas}" '
+                f"WHERE \"host_id\" = '{SIM}' AND time > now() - {WORK_WINDOW_MIN}m")
+            got[meas] = int(series[0]["values"][0][1]) if series else 0
+        return got
+
+    def ingest():
+        _, rows = clickhouse(
+            "SELECT instance_id, dateDiff('second', max(ts), now()) AS lag_s, "
+            "count() AS rows FROM bifrost_events "
+            "WHERE ts > now() - INTERVAL 15 MINUTE "
+            "GROUP BY instance_id ORDER BY lag_s")
+        return [{"instance": r[0], "lag": ch_int(r[1]), "rows": ch_int(r[2])}
+                for r in rows]
+
+    def restart():
+        _, rows = clickhouse(
+            "SELECT toString(ts) AS at, attrs['peer_addr'] AS peer "
+            "FROM bifrost_events WHERE ts > now() - INTERVAL 48 HOUR "
+            f"  AND instance_id = '{CH_INSTANCE}' AND event = 'connected' "
+            "  AND attrs['peer_addr'] LIKE '127.0.0.1%' ORDER BY ts DESC LIMIT 1")
+        return {"at": rows[0][0], "peer": rows[0][1]} if rows else None
+
+    def connector():
+        # MUST pin Body='connector status'. 'builder network status' rows carry
+        # no leader_state/slot attrs and would count as inactive, making a
+        # healthy feed look dead.
+        r = otel("SELECT countIf(LogAttributes['leader_state'] != 'Inactive') AS active, "
+                 "countIf(LogAttributes['slot'] != '0') AS live_slot, count() AS total "
+                 "FROM otel_logs WHERE Timestamp > now() - INTERVAL 10 MINUTE "
+                 f"AND ServiceName = '{OTEL_SERVICE}' AND Body = 'connector status'")
+        a, l, t = (int(x) for x in r[0])
+        return {"active": a, "live_slot": l, "total": t}
+
+    def network():
+        r = otel("SELECT LogAttributes['connectors'] AS c, LogAttributes['relays'] AS s, "
+                 "count() AS n FROM otel_logs "
+                 "WHERE Timestamp > now() - INTERVAL 10 MINUTE "
+                 f"AND ServiceName = '{OTEL_SERVICE}' AND Body = 'builder network status' "
+                 "GROUP BY c, s ORDER BY n DESC")
+        return [{"connectors": x[0], "relays": x[1], "n": ch_int(x[2])} for x in r]
+
+    def scheduler():
+        # pool oscillates on the ~10s log cadence, so a single sample flaps
+        # between "busy" and "nothing to build". Judge on the peak across the
+        # window and show the latest alongside it.
+        r = otel("SELECT max(toUInt64OrZero(LogAttributes['pool'])) AS pool_max, "
+                 "argMax(LogAttributes['pool'], Timestamp) AS pool_last, "
+                 "argMax(LogAttributes['prefix'], Timestamp) AS prefix_last, "
+                 "argMax(LogAttributes['inflight_probes'], Timestamp) AS inflight, "
+                 "max(toUInt64OrZero(LogAttributes['probe_queue'])) AS queue_max, "
+                 "count() AS samples, toString(max(Timestamp)) AS at "
+                 "FROM otel_logs WHERE Timestamp > now() - INTERVAL 15 MINUTE "
+                 f"AND ServiceName = '{OTEL_SERVICE}' AND Body = 'scheduler status'")
+        if not r or not ch_int(r[0][5]):
+            return None
+        return {"pool_max": ch_int(r[0][0]), "pool": r[0][1], "prefix": r[0][2],
+                "inflight": r[0][3], "queue_max": ch_int(r[0][4]),
+                "samples": ch_int(r[0][5]), "at": r[0][6]}
+
+    for name, fn in (("work", work), ("ingest", ingest), ("restart", restart),
+                     ("connector", connector), ("network", network),
+                     ("scheduler", scheduler)):
+        run(name, fn)
+    _health_cache.update(at=now, data=out)
+    return out
+
+
+def health_html():
+    try:
+        h = health_probe()
+    except Exception as exc:
+        return ('<div class="err">health probe failed: '
+                f"{html.escape(str(exc))[:160]}</div>")
+    cells = []
+
+    def cell(label, value, state, detail=""):
+        cells.append(f'<div class="hc {state}"><div class="hl">{label}</div>'
+                     f'<div class="hv">{value}</div>'
+                     f'<div class="hd">{detail}</div></div>')
+
+    w = h["work"]
+    if w["ok"]:
+        v = w["v"]
+        building = v["sim-extend"] + v["sim-commit"]
+        cell("building", "yes" if building else "idle",
+             "good" if building else "warn",
+             f'extend {v["sim-extend"]:,} &middot; commit {v["sim-commit"]:,} '
+             f'&middot; ctx {v["sim-context"]:,} &middot; probe {v["sim-probe"]:,} '
+             f"/ {WORK_WINDOW_MIN}m")
+    else:
+        cell("building", "?", "dead", html.escape(w["err"]))
+
+    c = h["connector"]
+    if c["ok"]:
+        v = c["v"]
+        # live_slot is the signal: an idle connector still reports the chain
+        # head. active only rises when a served validator is actually leading,
+        # so active=0 is normal and is NOT a fault.
+        cell("connector feed", "live" if v["live_slot"] else "DEAD",
+             "good" if v["live_slot"] else "dead",
+             f'live_slot {v["live_slot"]}/{v["total"]} &middot; '
+             f'active {v["active"]} (0 is normal off-window)')
+    else:
+        cell("connector feed", "n/a", "off", html.escape(c["err"]))
+
+    n = h["network"]
+    if n["ok"] and n["v"]:
+        top = n["v"][0]
+        flapping = len(n["v"]) > 1
+        cell("topology", f'{top["connectors"]}c / {top["relays"]}r',
+             "warn" if flapping else "good",
+             "flapping: " + ", ".join(f'{x["connectors"]}c/{x["relays"]}r'
+                                      for x in n["v"][:3]) if flapping
+             else "stable over 10m")
+    elif n["ok"]:
+        cell("topology", "none", "warn", "no builder network status in 10m")
+    else:
+        cell("topology", "n/a", "off", html.escape(n["err"]))
+
+    s = h["scheduler"]
+    if s["ok"] and s["v"]:
+        v = s["v"]
+        # only a peak of zero across the whole window means nothing to build
+        idle = v["pool_max"] == 0
+        cell("scheduler", f'pool {v["pool_max"]:,}', "warn" if idle else "good",
+             f'peak over 15m &middot; latest {v["pool"]} &middot; prefix '
+             f'{v["prefix"]} &middot; inflight {v["inflight"]} &middot; queue peak '
+             f'{v["queue_max"]:,} &middot; {v["samples"]} samples'
+             + (" &mdash; nothing to build" if idle else ""))
+    elif s["ok"]:
+        cell("scheduler", "silent", "warn", "no scheduler status in 15m")
+    else:
+        cell("scheduler", "n/a", "off", html.escape(s["err"]))
+
+    g = h["ingest"]
+    if g["ok"] and g["v"]:
+        mine = next((x for x in g["v"] if x["instance"] == CH_INSTANCE), None)
+        best = g["v"][0]["lag"]
+        if mine:
+            state = "good" if mine["lag"] <= 60 else "warn" if mine["lag"] <= 300 else "dead"
+            cell("event ingest", f'{mine["lag"]}s lag', state,
+                 f'{mine["rows"]:,} rows/15m &middot; best peer {best}s '
+                 f'({len(g["v"])} instances)')
+        else:
+            cell("event ingest", "absent", "dead",
+                 f"{CH_INSTANCE} wrote nothing in 15m")
+    else:
+        cell("event ingest", "n/a", "off",
+             html.escape(g.get("err", "no rows")))
+
+    r = h["restart"]
+    if r["ok"] and r["v"]:
+        cell("last restart", ago(r["v"]["at"]) + " ago", "good",
+             f'{html.escape(r["v"]["at"][:19])} UTC &middot; local sim reconnect '
+             f'from {html.escape(r["v"]["peer"])}')
+    elif r["ok"]:
+        cell("last restart", "&gt;48h", "good", "no local-sim reconnect in 48h")
+    else:
+        cell("last restart", "n/a", "off", html.escape(r["err"]))
+
+    return f'<div class="health">{"".join(cells)}</div>'
 
 
 # ------------------------------------------------------------ produced slots
@@ -821,6 +1039,20 @@ header{padding:20px 28px 14px;display:flex;gap:16px;align-items:baseline;
 h1{margin:0;font-size:17px;font-weight:650;letter-spacing:-.01em}
 h1 span{color:#5eead4}
 .sub{color:#6b7f96;font-size:12.5px}
+.health{display:flex;gap:10px;padding:14px 28px 4px;flex-wrap:wrap}
+.hc{flex:1 1 190px;background:#111823;border:1px solid #1e2937;border-radius:9px;
+  padding:9px 13px;border-left-width:3px}
+.hc.good{border-left-color:#14b8a6}
+.hc.warn{border-left-color:#fbbf24}
+.hc.dead{border-left-color:#dc2626;background:#1a1114}
+.hc.off{border-left-color:#2b3a4b;opacity:.6}
+.hl{color:#61748b;font-size:9.5px;text-transform:uppercase;letter-spacing:.07em}
+.hv{font-size:15px;font-weight:600;margin-top:2px;color:#dbe4ee;
+  font-family:ui-monospace,Menlo,monospace}
+.hc.good .hv{color:#5eead4}
+.hc.warn .hv{color:#fbbf24}
+.hc.dead .hv{color:#fca5a5}
+.hd{color:#5b6b80;font-size:10.5px;margin-top:3px;line-height:1.45}
 .striphead{display:flex;gap:12px;align-items:baseline;padding:12px 28px 0}
 .cap{color:#61748b;font-size:10.5px;text-transform:uppercase;letter-spacing:.07em}
 .hint{color:#4d5c70;font-size:11.5px;margin-left:auto}
@@ -1129,6 +1361,7 @@ def page(sel_win=None, sel_slot=None, sel_round=None):
   <h1>sim<span>bench</span></h1>
   <div class="sub">block-builder slot explorer</div>
 </header>
+{health_html()}
 {strip}
 {body}
 <script>{TICK_JS.replace("__SERVER_NOW__", f"{dt.datetime.now(dt.UTC).timestamp():.3f}")}</script>
