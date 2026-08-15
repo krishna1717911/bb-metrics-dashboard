@@ -90,7 +90,32 @@ Click a window to expand its slots; click a slot for its rounds. Each round
 collapses to one line — offer count, won / not ours / no winner echo, `is_last`,
 and an extend badge — and expands to the detail.
 
-### 4. Mutation lane, per round
+### 4. Comparison tab
+
+A per-slot tab beside the rounds view: what won each round, what we offered,
+and what the lane spent.
+
+| column | meaning |
+|---|---|
+| winner | `OUR_NAME` when `won_by_us`, else `OPPONENT_NAME` |
+| their reward | the winner row's reward; `—` when we won |
+| ours | **the final cumulative offer**, not a sum — see below |
+| margin | ours vs theirs, in percent |
+| orders / CU (them/us) | winner row vs our final offer |
+| commit replay | `sim-commit body_us` — on a lost round this is the cost of replaying the foreign winner before we can build on it |
+| extends n / p50 / max | accepted extends for that round |
+
+**Ours is the final offer, not the sum of the selected rows.** Those rows are
+cumulative prefixes — each is a superset of the last — so summing double-counts
+by 2–6×. Verified on rounds we won, where the winner row *is* our own
+composition: `winner.order_count` equals the max of selected (128=128, 208=208,
+278=278, 360=360) and never the sum (309, 569, 1246, 1990). Reward behaves the
+same way.
+
+The winner label is **named by exclusion, not identified** — `won_by_us=false`
+only tells you someone else won. `OPPONENT_NAME` is a convenience label.
+
+### 5. Mutation lane, per round
 
 `sim-extend` points bucketed by round. Attribution is exact rather than a
 timestamp join: the simulator emits `("index", round.index_in_slot)` on every
@@ -116,7 +141,7 @@ before the worker runs, so the count is *accepted* calls only and a round's
 true offered load is not visible here. A round with zero accepted extends is
 rendered in red and says so explicitly, rather than showing a blank.
 
-### 5. Program cache, per round
+### 6. Program cache, per round
 
 The seven `program_cache_*` fields ride on the same `sim-extend` point as
 `index`, so they are round-attributed structurally — no timestamp matching.
@@ -137,7 +162,7 @@ and `clone us` are 0 on almost every round; a non-zero value is the signal, not
 the baseline. Compiles and forks raise a pill in the header and turn their
 cells amber.
 
-### 6. Shred path — leader vs our simulator
+### 7. Shred path — leader vs our simulator
 
 Per slot, when each side saw it: slot complete, bank frozen, optimistic
 confirmed, with the sim-minus-leader delta. Positive (we were later) is amber,

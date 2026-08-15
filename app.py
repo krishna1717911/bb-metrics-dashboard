@@ -522,6 +522,45 @@ def _p50(values):
     return ordered[(len(ordered) - 1) // 2] if ordered else 0
 
 
+def slot_commits(slot, stamps):
+    """sim-commit for one slot, bucketed by round via the same `index` field.
+
+    When we lose a round the commit is a REPLAY of the foreign winner's block,
+    so body_us here is the cost of replaying someone else's composition before
+    we can build on top of it. `replayed` is an ORDER COUNT, not a duration."""
+    if not stamps:
+        return {}
+    pad = dt.timedelta(seconds=150)
+    lo = (dt.datetime.fromisoformat(min(stamps)[:26]) - pad
+          ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    hi = (dt.datetime.fromisoformat(max(stamps)[:26]) + pad
+          ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    cols, rows = influx(
+        'SELECT "index","body_us","queue_us","replayed","promoted_len","applied" '
+        f'FROM "sim-commit" WHERE slot = {int(slot)} '
+        + "".join(f"AND \"host_id\" != '{h}' " for h in OFF_CHAIN)
+        + f"AND time >= '{lo}' AND time <= '{hi}'")
+    if not rows:
+        return {}
+    at = {name: i for i, name in enumerate(cols)}
+    out = {}
+    for r in rows:
+        def num(field):
+            try:
+                return int(r[at[field]] or 0)
+            except (TypeError, ValueError):
+                return 0
+        idx = num("index")
+        e = out.setdefault(idx, {"n": 0, "body": 0, "replayed": 0,
+                                 "promoted": 0, "queue": 0})
+        e["n"] += 1
+        e["body"] += num("body_us")
+        e["queue"] += num("queue_us")
+        e["replayed"] += num("replayed")
+        e["promoted"] += num("promoted_len")
+    return out
+
+
 def slot_extends(slot, stamps):
     """sim-extend points for one slot, bucketed by auction round.
 
@@ -869,13 +908,18 @@ def slot_data(slot):
     # 300s window, so run them together rather than back to back.
     import concurrent.futures as cf
 
-    with cf.ThreadPoolExecutor(max_workers=2) as pool:
+    with cf.ThreadPoolExecutor(max_workers=3) as pool:
         fut = {"ext": pool.submit(slot_extends, slot, stamps),
+               "commit": pool.submit(slot_commits, slot, stamps),
                "shred": pool.submit(slot_shreds, slot, stamps)}
     try:
         extends, ext_err = fut["ext"].result(), None
     except Exception as exc:
         extends, ext_err = {}, str(exc)[:140]
+    try:
+        commits = fut["commit"].result()
+    except Exception:
+        commits = {}
     try:
         shreds, shred_err = fut["shred"].result(), None
     except Exception as exc:
@@ -885,6 +929,7 @@ def slot_data(slot):
     except Exception as exc:
         runs, runs_err = [], str(exc)[:140]
     data = {"rounds": rounds, "extends": extends, "ext_err": ext_err,
+            "commits": commits,
             "shreds": shreds, "shred_err": shred_err,
             "runs": runs, "runs_err": runs_err}
 
@@ -1004,6 +1049,96 @@ def pcache_table(stat):
             + ("<span class='warnpill'>forked</span>" if stat["pc_forks"] else "")
             + note + "</div>"
             f"<table><thead>{head}</thead><tbody>{row}</tbody></table></div>")
+
+
+# ---------------------------------------------------- per-round comparison
+
+# The relay never tells us WHICH builder won a round it did not award us. The
+# opponent is therefore named by exclusion, not identified: won_by_us=false
+# only means someone else took it. Set OPPONENT_NAME when you know who that
+# is in practice; the label is a convenience, not evidence.
+OPPONENT = os.environ.get("OPPONENT_NAME", "other builder")
+OURS_NAME = os.environ.get("OUR_NAME", "us")
+
+
+def big(v):
+    """Lamports and CU both run to millions; the table is unreadable raw."""
+    if v is None:
+        return "&mdash;"
+    v = float(v)
+    if abs(v) >= 1e6:
+        return f"{v/1e6:.2f}M"
+    if abs(v) >= 1e3:
+        return f"{v/1e3:.1f}k"
+    return f"{v:.0f}"
+
+
+def compare_html(slot, rounds, extends, commits):
+    """Round-by-round: what won, what we offered, and what the lane spent.
+
+    OUR offer is the FINAL cumulative offer for the round, not a sum of the
+    selected rows. Those rows are cumulative prefixes -- each is a superset of
+    the last -- so summing them double-counts. Verified on rounds we won, where
+    the winner row IS our own composition: winner.order_count equals max of
+    selected (128=128, 208=208, 278=278, 360=360), never the sum
+    (309, 569, 1246, 1990). Same for reward."""
+    if not rounds:
+        return '<div class="empty">no rounds for this slot</div>'
+    body = []
+    for r in rounds:
+        w = r["winner"]
+        offers = r["offers"]
+        ours_reward = max((o["reward"] for o in offers), default=None)
+        ours_orders = max((o["orders"] for o in offers), default=None)
+        ours_cu = max((o["exec_cost"] for o in offers), default=None)
+        we_won = bool(w and w["won"])
+        winner = OURS_NAME if we_won else (OPPONENT if w else "&mdash;")
+        # their reward is only meaningful when the winner was NOT us
+        theirs = None if (we_won or not w) else w["reward"]
+        if theirs and ours_reward is not None and theirs > 0:
+            pct = 100.0 * (ours_reward - theirs) / theirs
+            margin = (f'<span class="{"goodc" if pct >= 0 else "redc"}">'
+                      f'{pct:+.0f}%</span>')
+        else:
+            margin = '<span class="dim">&mdash;</span>'
+        ext = extends.get(r["round"])
+        com = commits.get(r["round"])
+        their_ord = w["orders"] if w else None
+        their_cu = w["exec_cost"] if w else None
+        body.append(
+            f'<tr><td class="m"><a href="/?win={window_of(slot)}&slot={slot}'
+            f'&round={r["round"]}">round {r["round"]}</a>'
+            + (' <span class="last">is_last</span>' if w and w["is_last"] else "")
+            + "</td>"
+            f'<td class="m {"goodc" if we_won else ""}">{winner}</td>'
+            f'<td class="n m">{big(theirs) if theirs is not None else "&mdash;"}</td>'
+            f'<td class="n m">{big(ours_reward)}</td>'
+            f'<td class="n m">{margin}</td>'
+            f'<td class="n m">{big(their_ord) if their_ord is not None else "&mdash;"}'
+            f' / {big(ours_orders)}</td>'
+            f'<td class="n m">{big(their_cu) if their_cu is not None else "&mdash;"}'
+            f' / {big(ours_cu)}</td>'
+            f'<td class="n m">{ms(com["body"]) if com else "&mdash;"}</td>'
+            f'<td class="n m">{ext["n"] if ext else 0}</td>'
+            f'<td class="n m">{ms(ext["body_p50"]) if ext else "&mdash;"}</td>'
+            f'<td class="n m">{ms(ext["body_max"]) if ext else "&mdash;"}</td>'
+            "</tr>")
+    head = ("<tr><th>round</th><th>winner</th>"
+            f"<th class=n>their reward</th><th class=n>ours</th>"
+            "<th class=n>margin</th><th class=n>orders (them/us)</th>"
+            "<th class=n>CU (them/us)</th><th class=n>commit replay</th>"
+            "<th class=n>extends n</th><th class=n>extend p50</th>"
+            "<th class=n>extend max</th></tr>")
+    return ('<div class="panel"><div class="dtlhead">round comparison'
+            "<span class='note'>rewards in lamports, CU in compute units "
+            "&middot; <b>ours is the final cumulative offer for the round, not "
+            "a sum</b> &mdash; selected rows are cumulative prefixes, so "
+            "summing double-counts &middot; commit replay is sim-commit "
+            "body_us, which on a lost round is the cost of replaying the "
+            "foreign winner before we can build on it &middot; extends are "
+            "ACCEPTED calls only, refusals emit nothing</span></div>"
+            f"<table><thead>{head}</thead><tbody>{''.join(body)}</tbody></table>"
+            "</div>")
 
 
 def rounds_html(slot, sel_round):
@@ -1191,6 +1326,13 @@ main.rounds{padding:10px 0 60px}
 code{font-family:ui-monospace,Menlo,monospace;color:#8fa6bf}
 
 /* rounds */
+a.tab{display:inline-block;padding:6px 15px;margin-right:6px;border-radius:8px 8px 0 0;
+  border:1px solid #1e2937;border-bottom:none;background:#0e151d;color:#7d90a6;
+  font-size:12.5px;text-decoration:none}
+a.tab:hover{color:#cfe0f0;border-color:#2f4256}
+a.tab.on{background:#0c141b;border-color:#14b8a6;color:#5eead4;font-weight:600}
+.tabs{padding:6px 28px 0;border-bottom:1px solid #1e2937;margin-bottom:14px}
+.goodc{color:#5eead4}
 .slotbar{padding:20px 28px 4px;color:#9fb2c8;font-size:13px}
 .slotbar b{color:#5eead4;font-family:ui-monospace,Menlo,monospace}
 .rndwrap{margin:0 28px 8px}
@@ -1698,7 +1840,7 @@ def reference_page():
 {''.join(out)}
 </body></html>"""
 
-def page(sel_win=None, sel_slot=None, sel_round=None):
+def page(sel_win=None, sel_slot=None, sel_round=None, tab="rounds"):
     try:
         windows = produced_windows()
     except Exception as exc:
@@ -1719,10 +1861,27 @@ def page(sel_win=None, sel_slot=None, sel_round=None):
         body = (f'<main><div class="empty"><b>No slot selected.</b><br>{note}'
                 "</div></main>")
     else:
+        base = f"/?win={window_of(sel_slot)}&slot={sel_slot}"
+        tabs = "".join(
+            f'<a class="tab{" on" if tab == key else ""}" '
+            f'href="{base}{"" if key == "rounds" else "&tab=" + key}">{label}</a>'
+            for key, label in (("rounds", "rounds"), ("compare", "comparison")))
+        if tab == "compare":
+            try:
+                d = slot_data(sel_slot)
+                inner = compare_html(sel_slot, d["rounds"], d["extends"],
+                                     d["commits"])
+            except Exception as exc:
+                inner = ('<div class="err">comparison unavailable: '
+                         f"{html.escape(str(exc))[:160]}</div>")
+            blurb = "what won each round, what we offered, and what the lane spent."
+        else:
+            inner = f"<main class=rounds>{rounds_html(sel_slot, sel_round)}</main>"
+            blurb = ("auction rounds. Click a round for its offers and the "
+                     "winning miniblock.")
         body = (f'<div class="slotbar hascp">slot <b>{sel_slot}</b>'
-                f'{copy_btn(sel_slot)} &mdash; auction rounds. '
-                f"Click a round for its offers and the winning miniblock.</div>"
-                f"<main class=rounds>{rounds_html(sel_slot, sel_round)}</main>")
+                f"{copy_btn(sel_slot)} &mdash; {blurb}</div>"
+                f'<div class="tabs">{tabs}</div>{inner}')
     title = f" &middot; slot {sel_slot}" if sel_slot else \
             f" &middot; window {sel_win}" if sel_win else ""
     return f"""<!doctype html><html><head><meta charset="utf-8">
@@ -1765,7 +1924,9 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 return None
         try:
-            body = page(as_int("win"), as_int("slot"), as_int("round")).encode()
+            tab = qs.get("tab", ["rounds"])[0]
+            body = page(as_int("win"), as_int("slot"), as_int("round"),
+                        "compare" if tab == "compare" else "rounds").encode()
         except Exception as exc:
             body = f"<pre>{html.escape(str(exc))}</pre>".encode()
         self.send_response(200)
