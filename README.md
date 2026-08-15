@@ -63,7 +63,8 @@ identity, the **`run_id`** that served it, and `N/4 won`.
 `run_id` is one builder **process lifetime**, so it changes on every restart —
 putting it on the strip makes deploy boundaries visible while scanning, rather
 than only after opening a slot. A window served within ten minutes of a restart
-gets a `cold` pill: it ran against a cold program cache and a cold account
+gets a `cold` pill, which explains itself on hover or keyboard focus with that
+window's own numbers — it ran against a cold program cache and a cold account
 overlay, so its timings are not comparable to a window served hours into the
 same run. Hovering gives the full UUID, when the run started, how many slots it
 covers, and how far into it this window fell. A window spanning a restart is

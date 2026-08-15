@@ -509,6 +509,27 @@ def copy_btn(value):
             f'>copy</span>')
 
 
+def cold_why(w):
+    """Why this window is marked cold, in its own numbers.
+
+    Escaped for an HTML attribute because it is read by the tooltip script,
+    not rendered as markup."""
+    age = w.get("run_age")
+    mins = "" if age is None else (f"{int(age)}s" if age < 90
+                                   else f"{int(age // 60)}m {int(age % 60)}s")
+    started = (w.get("run_started") or "")[:19]
+    return html.escape(
+        f"This window began {mins} after builder run "
+        f"{short_run(w.get('run_id',''))} started"
+        + (f" at {started} UTC" if started else "")
+        + f", inside the first {COLD_RUN_SECONDS // 60} minutes of the process. "
+        "A fresh process starts with an empty program cache and an empty "
+        "account overlay, so early extends pay for JIT compiles and account "
+        "loads that a warmed process has already done. Treat this window's "
+        "extend and commit timings as not comparable with one served hours "
+        "into the same run.", quote=True)
+
+
 def short_run(run_id):
     """run_id is a UUID; the chip has room for its first block only. The full
     value is in the chip title and is copyable from there."""
@@ -1488,7 +1509,14 @@ a.navlink:hover{background:#0f766e22;border-color:#5eead4}
   font-family:ui-monospace,Menlo,monospace}
 .chip.on .runline{color:#a7f3ea}
 .coldpill{color:#fbbf24;border:1px solid #78350f;background:#78350f33;
-  border-radius:3px;padding:0 4px;font-size:8.5px;text-transform:uppercase}
+  border-radius:3px;padding:0 4px;font-size:8.5px;text-transform:uppercase;
+  cursor:help;margin-left:4px}
+.coldpill:hover,.coldpill:focus{background:#78350f66;border-color:#fbbf24;
+  outline:none}
+.tipbox{position:fixed;z-index:200;max-width:340px;background:#0d151d;
+  border:1px solid #2f4256;border-radius:9px;padding:10px 13px;color:#c3d3e6;
+  font:11.5px/1.55 ui-sans-serif,-apple-system,sans-serif;
+  box-shadow:0 10px 30px #000a;pointer-events:none;white-space:normal}
 .chip.won{border-color:#14b8a655;background:#0f1c1f}
 .chip.won .tag{color:#5eead4}
 .chip.won:hover{border-color:#5eead4}
@@ -1609,6 +1637,48 @@ TICK_JS = """
   });
 })();
 
+// Tooltips for [data-tip]. Deliberately not a CSS popover: these live inside
+// .strip, which is overflow:auto in both axes and would clip an absolutely
+// positioned child. A fixed-position node attached to <body> escapes that.
+(function(){
+  var box = null;
+  function hide(){ if (box) { box.remove(); box = null; } }
+  function show(el){
+    hide();
+    var tip = el.getAttribute('data-tip');
+    if (!tip) return;
+    box = document.createElement('div');
+    box.className = 'tipbox';
+    box.textContent = tip;
+    document.body.appendChild(box);
+    var r = el.getBoundingClientRect();
+    var w = box.offsetWidth, h = box.offsetHeight;
+    // prefer below-right, but stay inside the viewport
+    var left = Math.min(Math.max(8, r.left), window.innerWidth - w - 8);
+    var top = r.bottom + 8;
+    if (top + h > window.innerHeight - 8) top = Math.max(8, r.top - h - 8);
+    box.style.left = left + 'px';
+    box.style.top = top + 'px';
+  }
+  document.addEventListener('mouseover', function(ev){
+    var el = ev.target.closest && ev.target.closest('[data-tip]');
+    if (el) show(el);
+  });
+  document.addEventListener('mouseout', function(ev){
+    var el = ev.target.closest && ev.target.closest('[data-tip]');
+    if (el) hide();
+  });
+  document.addEventListener('focusin', function(ev){
+    var el = ev.target.closest && ev.target.closest('[data-tip]');
+    if (el) show(el);
+  });
+  document.addEventListener('focusout', hide);
+  window.addEventListener('scroll', hide, true);
+  document.addEventListener('keydown', function(ev){
+    if (ev.key === 'Escape') hide();
+  });
+})();
+
 // Copy-on-hover. The controls sit inside chip anchors, so the click must be
 // swallowed or copying would also navigate. navigator.clipboard needs a secure
 // context -- localhost qualifies, a bare LAN IP does not -- hence the fallback.
@@ -1683,8 +1753,8 @@ def strip_html(windows, sel_win, sel_slot):
                 f'{" &#9888;" if w["leader_split"] else ""}</div>'
                 f'<div class="runline">run {html.escape(short_run(w["run_id"]))}'
                 + (' <span class="warn">&#9888;</span>' if w["run_split"] else "")
-                + (' <span class="coldpill">cold</span>' if w.get("run_cold")
-                   else "")
+                + (f'<span class="coldpill" tabindex="0" data-tip="{cold_why(w)}"'
+                   f">cold</span>" if w.get("run_cold") else "")
                 + "</div>"
                 f'<div class="tag">{w["won"]}/{len(w["slots"])} won</div></a>')
 
