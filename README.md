@@ -220,6 +220,17 @@ band at all. Either it is a p50 target we barely meet, or it is stale.
 
 ## Performance
 
+Opening a slot, or merely expanding a leader window, warms the window's other
+slots in the background. A window is the unit people actually inspect — you
+open one slot and then walk the other three — so those clicks become cache hits
+(measured: 0.91 s cold, then 4–7 ms for each sibling).
+
+Fetches are **single-flight**: the first caller does the work and the rest wait
+on it. Without that the ordinary path double-fetches, because expanding a
+window starts a prefetch and clicking a slot a moment later starts a second
+fetch for the same slot. Measured with four concurrent requests for one cold
+slot: 2 ClickHouse + 3 InfluxDB queries, not 8 + 12.
+
 A slot costs three queries — two ClickHouse, one InfluxDB, the slow pair run
 concurrently — and they are
 cached for five minutes (64 slots, oldest evicted). Neither query was ever

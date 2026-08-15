@@ -883,9 +883,67 @@ _slot_lock = threading.Lock()
 SLOT_CACHE_TTL = 300
 SLOT_CACHE_MAX = 64
 
+# A leader window is the unit people actually inspect -- you open one slot and
+# then walk the other three. Warming them in the background turns those clicks
+# from a multi-second fetch into a cache hit. Bounded so a burst of navigation
+# cannot pile up connections against ClickHouse and InfluxDB.
+_prefetch = None
+_prefetch_lock = threading.Lock()
+_inflight = {}                         # slot -> Event, for single-flight
+
+
+def _prefetch_pool():
+    global _prefetch
+    with _prefetch_lock:
+        if _prefetch is None:
+            import concurrent.futures as cf
+            _prefetch = cf.ThreadPoolExecutor(max_workers=2,
+                                              thread_name_prefix="warm")
+        return _prefetch
+
+
+def warm_window(win, skip=None):
+    """Fetch the other slots of this window in the background.
+
+    Never blocks the request that triggered it, and never duplicates work: a
+    slot already cached or already being fetched is skipped, so a foreground
+    request and a prefetch cannot both hit the datastores for the same slot."""
+    if win is None:
+        return
+    try:
+        windows = produced_windows()
+    except Exception:
+        return
+    entry = next((w for w in windows if w["win"] == win), None)
+    if entry is None:
+        return
+    now = time.monotonic()
+    for s in entry["slots"]:
+        slot = s["slot"]
+        if slot == skip:
+            continue
+        with _slot_lock:
+            hit = _slot_cache.get(slot)
+            if hit and now - hit[0] < SLOT_CACHE_TTL:
+                continue
+        with _prefetch_lock:
+            if slot in _inflight:
+                continue
+
+        def task(target=slot):
+            try:
+                slot_data(target)      # takes the single-flight lease itself
+            except Exception:
+                pass
+
+        try:
+            _prefetch_pool().submit(task)
+        except Exception:
+            pass
+
 
 def slot_data(slot):
-    """Everything the rounds view needs for one slot: two queries, all rounds.
+    """Everything the slot views need: rounds, extends, commits, shreds, runs.
 
     Neither query was ever per-round -- ClickHouse returns the whole slot and
     is bucketed by index_in_slot here, and the InfluxDB one is bucketed by
@@ -901,6 +959,31 @@ def slot_data(slot):
         if hit and now - hit[0] < SLOT_CACHE_TTL:
             return hit[1]
 
+    # Single-flight. Without it the ordinary path double-fetches: expanding a
+    # window starts a prefetch, and clicking a slot a moment later starts a
+    # second fetch for the same slot. The first caller does the work; the rest
+    # wait on it and then read the cache.
+    with _prefetch_lock:
+        leader = slot not in _inflight
+        if leader:
+            _inflight[slot] = threading.Event()
+        done = _inflight[slot]
+    if not leader:
+        done.wait(timeout=180)
+        with _slot_lock:
+            hit = _slot_cache.get(slot)
+        if hit:
+            return hit[1]
+        return _slot_data_uncached(slot, time.monotonic())
+    try:
+        return _slot_data_uncached(slot, now)
+    finally:
+        with _prefetch_lock:
+            _inflight.pop(slot, None)
+        done.set()
+
+
+def _slot_data_uncached(slot, now):
     rounds = slot_rounds(slot)
     stamps = [i["ts"] for r in rounds
               for i in r["offers"] + ([r["winner"]] if r["winner"] else [])]
@@ -1098,7 +1181,7 @@ def compare_html(slot, rounds, extends, commits):
         if theirs and ours_reward is not None and theirs > 0:
             pct = 100.0 * (ours_reward - theirs) / theirs
             margin = (f'<span class="{"goodc" if pct >= 0 else "redc"}">'
-                      f'{pct:+.0f}%</span>')
+                      f'{pct:+.4f}%</span>')
         else:
             margin = '<span class="dim">&mdash;</span>'
         ext = extends.get(r["round"])
@@ -1854,6 +1937,9 @@ def page(sel_win=None, sel_slot=None, sel_round=None, tab="rounds"):
             if sel_slot is not None and sel_win is None:
                 sel_win = window_of(sel_slot)
             strip = strip_html(windows, sel_win, sel_slot)
+            # people walk a whole leader window, so warm its other slots in
+            # the background as soon as the window is known
+            warm_window(sel_win, skip=sel_slot)
 
     if sel_slot is None:
         note = ("Pick a leader window above, then a slot inside it."
