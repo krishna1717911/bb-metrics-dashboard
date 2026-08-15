@@ -97,8 +97,8 @@ and what the lane spent.
 
 | column | meaning |
 |---|---|
-| winner | `OUR_NAME` when `won_by_us`, else `OPPONENT_NAME` |
-| their reward | the winner row's reward; `—` when we won |
+| winner | from the relay's `round_chosen`, which names the actual builder |
+| their reward | **their accepted block when they won; their best losing offer when we won** |
 | ours | **the final cumulative offer**, not a sum — see below |
 | margin | ours vs theirs, in percent |
 | orders / CU (them/us) | winner row vs our final offer |
@@ -112,8 +112,18 @@ composition: `winner.order_count` equals the max of selected (128=128, 208=208,
 278=278, 360=360) and never the sum (309, 569, 1246, 1990). Reward behaves the
 same way.
 
-The winner label is **named by exclusion, not identified** — `won_by_us=false`
-only tells you someone else won. `OPPONENT_NAME` is a convenience label.
+**Their side comes from the relay** when `RELAY_URL` is configured. The relay
+sees every builder's submissions and its `round_chosen` event names the winner
+— something our own data structurally cannot do, since `won_by_us=false` only
+ever means "not us". Which of their numbers is shown depends on the result:
+their accepted block when they won, their best `submitted` offer when they
+lost. The relay also reports its **verdict on our offers**, so a round where
+ours were rejected says so and why.
+
+Without the relay it falls back to our own winner rows and the generic
+`OPPONENT_NAME` label, which is named by exclusion rather than identified.
+`commit replay` and the extend columns are ours only; there is no counterpart
+on their side.
 
 ### 5. Mutation lane, per round
 

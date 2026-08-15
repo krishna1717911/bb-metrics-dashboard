@@ -54,6 +54,17 @@ OTEL_PASS = os.environ.get("OTEL_PASS", "")
 OTEL_DB = os.environ.get("OTEL_DB", "default")
 OTEL_SERVICE = os.environ.get("OTEL_SERVICE", "")
 
+# The relay's own ClickHouse, reached through its Grafana datasource proxy.
+# Unlike bifrost_miniblocks this sees EVERY builder's submissions, and its
+# round_chosen event names the winner -- which our own data structurally
+# cannot, since won_by_us=false only ever means "not us".
+RELAY_URL = os.environ.get("RELAY_URL", "")
+RELAY_USER = os.environ.get("RELAY_USER", "")
+RELAY_PASS = os.environ.get("RELAY_PASS", "")
+RELAY_DS_UID = os.environ.get("RELAY_DS_UID", "")
+# our builder_id as the relay knows it; usually the same as CH_BUILDER
+RELAY_OUR_BUILDER = os.environ.get("RELAY_OUR_BUILDER", "") or CH_BUILDER
+
 _auth = base64.b64encode(f"{INFLUX_USER}:{INFLUX_PASS}".encode()).decode()
 _good_host = None
 
@@ -102,6 +113,37 @@ def clickhouse(sql):
     if not lines:
         return [], []
     return lines[0].split("\t"), [ln.split("\t") for ln in lines[1:]]
+
+
+def relay(sql):
+    """-> (columns, rows) from the relay ClickHouse via Grafana's datasource
+    proxy. Cloudflare fronts that host and rejects a default urllib
+    user-agent with a 403 "error code 1010" that reads like an auth failure,
+    hence the explicit header."""
+    if not (RELAY_URL and RELAY_DS_UID):
+        raise RuntimeError("RELAY_URL / RELAY_DS_UID not configured")
+    body = json.dumps({"queries": [{
+        "refId": "A", "format": 1,
+        "datasource": {"type": "grafana-clickhouse-datasource",
+                       "uid": RELAY_DS_UID},
+        "rawSql": sql}], "from": "now-24h", "to": "now"}).encode()
+    token = base64.b64encode(f"{RELAY_USER}:{RELAY_PASS}".encode()).decode()
+    req = urllib.request.Request(
+        RELAY_URL.rstrip("/") + "/api/ds/query", data=body,
+        headers={"Content-Type": "application/json",
+                 "Authorization": "Basic " + token,
+                 "User-Agent": "simbench/1.0"})
+    with urllib.request.urlopen(req, timeout=90) as resp:
+        payload = json.load(resp)
+    result = payload.get("results", {}).get("A", {})
+    if result.get("error"):
+        raise RuntimeError(result["error"][:200])
+    frames = result.get("frames") or []
+    if not frames:
+        return [], []
+    frame = frames[0]
+    return ([f["name"] for f in frame["schema"]["fields"]],
+            list(zip(*frame["data"]["values"])))
 
 
 def otel(sql):
@@ -520,6 +562,78 @@ def _rfc3339_ns(stamp):
 def _p50(values):
     ordered = sorted(values)
     return ordered[(len(ordered) - 1) // 2] if ordered else 0
+
+
+def slot_relay(slot, stamps):
+    """Per-round opponent view from the relay, keyed by index_in_slot.
+
+    Two different things are collected for the opponent, and which one the
+    table shows depends on who won:
+
+      won_round   the round_chosen event -- their block AS ACCEPTED, the
+                  authoritative reward/CU/orders for the round
+      best_offer  their highest `submitted` offer, which is what to compare
+                  against when the round did not go to them
+
+    Also carries our own offer count and rejection reason as the relay saw
+    them, which our own data cannot show: bifrost_miniblocks records what we
+    sent, never the relay's verdict on it."""
+    if not stamps or not (RELAY_URL and RELAY_DS_UID):
+        return {}
+    pad = dt.timedelta(minutes=10)
+    lo = (dt.datetime.fromisoformat(min(stamps)[:26]) - pad
+          ).strftime("%Y-%m-%d %H:%M:%S")
+    hi = (dt.datetime.fromisoformat(max(stamps)[:26]) + pad
+          ).strftime("%Y-%m-%d %H:%M:%S")
+    ours = RELAY_OUR_BUILDER.replace("'", "")
+    cols, rows = relay(
+        "SELECT index_in_slot AS rnd,"
+        " argMaxIf(assumeNotNull(builder_id), assumeNotNull(reward),"
+        "          event = 'round_chosen') AS win_builder,"
+        " maxIf(assumeNotNull(reward), event = 'round_chosen') AS win_reward,"
+        " argMaxIf(assumeNotNull(execution_cost), assumeNotNull(reward),"
+        "          event = 'round_chosen') AS win_cu,"
+        " argMaxIf(order_count, assumeNotNull(reward),"
+        "          event = 'round_chosen') AS win_orders,"
+        f" argMaxIf(assumeNotNull(builder_id), assumeNotNull(reward),"
+        f"          event = 'submitted' AND builder_id != '{ours}') AS opp_builder,"
+        f" maxIf(assumeNotNull(reward),"
+        f"       event = 'submitted' AND builder_id != '{ours}') AS opp_reward,"
+        f" argMaxIf(assumeNotNull(execution_cost), assumeNotNull(reward),"
+        f"          event = 'submitted' AND builder_id != '{ours}') AS opp_cu,"
+        f" argMaxIf(order_count, assumeNotNull(reward),"
+        f"          event = 'submitted' AND builder_id != '{ours}') AS opp_orders,"
+        f" countIf(event = 'submitted' AND builder_id = '{ours}') AS our_subs,"
+        f" anyIf(reason, event = 'offer_rejected'"
+        f"       AND builder_id = '{ours}') AS our_reject"
+        " FROM relay.mini_block_events"
+        f" WHERE timestamp >= '{lo}' AND timestamp <= '{hi}'"
+        f"   AND slot = {int(slot)}"
+        " GROUP BY rnd ORDER BY rnd")
+    if not rows:
+        return {}
+    at = {n: i for i, n in enumerate(cols)}
+    out = {}
+    for r in rows:
+        def val(name):
+            v = r[at[name]] if name in at else None
+            return v
+
+        def num(name):
+            try:
+                return int(val(name) or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        out[num("rnd")] = {
+            "win_builder": val("win_builder") or "",
+            "win_reward": num("win_reward"), "win_cu": num("win_cu"),
+            "win_orders": num("win_orders"),
+            "opp_builder": val("opp_builder") or "",
+            "opp_reward": num("opp_reward"), "opp_cu": num("opp_cu"),
+            "opp_orders": num("opp_orders"),
+            "our_subs": num("our_subs"), "our_reject": val("our_reject") or ""}
+    return out
 
 
 def slot_commits(slot, stamps):
@@ -991,9 +1105,10 @@ def _slot_data_uncached(slot, now):
     # 300s window, so run them together rather than back to back.
     import concurrent.futures as cf
 
-    with cf.ThreadPoolExecutor(max_workers=3) as pool:
+    with cf.ThreadPoolExecutor(max_workers=4) as pool:
         fut = {"ext": pool.submit(slot_extends, slot, stamps),
                "commit": pool.submit(slot_commits, slot, stamps),
+               "relay": pool.submit(slot_relay, slot, stamps),
                "shred": pool.submit(slot_shreds, slot, stamps)}
     try:
         extends, ext_err = fut["ext"].result(), None
@@ -1004,6 +1119,10 @@ def _slot_data_uncached(slot, now):
     except Exception:
         commits = {}
     try:
+        relay_rounds, relay_err = fut["relay"].result(), None
+    except Exception as exc:
+        relay_rounds, relay_err = {}, str(exc)[:140]
+    try:
         shreds, shred_err = fut["shred"].result(), None
     except Exception as exc:
         shreds, shred_err = {}, str(exc)[:140]
@@ -1012,7 +1131,8 @@ def _slot_data_uncached(slot, now):
     except Exception as exc:
         runs, runs_err = [], str(exc)[:140]
     data = {"rounds": rounds, "extends": extends, "ext_err": ext_err,
-            "commits": commits,
+            "commits": commits, "relay": relay_rounds,
+            "relay_err": relay_err,
             "shreds": shreds, "shred_err": shred_err,
             "runs": runs, "runs_err": runs_err}
 
@@ -1156,17 +1276,30 @@ def big(v):
     return f"{v:.0f}"
 
 
-def compare_html(slot, rounds, extends, commits):
+def compare_html(slot, rounds, extends, commits, relay_rounds=None,
+                 relay_err=None):
     """Round-by-round: what won, what we offered, and what the lane spent.
 
-    OUR offer is the FINAL cumulative offer for the round, not a sum of the
-    selected rows. Those rows are cumulative prefixes -- each is a superset of
-    the last -- so summing them double-counts. Verified on rounds we won, where
-    the winner row IS our own composition: winner.order_count equals max of
-    selected (128=128, 208=208, 278=278, 360=360), never the sum
-    (309, 569, 1246, 1990). Same for reward."""
+    THEIR side comes from the relay when we have it, because the relay sees
+    every builder and names the winner, while our own data only knows
+    "won_by_us: false". Which of their numbers is shown depends on the result:
+
+      they won   -> their round_chosen block, i.e. what was actually accepted
+      we won     -> their best `submitted` offer, i.e. what they bid and lost
+
+    Falling back to the bifrost_miniblocks winner row when the relay has
+    nothing keeps slots off that relay (a different connector) readable.
+
+    OUR offer is the FINAL cumulative offer, not a sum of the selected rows:
+    those rows are cumulative prefixes, so summing double-counts. Verified on
+    rounds we won, where the winner row IS our composition -- winner.order_count
+    equals max of selected (128=128, 208=208, 360=360), never the sum.
+
+    extends and commit are OURS only; there is no equivalent for them, so
+    those cells read as a dash on their side by construction."""
     if not rounds:
         return '<div class="empty">no rounds for this slot</div>'
+    relay_rounds = relay_rounds or {}
     body = []
     for r in rounds:
         w = r["winner"]
@@ -1175,29 +1308,51 @@ def compare_html(slot, rounds, extends, commits):
         ours_orders = max((o["orders"] for o in offers), default=None)
         ours_cu = max((o["exec_cost"] for o in offers), default=None)
         we_won = bool(w and w["won"])
-        winner = OURS_NAME if we_won else (OPPONENT if w else "&mdash;")
-        # their reward is only meaningful when the winner was NOT us
-        theirs = None if (we_won or not w) else w["reward"]
-        if theirs and ours_reward is not None and theirs > 0:
-            pct = 100.0 * (ours_reward - theirs) / theirs
+        rl = relay_rounds.get(r["round"])
+
+        # who they are, and which of their numbers applies
+        if rl and rl["win_builder"] and not we_won:
+            them_name, basis = rl["win_builder"], "won"
+            their_reward, their_cu = rl["win_reward"], rl["win_cu"]
+            their_orders = rl["win_orders"]
+        elif rl and rl["opp_builder"]:
+            them_name, basis = rl["opp_builder"], "best offer"
+            their_reward, their_cu = rl["opp_reward"], rl["opp_cu"]
+            their_orders = rl["opp_orders"]
+        elif w and not we_won:
+            them_name, basis = OPPONENT, "winner row"
+            their_reward, their_cu = w["reward"], w["exec_cost"]
+            their_orders = w["orders"]
+        else:
+            them_name, basis = None, ""
+            their_reward = their_cu = their_orders = None
+
+        winner = OURS_NAME if we_won else (them_name or OPPONENT if w else "&mdash;")
+        if their_reward and ours_reward is not None and their_reward > 0:
+            pct = 100.0 * (ours_reward - their_reward) / their_reward
             margin = (f'<span class="{"goodc" if pct >= 0 else "redc"}">'
-                      f'{pct:+.4f}%</span>')
+                      f"{pct:+.4f}%</span>")
         else:
             margin = '<span class="dim">&mdash;</span>'
         ext = extends.get(r["round"])
         com = commits.get(r["round"])
-        their_ord = w["orders"] if w else None
-        their_cu = w["exec_cost"] if w else None
+        note = ""
+        if rl and rl["our_reject"]:
+            note = (f'<div class="rejnote">our {rl["our_subs"]} offer'
+                    f'{"" if rl["our_subs"] == 1 else "s"} rejected: '
+                    f'{html.escape(rl["our_reject"])}</div>')
         body.append(
             f'<tr><td class="m"><a href="/?win={window_of(slot)}&slot={slot}'
             f'&round={r["round"]}">round {r["round"]}</a>'
             + (' <span class="last">is_last</span>' if w and w["is_last"] else "")
+            + note + "</td>"
+            f'<td class="m {"goodc" if we_won else ""}">{html.escape(winner)}'
+            + (f'<div class="basis">their {basis}</div>' if basis else "")
             + "</td>"
-            f'<td class="m {"goodc" if we_won else ""}">{winner}</td>'
-            f'<td class="n m">{big(theirs) if theirs is not None else "&mdash;"}</td>'
+            f'<td class="n m">{big(their_reward) if their_reward is not None else "&mdash;"}</td>'
             f'<td class="n m">{big(ours_reward)}</td>'
             f'<td class="n m">{margin}</td>'
-            f'<td class="n m">{big(their_ord) if their_ord is not None else "&mdash;"}'
+            f'<td class="n m">{big(their_orders) if their_orders is not None else "&mdash;"}'
             f' / {big(ours_orders)}</td>'
             f'<td class="n m">{big(their_cu) if their_cu is not None else "&mdash;"}'
             f' / {big(ours_cu)}</td>'
@@ -1207,19 +1362,25 @@ def compare_html(slot, rounds, extends, commits):
             f'<td class="n m">{ms(ext["body_max"]) if ext else "&mdash;"}</td>'
             "</tr>")
     head = ("<tr><th>round</th><th>winner</th>"
-            f"<th class=n>their reward</th><th class=n>ours</th>"
+            "<th class=n>their reward</th><th class=n>ours</th>"
             "<th class=n>margin</th><th class=n>orders (them/us)</th>"
-            "<th class=n>CU (them/us)</th><th class=n>commit replay</th>"
-            "<th class=n>extends n</th><th class=n>extend p50</th>"
-            "<th class=n>extend max</th></tr>")
+            "<th class=n>CU (them/us)</th><th class=n>commit replay (us)</th>"
+            "<th class=n>extends n (us)</th><th class=n>extend p50 (us)</th>"
+            "<th class=n>extend max (us)</th></tr>")
+    src = ("relay" if relay_rounds else
+           ("relay unavailable, using our own winner rows" if relay_err
+            else "relay has no rows for this slot, using our own winner rows"))
     return ('<div class="panel"><div class="dtlhead">round comparison'
-            "<span class='note'>rewards in lamports, CU in compute units "
-            "&middot; <b>ours is the final cumulative offer for the round, not "
-            "a sum</b> &mdash; selected rows are cumulative prefixes, so "
-            "summing double-counts &middot; commit replay is sim-commit "
-            "body_us, which on a lost round is the cost of replaying the "
-            "foreign winner before we can build on it &middot; extends are "
-            "ACCEPTED calls only, refusals emit nothing</span></div>"
+            f'<span class="note">their side from <b>{src}</b> &middot; when '
+            "they won it is their accepted block, when we won it is their best "
+            "losing offer &middot; <b>ours is the final cumulative offer, not a "
+            "sum</b> &mdash; selected rows are cumulative prefixes &middot; "
+            "commit replay and extends are OURS; there is no counterpart for "
+            "them &middot; commit replay on a lost round is the cost of "
+            "replaying their block before we can build on it</span>"
+            + (f'<span class="warn"> &#9888; {html.escape(relay_err)}</span>'
+               if relay_err else "")
+            + "</div>"
             f"<table><thead>{head}</thead><tbody>{''.join(body)}</tbody></table>"
             "</div>")
 
@@ -1415,6 +1576,8 @@ a.tab{display:inline-block;padding:6px 15px;margin-right:6px;border-radius:8px 8
 a.tab:hover{color:#cfe0f0;border-color:#2f4256}
 a.tab.on{background:#0c141b;border-color:#14b8a6;color:#5eead4;font-weight:600}
 .tabs{padding:6px 28px 0;border-bottom:1px solid #1e2937;margin-bottom:14px}
+.basis{color:#5b6b80;font-size:9.5px;margin-top:2px;text-transform:none}
+.rejnote{color:#fbbf24;font-size:9.5px;margin-top:3px}
 .goodc{color:#5eead4}
 .slotbar{padding:20px 28px 4px;color:#9fb2c8;font-size:13px}
 .slotbar b{color:#5eead4;font-family:ui-monospace,Menlo,monospace}
@@ -1956,7 +2119,8 @@ def page(sel_win=None, sel_slot=None, sel_round=None, tab="rounds"):
             try:
                 d = slot_data(sel_slot)
                 inner = compare_html(sel_slot, d["rounds"], d["extends"],
-                                     d["commits"])
+                                     d["commits"], d.get("relay"),
+                                     d.get("relay_err"))
             except Exception as exc:
                 inner = ('<div class="err">comparison unavailable: '
                          f"{html.escape(str(exc))[:160]}</div>")
