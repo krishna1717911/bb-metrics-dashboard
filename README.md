@@ -58,7 +58,16 @@ window's first slot — four rows in the strip were always four views of one
 assignment.
 
 Each chip carries the window's first slot, a **live-ticking age**, the leader
-identity, and `N/4 won`. Scope is every slot you *competed* in — at least one
+identity, the **`run_id`** that served it, and `N/4 won`.
+
+`run_id` is one builder **process lifetime**, so it changes on every restart —
+putting it on the strip makes deploy boundaries visible while scanning, rather
+than only after opening a slot. A window served within ten minutes of a restart
+gets a `cold` pill: it ran against a cold program cache and a cold account
+overlay, so its timings are not comparable to a window served hours into the
+same run. Hovering gives the full UUID, when the run started, how many slots it
+covers, and how far into it this window fell. A window spanning a restart is
+marked with a warning rather than silently showing one of its two runs. Scope is every slot you *competed* in — at least one
 `kind='selected'` offer — not only the ones you produced. That distinction
 matters: winning tends to be concentrated on a small number of connector
 identities, so a won-only list can show a single leader and hide every other
@@ -68,29 +77,13 @@ Ages keep counting after render. The page carries the server's clock and the
 browser holds the difference as a fixed offset, so a machine whose clock is off
 still shows ages consistent with the server rather than its own drift.
 
-### 2. Builder run
-
-`run_id` is one builder **process lifetime**, so it changes on every restart. It
-is constant within a (slot, instance) pair, but a slot can carry two runs when
-two instances were live at once — so the panel renders a row per run.
-
-The column that earns its place is **how far into the run this slot fell**. A
-slot served shortly after a restart ran against a cold program cache and a cold
-account overlay; its extend timings are not comparable to one served hours in,
-and without this the panels below would look anomalous for no visible reason.
-Under ten minutes raises a `cold start` pill.
-
-Also carried: the run's instance, start time, total slots and wins, its slot
-span, and this slot's row count and `seq_id` range (`seq_id` is global across
-the run, not per slot, so gaps are visible).
-
-### 3. Auction rounds
+### 2. Auction rounds
 
 Click a window to expand its slots; click a slot for its rounds. Each round
 collapses to one line — offer count, won / not ours / no winner echo, `is_last`,
 and an extend badge — and expands to the detail.
 
-### 4. Comparison tab
+### 3. Comparison tab
 
 A per-slot tab beside the rounds view: what won each round, what we offered,
 and what the lane spent.
@@ -125,7 +118,7 @@ Without the relay it falls back to our own winner rows and the generic
 `commit replay` and the extend columns are ours only; there is no counterpart
 on their side.
 
-### 5. Mutation lane, per round
+### 4. Mutation lane, per round
 
 `sim-extend` points bucketed by round. Attribution is exact rather than a
 timestamp join: the simulator emits `("index", round.index_in_slot)` on every
@@ -151,7 +144,7 @@ before the worker runs, so the count is *accepted* calls only and a round's
 true offered load is not visible here. A round with zero accepted extends is
 rendered in red and says so explicitly, rather than showing a blank.
 
-### 6. Program cache, per round
+### 5. Program cache, per round
 
 The seven `program_cache_*` fields ride on the same `sim-extend` point as
 `index`, so they are round-attributed structurally — no timestamp matching.
@@ -172,7 +165,7 @@ and `clone us` are 0 on almost every round; a non-zero value is the signal, not
 the baseline. Compiles and forks raise a pill in the header and turn their
 cells amber.
 
-### 7. Shred path — leader vs our simulator
+### 6. Shred path — leader vs our simulator
 
 Per slot, when each side saw it: slot complete, bank frozen, optimistic
 confirmed, with the sim-minus-leader delta. Positive (we were later) is amber,

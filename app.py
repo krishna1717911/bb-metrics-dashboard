@@ -402,6 +402,12 @@ _cache = {"windows": None, "at": 0.0}
 
 WINDOW = 4  # a Solana leader window is four consecutive slots
 
+# run_id is one builder process lifetime, so it changes on every restart. A
+# window served shortly after one ran against a cold program cache and a cold
+# account overlay, and its timings are not comparable to a window served hours
+# into the same run -- which is the whole reason the strip shows the run at all.
+COLD_RUN_SECONDS = 600
+
 
 def window_of(slot):
     return (slot // WINDOW) * WINDOW
@@ -429,7 +435,8 @@ def produced_windows(days=30):
         return _cache["windows"]
     _, rows = clickhouse(
         "SELECT slot, toString(min(ts)) AS first_ts, any(connector_identity) AS leader, "
-        "       max(won_by_us) AS won, countIf(kind = 'selected') AS offers "
+        "       max(won_by_us) AS won, countIf(kind = 'selected') AS offers, "
+        "       any(run_id) AS run_id "
         "FROM bifrost_miniblocks "
         f"WHERE ts > now() - INTERVAL {int(days)} DAY "
         f"  AND local_builder_id = '{CH_BUILDER}' "
@@ -443,6 +450,8 @@ def produced_windows(days=30):
                              "offers": ch_int(r[4])})
         if r[2]:
             win["leaders"].add(r[2])
+        if len(r) > 5 and r[5]:
+            win.setdefault("runs", set()).add(r[5])
     out = []
     for win in (windows[k] for k in sorted(windows, reverse=True)):
         win["slots"].sort(key=lambda s: s["slot"])
@@ -453,7 +462,40 @@ def produced_windows(days=30):
         # silently picking one with any().
         win["leader"] = leaders[0] if leaders else ""
         win["leader_split"] = len(leaders) > 1
+        runs = sorted(win.pop("runs", set()))
+        # a restart mid-window is rare but real; surface it rather than
+        # silently showing one of the two
+        win["run_id"] = runs[0] if runs else ""
+        win["run_split"] = len(runs) > 1
         out.append(win)
+
+    # One extra query for the whole strip: when each run began. That is what
+    # makes run_id actionable -- a window served minutes after a restart ran
+    # against a cold program cache and a cold account overlay, so its timings
+    # are not comparable to one served hours in.
+    run_ids = sorted({w["run_id"] for w in out if w["run_id"]})
+    starts = {}
+    if run_ids:
+        try:
+            quoted = ",".join("'" + r.replace("'", "") + "'" for r in run_ids)
+            _, rrows = clickhouse(
+                "SELECT run_id, toString(min(ts)) AS started, uniqExact(slot) AS slots "
+                f"FROM bifrost_miniblocks WHERE run_id IN ({quoted}) "
+                f"  AND local_builder_id = '{CH_BUILDER}' GROUP BY run_id")
+            starts = {r[0]: (r[1], ch_int(r[2])) for r in rrows}
+        except Exception:
+            starts = {}
+    for win in out:
+        started, run_slots = starts.get(win["run_id"], (None, 0))
+        win["run_started"] = started
+        win["run_slots"] = run_slots
+        age = None
+        if started:
+            a, b = epoch(started), epoch(win["ts"])
+            age = None if (a is None or b is None) else b - a
+        win["run_age"] = age
+        win["run_cold"] = age is not None and age < COLD_RUN_SECONDS
+
     _cache.update(windows=out, at=now)
     return out
 
@@ -465,6 +507,12 @@ def copy_btn(value):
     return (f'<span class="cp" data-c="{html.escape(str(value), quote=True)}" '
             f'role="button" tabindex="0" title="copy {html.escape(str(value))}"'
             f'>copy</span>')
+
+
+def short_run(run_id):
+    """run_id is a UUID; the chip has room for its first block only. The full
+    value is in the chip title and is copyable from there."""
+    return run_id.split("-")[0] if run_id else "?"
 
 
 def short_id(identity):
@@ -763,115 +811,6 @@ def slot_extends(slot, stamps):
     return out
 
 
-# ---------------------------------------------------------- builder runs
-
-def slot_runs(rounds):
-    """The builder process(es) that served this slot.
-
-    `run_id` is one process lifetime, so it changes on every restart. It is
-    constant within a (slot, instance) pair, but a slot can carry more than one
-    run when two instances were live at once -- so this returns a list, not a
-    single run.
-
-    What makes it worth showing is position: how far into the run this slot
-    fell. A slot served minutes after a restart ran against a cold program
-    cache and a cold account overlay, and its timings are not comparable to one
-    served hours in."""
-    seen = {}
-    for r in rounds:
-        for item in r["offers"] + ([r["winner"]] if r["winner"] else []):
-            rid = item.get("run_id")
-            if not rid:
-                continue
-            slot_run = seen.setdefault(rid, {
-                "run_id": rid, "instance": item.get("instance", ""),
-                "first_ts": item["ts"], "last_ts": item["ts"], "rows": 0,
-                "seq_lo": item["seq_id"], "seq_hi": item["seq_id"]})
-            slot_run["rows"] += 1
-            slot_run["first_ts"] = min(slot_run["first_ts"], item["ts"])
-            slot_run["last_ts"] = max(slot_run["last_ts"], item["ts"])
-            slot_run["seq_lo"] = min(slot_run["seq_lo"], item["seq_id"])
-            slot_run["seq_hi"] = max(slot_run["seq_hi"], item["seq_id"])
-    if not seen:
-        return []
-    quoted = ",".join("'" + rid.replace("'", "") + "'" for rid in seen)
-    _, rows = clickhouse(
-        "SELECT run_id, any(instance_id) AS instance, toString(min(ts)) AS started, "
-        "       toString(max(ts)) AS ended, uniqExact(slot) AS slots, "
-        "       min(slot) AS slot_lo, max(slot) AS slot_hi, "
-        "       uniqExactIf(slot, won_by_us) AS won "
-        f"FROM bifrost_miniblocks WHERE run_id IN ({quoted}) "
-        f"  AND local_builder_id = '{CH_BUILDER}' GROUP BY run_id")
-    for r in rows:
-        if r[0] in seen:
-            seen[r[0]].update(instance=r[1], started=r[2], ended=r[3],
-                              slots=ch_int(r[4]), slot_lo=ch_int(r[5]),
-                              slot_hi=ch_int(r[6]), won=ch_int(r[7]))
-    return sorted(seen.values(), key=lambda s: s["first_ts"])
-
-
-def since(a, b):
-    """b - a as a coarse duration, both naive-UTC ClickHouse strings."""
-    start, end = epoch(a), epoch(b)
-    if start is None or end is None:
-        return "?"
-    secs = max(0, int(end - start))
-    d, rem = divmod(secs, 86400)
-    h, rem = divmod(rem, 3600)
-    m, s = divmod(rem, 60)
-    if d:
-        return f"{d}d {h}h"
-    if h:
-        return f"{h}h {m}m"
-    if m:
-        return f"{m}m {s}s"
-    return f"{s}s"
-
-
-# A slot served shortly after a restart ran against cold caches.
-COLD_RUN_SECONDS = 600
-
-
-def runs_html(slot, runs):
-    if not runs:
-        return ""
-    rows = []
-    for run in runs:
-        started = run.get("started")
-        into = since(started, run["first_ts"]) if started else "?"
-        age = epoch(run["first_ts"]) - epoch(started) if started else None
-        cold = age is not None and age < COLD_RUN_SECONDS
-        span = (f'{run.get("slot_lo","?")} &ndash; {run.get("slot_hi","?")}'
-                if started else "?")
-        num = lambda key: (f"{run[key]:,}" if isinstance(run.get(key), int)
-                           else "?")
-        rows.append(
-            "<tr>"
-            f'<td class=m>{html.escape(run["run_id"])}{copy_btn(run["run_id"])}</td>'
-            f'<td class=m>{html.escape(run.get("instance", ""))}</td>'
-            f'<td class=m>{html.escape((started or "?")[:19])}</td>'
-            f'<td class="n m{" bad" if cold else ""}">{into}'
-            + ("<span class='warnpill'>cold start</span>" if cold else "")
-            + "</td>"
-            f'<td class="n m">{num("slots")}</td>'
-            f'<td class="n m">{num("won")}</td>'
-            f'<td class="n m">{span}</td>'
-            f'<td class="n m">{run["rows"]} rows, seq '
-            f'{run["seq_lo"]}&ndash;{run["seq_hi"]}</td></tr>')
-    head = ("<tr><th>run_id</th><th>instance</th><th>run started (UTC)</th>"
-            "<th class=n>slot is this far in</th><th class=n>run slots</th>"
-            "<th class=n>run wins</th><th class=n>run slot span</th>"
-            "<th class=n>this slot</th></tr>")
-    return ('<div class="panel"><div class="dtlhead">builder run'
-            + ("s" if len(runs) > 1 else "")
-            + "<span class='note'>run_id is one builder process lifetime, so it "
-              "changes on every restart &middot; a slot served soon after a "
-              "restart ran against cold caches and its timings are not "
-              "comparable to one served hours in</span></div>"
-            f"<table><thead>{head}</thead><tbody>{''.join(rows)}</tbody></table>"
-            "</div>")
-
-
 # ----------------------------------------- shred path: leader vs simulator
 
 # host_id is the validator identity. Several nodes write the same measurement
@@ -1126,17 +1065,12 @@ def _slot_data_uncached(slot, now):
         shreds, shred_err = fut["shred"].result(), None
     except Exception as exc:
         shreds, shred_err = {}, str(exc)[:140]
-    try:
-        runs, runs_err = slot_runs(rounds), None
-    except Exception as exc:
-        runs, runs_err = [], str(exc)[:140]
     data = {"rounds": rounds, "extends": extends, "ext_err": ext_err,
             "commits": commits, "relay": relay_rounds,
             "relay_err": relay_err,
-            "shreds": shreds, "shred_err": shred_err,
-            "runs": runs, "runs_err": runs_err}
+            "shreds": shreds, "shred_err": shred_err}
 
-    if ext_err is None and shred_err is None and runs_err is None:
+    if ext_err is None and shred_err is None:
         with _slot_lock:
             if len(_slot_cache) >= SLOT_CACHE_MAX:
                 _slot_cache.pop(min(_slot_cache, key=lambda k: _slot_cache[k][0]),
@@ -1395,11 +1329,6 @@ def rounds_html(slot, sel_round):
         return f'<div class="empty">no miniblock rows for slot <b>{slot}</b></div>'
 
     out = []
-    if data["runs_err"]:
-        out.append('<div class="err" style="margin:0 28px 8px">builder run '
-                   f"unavailable: {html.escape(data['runs_err'])}</div>")
-    else:
-        out.append(runs_html(slot, data["runs"]))
     if data["shred_err"]:
         out.append('<div class="err" style="margin:0 28px 8px">shred path '
                    f"unavailable: {html.escape(data['shred_err'])}</div>")
@@ -1555,6 +1484,11 @@ a.navlink:hover{background:#0f766e22;border-color:#5eead4}
 
 /* won == we produced the block; everything else we bid on and lost */
 .chip .tag{font-size:10px;color:#4d5c70;margin-top:3px}
+.chip .runline{font-size:9.5px;color:#5b6b80;margin-top:3px;
+  font-family:ui-monospace,Menlo,monospace}
+.chip.on .runline{color:#a7f3ea}
+.coldpill{color:#fbbf24;border:1px solid #78350f;background:#78350f33;
+  border-radius:3px;padding:0 4px;font-size:8.5px;text-transform:uppercase}
 .chip.won{border-color:#14b8a655;background:#0f1c1f}
 .chip.won .tag{color:#5eead4}
 .chip.won:hover{border-color:#5eead4}
@@ -1734,12 +1668,24 @@ def strip_html(windows, sel_win, sel_slot):
         return (f'<a class="{cls}" href="{href}" '
                 f'title="{html.escape(w["ts"][:19])} UTC &mdash; leader '
                 f'{html.escape(w["leader"])} &mdash; '
-                f'{w["won"]}/{len(w["slots"])} slots won">'
+                f'{w["won"]}/{len(w["slots"])} slots won &mdash; run '
+                f'{html.escape(w["run_id"] or "?")}'
+                + (f' started {html.escape((w.get("run_started") or "")[:19])} '
+                   f'UTC, {w.get("run_slots", 0)} slots'
+                   if w.get("run_started") else "")
+                + (f', this window {int(w["run_age"] // 60)}m in'
+                   if w.get("run_age") is not None else "")
+                + '">'
                 f'<div class="slot">{w["win"]}<span class="n">'
                 f'&nbsp;+{len(w["slots"]) - 1}</span>{copy_btn(w["win"])}</div>'
                 f'<div class="ageline">{age_html(w["ts"])}</div>'
                 f'<div class="meta">{html.escape(short_id(w["leader"]))}'
                 f'{" &#9888;" if w["leader_split"] else ""}</div>'
+                f'<div class="runline">run {html.escape(short_run(w["run_id"]))}'
+                + (' <span class="warn">&#9888;</span>' if w["run_split"] else "")
+                + (' <span class="coldpill">cold</span>' if w.get("run_cold")
+                   else "")
+                + "</div>"
                 f'<div class="tag">{w["won"]}/{len(w["slots"])} won</div></a>')
 
     chips = "".join(chip(w) for w in windows)
