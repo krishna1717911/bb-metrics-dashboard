@@ -84,10 +84,10 @@ Click a window to expand its slots; click a slot for its rounds. Each round
 collapses to one line — offer count, won / not ours / no winner echo, `is_last`,
 and an extend badge — and expands to the detail.
 
-### 3. Comparison tab
+### 3. Timeline tab
 
-Opens with a **slot timeline**: what happened, in order, from the moment a
-leader-window context installed to optimistic confirmation.
+What happened in this slot, in order, from the moment a leader-window context
+installed to optimistic confirmation.
 
 ```
 +0.0 ms     context installed      sequencing can begin      parent slot 439391880
@@ -109,6 +109,8 @@ Extends are collapsed per round: twenty extends in a round is one burst, not
 twenty things to read. The shape it exposes is the round cadence — extend
 burst, commit, extend burst, commit — with the auction finishing well before
 the slot completes.
+
+### 4. Comparison tab
 
 
 A per-slot tab beside the rounds view: what won each round, what we offered,
@@ -144,7 +146,7 @@ Without the relay it falls back to our own winner rows and the generic
 `commit replay` and the extend columns are ours only; there is no counterpart
 on their side.
 
-### 4. Mutation lane, per round
+### 5. Mutation lane, per round
 
 `sim-extend` points bucketed by round. Attribution is exact rather than a
 timestamp join: the simulator emits `("index", round.index_in_slot)` on every
@@ -170,7 +172,7 @@ before the worker runs, so the count is *accepted* calls only and a round's
 true offered load is not visible here. A round with zero accepted extends is
 rendered in red and says so explicitly, rather than showing a blank.
 
-### 5. Program cache, per round
+### 6. Program cache, per round
 
 The seven `program_cache_*` fields ride on the same `sim-extend` point as
 `index`, so they are round-attributed structurally — no timestamp matching.
@@ -191,7 +193,7 @@ and `clone us` are 0 on almost every round; a non-zero value is the signal, not
 the baseline. Compiles and forks raise a pill in the header and turn their
 cells amber.
 
-### 6. Shred path — leader vs our simulator
+### 7. Shred path — leader vs our simulator
 
 Per slot, when each side saw it: slot complete, bank frozen, optimistic
 confirmed, with the sim-minus-leader delta. Positive (we were later) is amber,

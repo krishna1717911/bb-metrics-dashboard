@@ -2453,13 +2453,22 @@ def page(sel_win=None, sel_slot=None, sel_round=None, tab="rounds"):
         tabs = "".join(
             f'<a class="tab{" on" if tab == key else ""}" '
             f'href="{base}{"" if key == "rounds" else "&tab=" + key}">{label}</a>'
-            for key, label in (("rounds", "rounds"), ("compare", "comparison")))
-        if tab == "compare":
+            for key, label in (("rounds", "rounds"), ("compare", "comparison"),
+                               ("timeline", "timeline")))
+        if tab == "timeline":
             try:
                 d = slot_data(sel_slot)
                 inner = timeline_html(sel_slot, d["extends"], d["commits"],
                                       d.get("shreds"), d["rounds"])
-                inner += compare_html(sel_slot, d["rounds"], d["extends"],
+            except Exception as exc:
+                inner = ('<div class="err">timeline unavailable: '
+                         f"{html.escape(str(exc))[:160]}</div>")
+            blurb = ("everything that happened in this slot, in order, on a "
+                     "single clock.")
+        elif tab == "compare":
+            try:
+                d = slot_data(sel_slot)
+                inner = compare_html(sel_slot, d["rounds"], d["extends"],
                                      d["commits"], d.get("relay"),
                                      d.get("relay_err"), compare_extras(sel_slot))
             except Exception as exc:
@@ -2517,7 +2526,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             tab = qs.get("tab", ["rounds"])[0]
             body = page(as_int("win"), as_int("slot"), as_int("round"),
-                        "compare" if tab == "compare" else "rounds").encode()
+                        tab if tab in ("compare", "timeline") else "rounds"
+                        ).encode()
         except Exception as exc:
             body = f"<pre>{html.escape(str(exc))}</pre>".encode()
         self.send_response(200)
