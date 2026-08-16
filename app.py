@@ -633,6 +633,120 @@ def _p50(values):
     return ordered[(len(ordered) - 1) // 2] if ordered else 0
 
 
+SOLANA_RPC = os.environ.get("SOLANA_RPC", "")
+_block_cache = {}
+_block_lock = threading.Lock()
+
+
+def slot_votes(slot):
+    """Which of this slot's transactions are votes, keyed by SigPrefix.
+
+    Miniblocks DO carry votes -- measured on slot 439391881, 388 of the
+    winner's 553 transaction refs were votes, and 680 of our 1,209 selected
+    signatures. So "non-vote" is a real distinction and not a formality.
+
+    Needs the block, hence an RPC call, hence optional: without SOLANA_RPC the
+    non-vote columns read as unknown rather than as zero. Only the comparison
+    tab asks for this."""
+    if not SOLANA_RPC:
+        return None
+    with _block_lock:
+        if slot in _block_cache:
+            return _block_cache[slot]
+    try:
+        req = urllib.request.Request(
+            SOLANA_RPC, headers={"Content-Type": "application/json"},
+            data=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "getBlock",
+                             "params": [int(slot), {
+                                 "encoding": "json",
+                                 "transactionDetails": "accounts",
+                                 "rewards": False,
+                                 "maxSupportedTransactionVersion": 0}]}).encode())
+        blk = json.load(urllib.request.urlopen(req, timeout=120)).get("result")
+    except Exception:
+        blk = None
+    votes = {}
+    for t in (blk or {}).get("transactions", []):
+        sig = t["transaction"]["signatures"][0]
+        keys = [k["pubkey"] if isinstance(k, dict) else k
+                for k in t["transaction"]["accountKeys"]]
+        votes[b58decode(sig)[:16]] = (VOTE_PROGRAM in keys)
+    with _block_lock:
+        if len(_block_cache) > 32:
+            _block_cache.clear()
+        _block_cache[slot] = votes
+    return votes
+
+
+VOTE_PROGRAM = "Vote111111111111111111111111111111111111111"
+_B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+
+def b58decode(s):
+    n = 0
+    for c in s:
+        n = n * 58 + _B58.index(c)
+    body = n.to_bytes((n.bit_length() + 7) // 8, "big") if n else b""
+    return b"\0" * (len(s) - len(s.lstrip("1"))) + body
+
+
+def slot_our_sigs(slot):
+    """Our offered signatures per round. `selected` rows are cumulative
+    prefixes, so the union across a round is the final offer's membership."""
+    out = {}
+    try:
+        _, rows = clickhouse(
+            "SELECT index_in_slot, arrayDistinct(arrayFlatten(groupArray(signatures))) "
+            "  AS sigs FROM bifrost_miniblocks "
+            f"WHERE slot = {int(slot)} AND kind = 'selected' "
+            f"  AND local_builder_id = '{CH_BUILDER}' GROUP BY index_in_slot")
+    except Exception:
+        return out
+    for r in rows:
+        raw = (r[1] or "").strip("[]")
+        sigs = [x.strip().strip("'") for x in raw.split(",") if x.strip()]
+        out[ch_int(r[0])] = sigs
+    return out
+
+
+def slot_winner_refs(slot):
+    """Decode each foreign winner payload into its transaction and bundle refs.
+
+    A foreign winner row reports transaction_count=0 and bundle_count=0 -- the
+    counts are only populated for our own blocks -- but the payload carries the
+    composition. Layout is a 55-byte header then tagged records:
+    u32 0 + 16-byte SigPrefix for a transaction, u32 1 + 32-byte id for a
+    bundle. Validated against order_count on every row."""
+    out = {}
+    try:
+        _, rows = clickhouse(
+            "SELECT index_in_slot, order_count, hex(payload) AS payload "
+            f"FROM bifrost_miniblocks WHERE slot = {int(slot)} AND kind = 'winner' "
+            f"  AND local_builder_id = '{CH_BUILDER}' AND length(payload) > 55")
+    except Exception:
+        return out
+    for r in rows:
+        try:
+            idx, want, b = ch_int(r[0]), ch_int(r[1]), bytes.fromhex(r[2])
+        except (ValueError, TypeError):
+            continue
+        off, txs, bundles = 55, [], 0
+        while off + 4 <= len(b):
+            tag = int.from_bytes(b[off:off + 4], "little")
+            size = {0: 16, 1: 32}.get(tag)
+            if size is None or off + 4 + size > len(b):
+                break
+            if tag == 0:
+                txs.append(b[off + 4:off + 20])
+            else:
+                bundles += 1
+            off += 4 + size
+        if len(txs) + bundles != want:      # layout did not hold; do not guess
+            continue
+        out[idx] = {"txs": txs, "bundles": bundles}
+    return out
+
+
 def slot_relay(slot, stamps):
     """Per-round opponent view from the relay, keyed by index_in_slot.
 
@@ -719,7 +833,8 @@ def slot_commits(slot, stamps):
     hi = (dt.datetime.fromisoformat(max(stamps)[:26]) + pad
           ).strftime("%Y-%m-%dT%H:%M:%SZ")
     cols, rows = influx(
-        'SELECT "index","body_us","queue_us","replayed","promoted_len","applied" '
+        'SELECT "index","body_us","queue_us","replayed","promoted_len","applied",'
+        '"winner","refusal" '
         f'FROM "sim-commit" WHERE slot = {int(slot)} '
         + "".join(f"AND \"host_id\" != '{h}' " for h in OFF_CHAIN)
         + f"AND time >= '{lo}' AND time <= '{hi}'")
@@ -735,13 +850,43 @@ def slot_commits(slot, stamps):
                 return 0
         idx = num("index")
         e = out.setdefault(idx, {"n": 0, "body": 0, "replayed": 0,
-                                 "promoted": 0, "queue": 0})
+                                 "promoted": 0, "queue": 0, "kind": 0,
+                                 "refusal": 0})
         e["n"] += 1
         e["body"] += num("body_us")
         e["queue"] += num("queue_us")
         e["replayed"] += num("replayed")
         e["promoted"] += num("promoted_len")
+        e["refusal"] += num("refusal")
+        # workers.rs winner_kind(): 0 empty, 1 promote, 2 replay. Keep the
+        # heaviest kind seen -- a replay is what actually costs.
+        e["kind"] = max(e["kind"], num("winner"))
     return out
+
+
+# workers.rs winner_kind()
+COMMIT_KIND = {0: "empty", 1: "promote", 2: "replay"}
+
+
+def commit_cell(com):
+    """A commit is not always a replay, and calling it one hides the single
+    biggest cost difference in the round.
+
+      replay   we lost, so their winning block is re-executed on our bank
+               before we can extend on top of it -- tens of milliseconds
+      promote  we won, so the prefix we already hold is just pointed at -- a
+               pointer move, tens of microseconds
+      empty    a winnerless round; nothing to apply
+    """
+    if not com:
+        return '<span class="dim">&mdash;</span>'
+    kind = COMMIT_KIND.get(com["kind"], "?")
+    if kind == "replay":
+        return (f'{ms(com["body"])}<div class="basis">replay '
+                f'{com["replayed"]:,} orders</div>')
+    if kind == "promote":
+        return (f'{ms(com["body"])}<div class="basis">promote, no replay</div>')
+    return f'{ms(com["body"])}<div class="basis">empty round</div>' 
 
 
 def slot_extends(slot, stamps):
@@ -1231,8 +1376,27 @@ def big(v):
     return f"{v:.0f}"
 
 
+_extra_cache = {}
+
+
+def compare_extras(slot):
+    """Bundle and non-vote inputs for the comparison tab only, so the rounds
+    view never pays for the block fetch."""
+    with _slot_lock:
+        hit = _extra_cache.get(slot)
+    if hit is not None:
+        return hit
+    extras = {"theirs": slot_winner_refs(slot), "ours": slot_our_sigs(slot),
+              "votes": slot_votes(slot)}
+    with _slot_lock:
+        if len(_extra_cache) > 32:
+            _extra_cache.clear()
+        _extra_cache[slot] = extras
+    return extras
+
+
 def compare_html(slot, rounds, extends, commits, relay_rounds=None,
-                 relay_err=None):
+                 relay_err=None, extras=None):
     """Round-by-round: what won, what we offered, and what the lane spent.
 
     THEIR side comes from the relay when we have it, because the relay sees
@@ -1255,6 +1419,20 @@ def compare_html(slot, rounds, extends, commits, relay_rounds=None,
     if not rounds:
         return '<div class="empty">no rounds for this slot</div>'
     relay_rounds = relay_rounds or {}
+    extras = extras or {}
+    their_refs = extras.get("theirs") or {}
+    our_sigs = extras.get("ours") or {}
+    votes = extras.get("votes")
+
+    def nonvote(prefixes):
+        """Counted only over transactions found in this slot's block; anything
+        that did not land cannot be classified, so it is reported separately
+        rather than silently counted as non-vote."""
+        if votes is None:
+            return None, 0
+        seen = [votes[p] for p in prefixes if p in votes]
+        return sum(1 for v in seen if not v), len(prefixes) - len(seen)
+
     body = []
     for r in rounds:
         w = r["winner"]
@@ -1275,7 +1453,7 @@ def compare_html(slot, rounds, extends, commits, relay_rounds=None,
             their_reward, their_cu = rl["opp_reward"], rl["opp_cu"]
             their_orders = rl["opp_orders"]
         elif w and not we_won:
-            them_name, basis = OPPONENT, "winner row"
+            them_name, basis = (rl or {}).get("win_builder") or OPPONENT, "winner row"
             their_reward, their_cu = w["reward"], w["exec_cost"]
             their_orders = w["orders"]
         else:
@@ -1291,6 +1469,23 @@ def compare_html(slot, rounds, extends, commits, relay_rounds=None,
             margin = '<span class="dim">&mdash;</span>'
         ext = extends.get(r["round"])
         com = commits.get(r["round"])
+        # bundles and non-vote, both sides
+        tr = their_refs.get(r["round"])
+        their_bundles = tr["bundles"] if tr else None
+        their_nv, their_unk = nonvote(tr["txs"]) if tr else (None, 0)
+        ours_bundles = max((o["bundles"] for o in offers), default=None)
+        mine = [b58decode(x)[:16] for x in our_sigs.get(r["round"], [])]
+        our_nv, our_unk = nonvote(mine) if mine else (None, 0)
+
+        def pair(a, b, unk_a=0, unk_b=0):
+            fa = "&mdash;" if a is None else f"{a:,}"
+            fb = "&mdash;" if b is None else f"{b:,}"
+            tail = ""
+            if unk_a or unk_b:
+                tail = (f'<div class="basis">{unk_a}/{unk_b} did not land, '
+                        "unclassified</div>")
+            return f'<td class="n m">{fa} / {fb}{tail}</td>'
+
         note = ""
         if rl and rl["our_reject"]:
             note = (f'<div class="rejnote">our {rl["our_subs"]} offer'
@@ -1311,15 +1506,20 @@ def compare_html(slot, rounds, extends, commits, relay_rounds=None,
             f' / {big(ours_orders)}</td>'
             f'<td class="n m">{big(their_cu) if their_cu is not None else "&mdash;"}'
             f' / {big(ours_cu)}</td>'
-            f'<td class="n m">{ms(com["body"]) if com else "&mdash;"}</td>'
-            f'<td class="n m">{ext["n"] if ext else 0}</td>'
+            + pair(their_bundles, ours_bundles)
+            + pair(their_nv, our_nv, their_unk, our_unk)
+            + f'<td class="n m">{commit_cell(com)}</td>'
+            + f'<td class="n m">{ext["n"] if ext else 0}</td>'
             f'<td class="n m">{ms(ext["body_p50"]) if ext else "&mdash;"}</td>'
             f'<td class="n m">{ms(ext["body_max"]) if ext else "&mdash;"}</td>'
             "</tr>")
     head = ("<tr><th>round</th><th>winner</th>"
             "<th class=n>their reward</th><th class=n>ours</th>"
             "<th class=n>margin</th><th class=n>orders (them/us)</th>"
-            "<th class=n>CU (them/us)</th><th class=n>commit replay (us)</th>"
+            "<th class=n>CU (them/us)</th>"
+            "<th class=n>bundles (them/us)</th>"
+            "<th class=n>non-vote txs (them/us)</th>"
+            "<th class=n>commit (us)</th>"
             "<th class=n>extends n (us)</th><th class=n>extend p50 (us)</th>"
             "<th class=n>extend max (us)</th></tr>")
     src = ("relay" if relay_rounds else
@@ -1642,11 +1842,25 @@ TICK_JS = """
 // positioned child. A fixed-position node attached to <body> escapes that.
 (function(){
   var box = null;
-  function hide(){ if (box) { box.remove(); box = null; } }
+  function hide(){
+    if (box) { box.remove(); box = null; }
+    unmute();
+  }
+  var muted = null;      // ancestor whose native title we suppressed
+  function unmute(){
+    if (muted) { muted.el.title = muted.title; muted = null; }
+  }
   function show(el){
     hide();
     var tip = el.getAttribute('data-tip');
     if (!tip) return;
+    // The chip carries its own title=. Left alone the browser pops it a second
+    // later, on top of this tooltip. Suppress it while we are showing ours.
+    var owner = el.closest('[title]');
+    if (owner && owner.title) {
+      muted = {el: owner, title: owner.title};
+      owner.title = '';
+    }
     box = document.createElement('div');
     box.className = 'tipbox';
     box.textContent = tip;
@@ -2136,7 +2350,7 @@ def page(sel_win=None, sel_slot=None, sel_round=None, tab="rounds"):
                 d = slot_data(sel_slot)
                 inner = compare_html(sel_slot, d["rounds"], d["extends"],
                                      d["commits"], d.get("relay"),
-                                     d.get("relay_err"))
+                                     d.get("relay_err"), compare_extras(sel_slot))
             except Exception as exc:
                 inner = ('<div class="err">comparison unavailable: '
                          f"{html.escape(str(exc))[:160]}</div>")
