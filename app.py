@@ -1468,7 +1468,8 @@ def compare_html(slot, rounds, extends, commits, relay_rounds=None,
         else:
             margin = '<span class="dim">&mdash;</span>'
         ext = extends.get(r["round"])
-        com = commits.get(r["round"])
+        # the commit that had to finish before THIS round could extend
+        com = commits.get(r["round"] - 1) if r["round"] > 0 else None
         # bundles and non-vote, both sides
         tr = their_refs.get(r["round"])
         their_bundles = tr["bundles"] if tr else None
@@ -1519,7 +1520,7 @@ def compare_html(slot, rounds, extends, commits, relay_rounds=None,
             "<th class=n>CU (them/us)</th>"
             "<th class=n>bundles (them/us)</th>"
             "<th class=n>non-vote txs (them/us)</th>"
-            "<th class=n>commit (us)</th>"
+            "<th class=n>commit before this round (us)</th>"
             "<th class=n>extends n (us)</th><th class=n>extend p50 (us)</th>"
             "<th class=n>extend max (us)</th></tr>")
     src = ("relay" if relay_rounds else
@@ -1530,9 +1531,13 @@ def compare_html(slot, rounds, extends, commits, relay_rounds=None,
             "they won it is their accepted block, when we won it is their best "
             "losing offer &middot; <b>ours is the final cumulative offer, not a "
             "sum</b> &mdash; selected rows are cumulative prefixes &middot; "
-            "commit replay and extends are OURS; there is no counterpart for "
-            "them &middot; commit replay on a lost round is the cost of "
-            "replaying their block before we can build on it</span>"
+            "commit and extends are OURS; there is no counterpart for them "
+            "&middot; the commit column is the PREVIOUS round's commit, the "
+            "cost that had to finish before this round could extend, so round "
+            "0 has none &middot; `replayed` is replay.orders.len() from the "
+            "builder's CommitRoundRequest, which per the proto EXCLUDES votes "
+            "-- they are priced via votes_cu and never executed, which is why "
+            "it sits well below the winner's order_count</span>"
             + (f'<span class="warn"> &#9888; {html.escape(relay_err)}</span>'
                if relay_err else "")
             + "</div>"
