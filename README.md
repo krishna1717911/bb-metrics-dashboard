@@ -86,6 +86,31 @@ and an extend badge — and expands to the detail.
 
 ### 3. Comparison tab
 
+Opens with a **slot timeline**: what happened, in order, from the moment a
+leader-window context installed to optimistic confirmation.
+
+```
++0.0 ms     context installed      sequencing can begin      parent slot 439391880
++1.0 ms     round 0 extends        20 accepted over 61 ms    p50 1.1 ms, 185/186 applied
++100.4 ms   round 0 commit         replay, 30.6 ms           replay 183 orders
++101.5 ms   round 1 extends        8 accepted over 27 ms     p50 1.8 ms
+...
++392.5 ms   slot complete          every shred in blockstore insert took 343 ms
++397.0 ms   bank frozen
++480.6 ms   optimistic confirmed
+```
+
+**One clock only.** Every row is InfluxDB, with the shred rows pinned to our own
+host, so the ordering is real. Relay and ClickHouse timestamps are deliberately
+excluded — separate clocks, observed 11.5 s apart, which would silently reorder
+the sequence. The comparison table below carries the relay's side instead.
+
+Extends are collapsed per round: twenty extends in a round is one burst, not
+twenty things to read. The shape it exposes is the round cadence — extend
+burst, commit, extend burst, commit — with the auction finishing well before
+the slot completes.
+
+
 A per-slot tab beside the rounds view: what won each round, what we offered,
 and what the lane spent.
 

@@ -832,16 +832,30 @@ def slot_commits(slot, stamps):
           ).strftime("%Y-%m-%dT%H:%M:%SZ")
     hi = (dt.datetime.fromisoformat(max(stamps)[:26]) + pad
           ).strftime("%Y-%m-%dT%H:%M:%SZ")
-    cols, rows = influx(
+    # sim-context rides along: one query, and it is the timeline's t0 -- the
+    # moment a leader-window context installed and sequencing could begin.
+    series = influx_series(
         'SELECT "index","body_us","queue_us","replayed","promoted_len","applied",'
-        '"winner","refusal" '
-        f'FROM "sim-commit" WHERE slot = {int(slot)} '
+        '"winner","refusal","parent_slot","hold_us" '
+        f'FROM "sim-commit","sim-context" WHERE slot = {int(slot)} '
         + "".join(f"AND \"host_id\" != '{h}' " for h in OFF_CHAIN)
         + f"AND time >= '{lo}' AND time <= '{hi}'")
+    ctx, cols, rows = None, [], []
+    for ser in series:
+        if ser["name"] == "sim-context":
+            c = {n: i for i, n in enumerate(ser["columns"])}
+            v = ser["values"][0]
+            ctx = {"t": _rfc3339_ns(v[0]),
+                   "parent": int(v[c["parent_slot"]] or 0)
+                   if "parent_slot" in c else 0}
+        elif ser["name"] == "sim-commit":
+            cols, rows = ser["columns"], ser["values"]
     if not rows:
-        return {}
+        return {"_context": ctx} if ctx else {}
     at = {name: i for i, name in enumerate(cols)}
     out = {}
+    if ctx:
+        out["_context"] = ctx
     for r in rows:
         def num(field):
             try:
@@ -851,7 +865,7 @@ def slot_commits(slot, stamps):
         idx = num("index")
         e = out.setdefault(idx, {"n": 0, "body": 0, "replayed": 0,
                                  "promoted": 0, "queue": 0, "kind": 0,
-                                 "refusal": 0})
+                                 "refusal": 0, "t": _rfc3339_ns(r[at["time"]])})
         e["n"] += 1
         e["body"] += num("body_us")
         e["queue"] += num("queue_us")
@@ -953,6 +967,8 @@ def slot_extends(slot, stamps):
         start = calls[0]["t"] - calls[0]["body"] * 1000
         wall = max(1, (calls[-1]["t"] - start) // 1000)
         out[idx] = {
+            "t_first": calls[0]["t"] - calls[0]["body"] * 1000,  # start, not completion
+            "t_last": calls[-1]["t"],
             "n": len(calls), "body_sum": sum(body), "body_max": max(body),
             "body_p50": _p50(body), "queue_sum": sum(c["queue"] for c in calls),
             "exec_sum": sum(c["exec"] for c in calls), "wall": wall,
@@ -1376,6 +1392,86 @@ def big(v):
     return f"{v:.0f}"
 
 
+def timeline_html(slot, extends, commits, shreds, rounds):
+    """What happened in this slot, in order.
+
+    ONE CLOCK ONLY. Every row here comes from InfluxDB, and the shred rows are
+    pinned to our own host, so the ordering is trustworthy. Relay and
+    ClickHouse timestamps are deliberately absent: those are separate clocks
+    and have been observed 11.5s apart, which would silently reorder the
+    sequence. The comparison table below carries the relay's side instead.
+
+    Extends are collapsed per round -- twenty of them in a round is a burst,
+    not twenty things worth reading."""
+    ctx = (commits or {}).get("_context")
+    ev = []
+    if ctx:
+        ev.append((ctx["t"], "context installed", "sequencing can begin",
+                   f'parent slot {ctx["parent"]}', "start"))
+    for idx in sorted(k for k in (extends or {}) if isinstance(k, int)):
+        e = extends[idx]
+        span = max(0, (e["t_last"] - e["t_first"]) / 1e6)
+        ev.append((e["t_first"], f"round {idx} extends",
+                   f'{e["n"]} accepted over {span:.0f} ms',
+                   f'p50 {ms(e["body_p50"])} &middot; max {ms(e["body_max"])} '
+                   f'&middot; {e["applied"]:,} of {e["orders"]:,} orders applied',
+                   "ext"))
+    for idx in sorted(k for k in (commits or {}) if isinstance(k, int)):
+        c = commits[idx]
+        kind = COMMIT_KIND.get(c["kind"], "?")
+        detail = (f'replay {c["replayed"]:,} orders' if kind == "replay"
+                  else "promote, no replay" if kind == "promote"
+                  else "winnerless, nothing applied")
+        ev.append((c["t"], f"round {idx} commit",
+                   f'{kind} &middot; {ms(c["body"])}', detail, kind))
+    for meas, label, note in (("retransmit-first-shred", "first shred received",
+                               "turbine delivered the leader's first shred"),
+                              ("shred_insert_is_full", "slot complete",
+                               "every shred in the blockstore"),
+                              ("bank_frozen", "bank frozen",
+                               "state final, replay done"),
+                              ("optimistic_slot", "optimistic confirmed",
+                               "supermajority voted")):
+        e = (shreds or {}).get(meas, {}).get(SIM)
+        if not e:
+            continue
+        # only shred_insert_is_full carries a duration; the rest are instants
+        extra = (f'insert took {e["total_time_ms"]:,} ms'
+                 + (f', {e["num_recovered"]:,} recovered'
+                    if e.get("num_recovered") else "")
+                 + (f', {e["num_repaired"]:,} repaired'
+                    if e.get("num_repaired") else "")
+                 if e.get("total_time_ms") is not None else "")
+        ev.append((e["t"], label, note, extra, "chain"))
+    if not ev:
+        return ('<div class="panel"><div class="dtlhead">slot timeline</div>'
+                '<div class="none">no InfluxDB events for this slot</div></div>')
+    ev.sort(key=lambda x: x[0])
+    t0 = ev[0][0]
+    total = max(1, ev[-1][0] - t0)
+    rows = []
+    for t, label, what, detail, cls in ev:
+        off = (t - t0) / 1e6
+        pct = 100.0 * (t - t0) / total
+        rows.append(
+            f'<tr class="tl-{cls}"><td class="n m">+{off:,.1f} ms</td>'
+            f'<td class="m dim">{dt.datetime.fromtimestamp(t/1e9, dt.UTC).strftime("%H:%M:%S.%f")[:-3]}</td>'
+            f'<td class="m"><b>{label}</b></td>'
+            f'<td class="m">{what}</td>'
+            f'<td class="m dim">{detail}</td>'
+            f'<td class="bar"><span style="margin-left:{pct:.2f}%"></span></td></tr>')
+    return ('<div class="panel"><div class="dtlhead">slot timeline'
+            "<span class='note'>InfluxDB only, and shred rows pinned to our own "
+            "host, so this is a single clock and the order is real &middot; "
+            "relay and ClickHouse timestamps are excluded on purpose -- separate "
+            "clocks, observed 11.5s apart &middot; extends are collapsed per "
+            "round &middot; offsets are from the first event, not slot start"
+            "</span></div>"
+            "<table><thead><tr><th class=n>offset</th><th>UTC</th><th>event</th>"
+            "<th>what</th><th>detail</th><th></th></tr></thead>"
+            f"<tbody>{''.join(rows)}</tbody></table></div>")
+
+
 _extra_cache = {}
 
 
@@ -1743,6 +1839,14 @@ a.tab{display:inline-block;padding:6px 15px;margin-right:6px;border-radius:8px 8
 a.tab:hover{color:#cfe0f0;border-color:#2f4256}
 a.tab.on{background:#0c141b;border-color:#14b8a6;color:#5eead4;font-weight:600}
 .tabs{padding:6px 28px 0;border-bottom:1px solid #1e2937;margin-bottom:14px}
+td.bar{width:22%;padding:0 9px}
+td.bar span{display:block;width:7px;height:7px;border-radius:50%;background:#2f4256}
+tr.tl-start td.bar span{background:#5eead4}
+tr.tl-replay td.bar span{background:#fbbf24}
+tr.tl-promote td.bar span{background:#5eead4}
+tr.tl-chain td.bar span{background:#93c5fd}
+tr.tl-ext td.bar span{background:#a5b4fc}
+tr.tl-start td,tr.tl-chain td{background:#0e1720}
 .basis{color:#5b6b80;font-size:9.5px;margin-top:2px;text-transform:none}
 .rejnote{color:#fbbf24;font-size:9.5px;margin-top:3px}
 .goodc{color:#5eead4}
@@ -2353,7 +2457,9 @@ def page(sel_win=None, sel_slot=None, sel_round=None, tab="rounds"):
         if tab == "compare":
             try:
                 d = slot_data(sel_slot)
-                inner = compare_html(sel_slot, d["rounds"], d["extends"],
+                inner = timeline_html(sel_slot, d["extends"], d["commits"],
+                                      d.get("shreds"), d["rounds"])
+                inner += compare_html(sel_slot, d["rounds"], d["extends"],
                                      d["commits"], d.get("relay"),
                                      d.get("relay_err"), compare_extras(sel_slot))
             except Exception as exc:
