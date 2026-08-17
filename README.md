@@ -84,6 +84,12 @@ Click a window to expand its slots; click a slot for its rounds. Each round
 collapses to one line — offer count, won / not ours / no winner echo, `is_last`,
 and an extend badge — and expands to the detail.
 
+The winner miniblock's last column is **won by**, carrying the actual builder
+id rather than a bare YES/-. Knowing it was not us is rarely the question; who
+took it is. The name comes from the relay when configured, and falls back to
+"not ours". The uuid is shown in full and is copyable, since it joins onward to
+`bifrost_events` for the orders inside that block.
+
 ### 3. Timeline tab
 
 The whole causal chain for a slot, in order — starting on the **parent slot**,

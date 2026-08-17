@@ -1421,21 +1421,26 @@ def extend_table(stat):
             f"<table><thead>{head}</thead><tbody>{row}</tbody></table></div>")
 
 
-def detail_table(title, items, show_won=False):
+def detail_table(title, items, show_won=False, winner_name=None):
+    """`show_won` turns the last column into "won by". A bare YES/- only said
+    whether it was us; the point of interest on a lost round is WHO, so the
+    winning builder's id goes there when we can name it."""
     if not items:
         return f'<div class="dtl"><div class="dtlhead">{title}</div>' \
                '<div class="none">none</div></div>'
     head = ("<tr><th>time (UTC)</th><th class=n>orders</th><th class=n>txs</th>"
             "<th class=n>bundles</th><th class=n>reward SOL</th>"
             "<th class=n>exec cost</th><th class=n>selected cu</th><th>uuid</th>"
-            + ("<th>won</th>" if show_won else "") + "</tr>")
+            + ("<th>won by</th>" if show_won else "") + "</tr>")
     body = "".join(
         f"<tr><td class=m>{html.escape(i['ts'][11:23])}</td>"
         f"<td class='n m'>{i['orders']:,}</td><td class='n m'>{i['txs']:,}</td>"
         f"<td class='n m'>{i['bundles']:,}</td><td class='n m'>{sol(i['reward'])}</td>"
         f"<td class='n m'>{i['exec_cost']:,}</td><td class='n m'>{i['sel_cu']:,}</td>"
-        f"<td class='m dim'>{html.escape(i['uuid'][:8])}&hellip;</td>"
-        + (f"<td class=m>{'YES' if i['won'] else '-'}</td>" if show_won else "")
+        f"<td class='m dim'>{html.escape(i['uuid'])}{copy_btn(i['uuid'])}</td>"
+        + (f"<td class='m {'goodc' if i['won'] else ''}'>"
+           f"{html.escape(OURS_NAME if i['won'] else (winner_name or 'not ours'))}"
+           "</td>" if show_won else "")
         + "</tr>"
         for i in items)
     return (f'<div class="dtl"><div class="dtlhead">{title}</div>'
@@ -1830,6 +1835,7 @@ def rounds_html(slot, sel_round):
     except Exception as exc:
         return f'<div class="err">rounds unavailable: {html.escape(str(exc))[:150]}</div>'
     rounds, extends, ext_err = data["rounds"], data["extends"], data["ext_err"]
+    relay_rounds = data.get("relay") or {}
     if not rounds:
         return f'<div class="empty">no miniblock rows for slot <b>{slot}</b></div>'
 
@@ -1867,7 +1873,10 @@ def rounds_html(slot, sel_round):
                       + extend_table(stat)
                       + pcache_table(stat)
                       + detail_table(f"our offers &mdash; {len(r['offers'])}", r["offers"])
-                      + detail_table("winner miniblock", [w] if w else [], show_won=True)
+                      + detail_table(
+                          "winner miniblock", [w] if w else [], show_won=True,
+                          winner_name=(relay_rounds.get(r["round"]) or {}).get(
+                              "win_builder") or None)
                       + "</div>")
         out.append(f'<div class="rndwrap">{summary}{detail}</div>')
     return "".join(out)
