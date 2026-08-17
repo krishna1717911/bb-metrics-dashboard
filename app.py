@@ -19,6 +19,7 @@ import datetime as dt
 import html
 import json
 import os
+import re
 import socket
 import threading
 import time
@@ -587,7 +588,8 @@ def slot_rounds(slot):
     _, rows = clickhouse(
         "SELECT index_in_slot, kind, toString(ts) AS ts, order_count, transaction_count, "
         "       bundle_count, reward, execution_cost, selected_cu, is_last, "
-        "       won_by_us, uuid, connector_identity, run_id, instance_id, seq_id "
+        "       won_by_us, uuid, connector_identity, run_id, instance_id, seq_id, "
+        f"       countSubstrings(payload, unhex('{VOTE_ID_HEX}')) AS votes "
         f"FROM bifrost_miniblocks WHERE slot = {int(slot)} ORDER BY index_in_slot, kind, ts")
     rounds = {}
     for r in rows:
@@ -597,7 +599,8 @@ def slot_rounds(slot):
                 "exec_cost": ch_int(r[7]), "sel_cu": ch_int(r[8]),
                 "is_last": r[9] in TRUEISH, "won": r[10] in TRUEISH,
                 "uuid": r[11], "connector": r[12], "run_id": r[13],
-                "instance": r[14], "seq_id": ch_int(r[15])}
+                "instance": r[14], "seq_id": ch_int(r[15]),
+                "votes": ch_int(r[16], -1)}
         slot_round = rounds.setdefault(idx, {"round": idx, "offers": [], "winner": None})
         if r[1] == "winner":
             slot_round["winner"] = item
@@ -679,6 +682,11 @@ def slot_votes(slot):
 
 
 VOTE_PROGRAM = "Vote111111111111111111111111111111111111111"
+# The 32-byte program id as it appears verbatim in a transaction's account
+# keys. A `selected` payload carries whole transactions, so counting these
+# occurrences classifies every offered transaction EXACTLY -- including ones
+# that never landed, which a chain lookup cannot classify at all.
+VOTE_ID_HEX = "0761481d357474bb7c4d7624ebd3bdb3d8355e73d11043fc0da3538000000000"
 _B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
 
@@ -688,6 +696,31 @@ def b58decode(s):
         n = n * 58 + _B58.index(c)
     body = n.to_bytes((n.bit_length() + 7) // 8, "big") if n else b""
     return b"\0" * (len(s) - len(s.lstrip("1"))) + body
+
+
+def slot_offer_sigs(slot):
+    """Per OFFER (keyed by miniblock uuid) the 16-byte SigPrefix of every
+    transaction in it, so each row of the offers table can be split into vote
+    and non-vote.
+
+    Prefixes rather than full signatures: a slot's selected rows carry 24k-37k
+    signatures, ~2-3 MiB of base58, and only the first 16 bytes are needed to
+    match the block. ClickHouse does the truncation, which cuts the transfer
+    to roughly a third."""
+    out = {}
+    try:
+        _, rows = clickhouse(
+            "SELECT uuid, arrayStringConcat(arrayMap("
+            "  s -> hex(substring(base58Decode(s), 1, 16)), signatures), ',') AS pfx "
+            f"FROM bifrost_miniblocks WHERE slot = {int(slot)} "
+            f"  AND kind = 'selected' AND local_builder_id = '{CH_BUILDER}'")
+    except Exception:
+        return out
+    for r in rows:
+        if not r[0]:
+            continue
+        out[r[0]] = [bytes.fromhex(h) for h in (r[1] or "").split(",") if h]
+    return out
 
 
 def slot_our_sigs(slot):
@@ -945,8 +978,13 @@ def slot_commits(slot, stamps):
 COMMIT_KIND = {0: "empty", 1: "promote", 2: "replay"}
 
 
-def commit_cell(com):
-    """A commit is not always a replay, and calling it one hides the single
+def commit_cell(com, rnd, ready_window=None):
+    """The commit this round had to WAIT ON -- the previous round's.
+
+    Commit N applies round N's winner and round N+1 extends on top of it, so
+    the cost gating round N is commit N-1, and round 0 has none.
+
+    A commit is also not always a replay, and calling it one hides the single
     biggest cost difference in the round.
 
       replay   we lost, so their winning block is re-executed on our bank
@@ -955,6 +993,12 @@ def commit_cell(com):
                pointer move, tens of microseconds
       empty    a winnerless round; nothing to apply
     """
+    if rnd == 0:
+        # Nothing to replay before the first round; it builds on the parent
+        # bank. The parent's own timings live in their own strip above the
+        # table, not crammed into this cell.
+        return ('<span class="dim">&mdash;</span>'
+                '<div class="basis">nothing to replay</div>')
     if not com:
         return '<span class="dim">&mdash;</span>'
     kind = COMMIT_KIND.get(com["kind"], "?")
@@ -963,7 +1007,7 @@ def commit_cell(com):
                 f'{com["replayed"]:,} orders</div>')
     if kind == "promote":
         return (f'{ms(com["body"])}<div class="basis">promote, no replay</div>')
-    return f'{ms(com["body"])}<div class="basis">empty round</div>' 
+    return f'{ms(com["body"])}<div class="basis">empty round</div>'
 
 
 def slot_extends(slot, stamps):
@@ -1080,8 +1124,7 @@ OFF_CHAIN = [h.strip() for h in os.environ.get("SHRED_EXCLUDE_IDS", "").split(",
              if h.strip()]
 HOST_NAME = dict({h: "leader" for h in LEADERS}, **{SIM: "our simulator"})
 # measurement -> (row label, sort key). The timestamp IS the datum for all four.
-SHRED_STAGES = [("retransmit-first-shred", "first shred (retransmit stage)"),
-                ("shred_insert_is_full", "slot complete"),
+SHRED_STAGES = [("shred_insert_is_full", "slot complete"),
                 ("bank_frozen", "bank frozen")]
 
 # "first shred received" is DERIVED, not read from a column.
@@ -1164,46 +1207,76 @@ def with_derived_first_shred(per_slot):
     return out
 
 
-def shred_html(slot, shreds):
-    """A stage x host grid, with the sim-minus-leader delta called out."""
-    shreds = with_derived_first_shred((shreds or {}).get(slot) or {})
-    if not shreds:
+def shred_html(slot, shreds, parent=None):
+    """A stage x host grid, with the sim-minus-leader delta called out.
+
+    Shows the PARENT slot as well, and puts it first, because that is the one
+    that gates this slot's auction: a context cannot install until the parent's
+    bank is frozen. This slot's own completion is downstream of the auction --
+    measured on 439391881 the parent froze at +4.5ms and the context installed
+    at +22.2ms, while this slot did not complete until +414.8ms, long after the
+    last commit at +368.6ms. So the parent row explains when we could start;
+    this slot's row only says how our shred reception compared once the block
+    was already built."""
+    parent = parent if parent is not None else slot - 1
+    per_slot = shreds or {}
+    # Only the parent. This slot's own completion lands after its auction has
+    # already finished -- measured on 439391881, the last commit was at
+    # +368.6ms and the slot did not complete until +414.8ms -- so it cannot
+    # have gated anything and only added a row to scroll past.
+    groups = [(parent, "gates this slot's auction: no context installs until "
+                       "the parent's bank is frozen")]
+    if not any((per_slot.get(n) or {}) for n, _ in groups):
         return ('<div class="panel"><div class="dtlhead">shred path &mdash; leader vs '
                 'our simulator</div><div class="none">no shred-path rows for this '
                 "slot</div></div>")
     # Pick the leader identity that actually reported this slot. They are
     # complementary, so at most one normally has it; ties break on the
     # configured order.
-    present = {h for v in shreds.values() for h in v}
+    present = {h for n, _ in groups for v in (per_slot.get(n) or {}).values()
+               for h in v}
     leader = next((h for h in LEADERS if h in present), LEADER)
     hosts = [h for h in (leader, SIM) if h]
     head = ("<tr><th>stage</th>"
             + "".join(f"<th class=n>{html.escape(HOST_NAME[h])}</th>" for h in hosts)
             + "<th class=n>sim &minus; leader</th><th>detail</th></tr>")
     body = []
-    for meas, label in ([(DERIVED_FIRST_SHRED, DERIVED_FIRST_SHRED)]
-                        + SHRED_STAGES):
-        seen = {h: e for h, e in (shreds.get(meas) or {}).items() if h in hosts}
-        if not seen:                    # neither side reported this stage
+    for which, why in groups:
+        bucket = per_slot.get(which) or {}
+        if not bucket:
             continue
-        cells = []
-        for h in hosts:
-            e = seen.get(h)
-            cells.append(f"<td class='n m'>{dt.datetime.fromtimestamp(e['t']/1e9, dt.UTC).strftime('%H:%M:%S.%f')[:-3]}</td>"
-                         if e else "<td class='n m dim'>&mdash;</td>")
-        if leader in seen and SIM in seen:
-            d = (seen[SIM]["t"] - seen[leader]["t"]) / 1e6
-            cls = "bad" if d > 0 else "good"
-            delta = f"<td class='n m {cls}'>{d:+.1f} ms</td>"
-        else:
-            delta = "<td class='n m dim'>&mdash;</td>"
-        note = "; ".join(
-            f"{HOST_NAME[h]}: {e['total_time_ms']} ms"
-            + (f", {e['num_recovered']} recovered" if e.get("num_recovered") else "")
-            + (f", {e['num_repaired']} repaired" if e.get("num_repaired") else "")
-            for h in hosts if (e := seen.get(h)) and e.get("total_time_ms") is not None)
-        body.append(f"<tr><td class=m>{label}</td>{''.join(cells)}{delta}"
-                    f"<td class='m dim'>{note}</td></tr>")
+        body.append(
+            f'<tr class="shredgrp"><td colspan="{len(hosts) + 3}">'
+            f'parent slot <b>{which}</b>'
+            f' <span class="basis">{why}</span></td></tr>')
+        for meas, label in SHRED_STAGES:
+            seen = {h: e for h, e in (bucket.get(meas) or {}).items()
+                    if h in hosts}
+            if not seen:
+                continue
+            cells = []
+            for h in hosts:
+                e = seen.get(h)
+                cells.append(
+                    f"<td class='n m'>{dt.datetime.fromtimestamp(e['t']/1e9, dt.UTC).strftime('%H:%M:%S.%f')[:-3]}</td>"
+                    if e else "<td class='n m dim'>&mdash;</td>")
+            if leader in seen and SIM in seen:
+                d = (seen[SIM]["t"] - seen[leader]["t"]) / 1e6
+                delta = (f"<td class='n m {'bad' if d > 0 else 'good'}'>"
+                         f"{d:+.1f} ms</td>")
+            else:
+                delta = "<td class='n m dim'>&mdash;</td>"
+            note = "; ".join(
+                f"{HOST_NAME[h]}: {e['total_time_ms']} ms"
+                + (f", {e['num_recovered']:,} recovered"
+                   if e.get("num_recovered") else "")
+                + (f", {e['num_repaired']:,} repaired"
+                   if e.get("num_repaired") else "")
+                for h in hosts
+                if (e := seen.get(h)) and e.get("total_time_ms") is not None)
+            body.append(f"<tr><td class=m>{label}</td>{''.join(cells)}{delta}"
+                        f"<td class='m dim'>{note}</td></tr>")
+
     if not body:
         return ('<div class="panel"><div class="dtlhead">shred path &mdash; leader vs '
                 'our simulator</div><div class="none">neither the leader nor our '
@@ -1220,7 +1293,7 @@ def shred_html(slot, shreds):
     elif not any(SIM in v for v in shreds.values()):
         missing = '<span class="note">our simulator host wrote nothing here</span>'
     return ('<div class="panel"><div class="dtlhead">shred path &mdash; leader vs our '
-            'simulator'
+            'simulator, parent slot'
             + (f'<span class="basis">leader identity {html.escape(leader)}</span>'
                if leader else "")
             + '<span class="note">positive delta = our simulator was later &middot; '
@@ -1428,13 +1501,30 @@ def detail_table(title, items, show_won=False, winner_name=None):
     if not items:
         return f'<div class="dtl"><div class="dtlhead">{title}</div>' \
                '<div class="none">none</div></div>'
-    head = ("<tr><th>time (UTC)</th><th class=n>orders</th><th class=n>txs</th>"
+    def split(i):
+        """Vote / non-vote for one offer, counted from the payload itself.
+
+        The payload carries whole transactions, so the vote program id appears
+        verbatim in the account keys of every vote. That classifies ALL of
+        them, including transactions that never landed -- a chain lookup can
+        only classify the ones that did, and used to leave the rest as "?".
+
+        A foreign winner's payload holds only refs, not transactions, so it has
+        no count and reads as a dash."""
+        v = i.get("votes", -1)
+        if v is None or v < 0:
+            return "&mdash;", "&mdash;"
+        return f"{max(0, i['txs'] - v):,}", f"{v:,}"
+
+    head = ("<tr><th>time (UTC)</th><th class=n>orders</th>"
+            "<th class=n>non-vote</th><th class=n>vote</th>"
             "<th class=n>bundles</th><th class=n>reward SOL</th>"
             "<th class=n>exec cost</th><th class=n>selected cu</th><th>uuid</th>"
             + ("<th>won by</th>" if show_won else "") + "</tr>")
     body = "".join(
         f"<tr><td class=m>{html.escape(i['ts'][11:23])}</td>"
-        f"<td class='n m'>{i['orders']:,}</td><td class='n m'>{i['txs']:,}</td>"
+        f"<td class='n m'>{i['orders']:,}</td>"
+        f"<td class='n m'>{split(i)[0]}</td><td class='n m dim'>{split(i)[1]}</td>"
         f"<td class='n m'>{i['bundles']:,}</td><td class='n m'>{sol(i['reward'])}</td>"
         f"<td class='n m'>{i['exec_cost']:,}</td><td class='n m'>{i['sel_cu']:,}</td>"
         f"<td class='m dim'>{html.escape(i['uuid'])}{copy_btn(i['uuid'])}</td>"
@@ -1538,10 +1628,8 @@ def timeline_html(slot, extends, commits, shreds, rounds, builder=None):
     ev = []
 
     def shred_rows(which, tag, prefix):
-        bucket = with_derived_first_shred((shreds or {}).get(which) or {})
+        bucket = (shreds or {}).get(which) or {}
         for meas, label, note in (
-                (DERIVED_FIRST_SHRED, "first shred received",
-                 "derived: slot complete minus total_time_ms"),
                 ("shred_insert_is_full", "slot complete",
                  "every shred in the blockstore"),
                 ("bank_frozen", "bank frozen", "state final, replay done")):
@@ -1564,10 +1652,25 @@ def timeline_html(slot, extends, commits, shreds, rounds, builder=None):
     for idx in sorted(k for k in (extends or {}) if isinstance(k, int)):
         e = extends[idx]
         span = max(0, (e["t_last"] - e["t_first"]) / 1e6)
+        busy = 100.0 * e["body_sum"] / max(1, span * 1000)
+        tip = html.escape(
+            f"{e['n']} extends were ACCEPTED in round {idx}. "
+            f"Total extend time {e['body_sum']/1000:.1f} ms is the sum of "
+            f"those {e['n']} extend bodies -- it is NOT commit time and not "
+            f"one call. Wall {span:.0f} ms is from the first extend starting "
+            f"to the last one finishing, so wall minus total "
+            f"({span - e['body_sum']/1000:.0f} ms) is time the mutation lane "
+            f"sat idle inside this round. p50 {e['body_p50']/1000:.2f} ms and "
+            f"max {e['body_max']/1000:.2f} ms are per single extend, not "
+            f"totals. Refused extends emit no datapoint at all, so the true "
+            f"offered load was higher than {e['n']}.", quote=True)
         ev.append((e["t_first"], f"round {idx} extends",
-                   f'{e["n"]} accepted over {span:.0f} ms',
-                   f'p50 {ms(e["body_p50"])} &middot; max {ms(e["body_max"])} '
-                   f'&middot; {e["applied"]:,} of {e["orders"]:,} orders applied',
+                   f'{e["n"]} extends &middot; {ms(e["body_sum"])} total extend '
+                   f'time &middot; {span:.0f} ms wall ({busy:.0f}% busy)'
+                   f'<span class="info" tabindex="0" data-tip="{tip}">i</span>',
+                   f'per extend: p50 {ms(e["body_p50"])} &middot; max '
+                   f'{ms(e["body_max"])} &middot; {e["applied"]:,} of '
+                   f'{e["orders"]:,} orders applied',
                    "ext"))
     for idx in sorted(k for k in (commits or {}) if isinstance(k, int)):
         c = commits[idx]
@@ -1625,6 +1728,31 @@ def timeline_html(slot, extends, commits, shreds, rounds, builder=None):
                            f"{n:,} miniblock{'' if n == 1 else 's'} sent to the "
                            "relay", "", "bld"))
 
+    # The replay chain: the relay announces a winner, we commit/replay it, then
+    # the next round's first extend can run. Those three are already separate
+    # rows; what was missing was the gaps between them, which is the part that
+    # says how much of a round the replay actually costs us.
+    winner_at = {}
+    for e in (builder or {}).get("events", []):
+        if e["event"] == "round_winner" and off is not None:
+            winner_at[e["idx"]] = e["t"] + off
+    annotated = []
+    for t, label, what, detail, cls in ev:
+        m = re.match(r"round (\d+) (commit|extends)$", label)
+        if m:
+            rnd, kind = int(m.group(1)), m.group(2)
+            if kind == "commit" and rnd in winner_at:
+                gap = (t - winner_at[rnd]) / 1e6
+                detail += (f' &middot; <b>{gap:+,.1f} ms after round {rnd} '
+                           f"winner announced</b>")
+            elif kind == "extends" and rnd > 0 and (rnd - 1) in commits:
+                prev = commits[rnd - 1]
+                gap = (t - prev["t"]) / 1e6
+                detail += (f' &middot; first extend {gap:+,.1f} ms after the '
+                           f"round {rnd - 1} commit landed")
+        annotated.append((t, label, what, detail, cls))
+    ev = annotated
+
     if not ev:
         return ('<div class="panel"><div class="dtlhead">slot timeline</div>'
                 '<div class="none">no InfluxDB events for this slot</div></div>')
@@ -1642,6 +1770,17 @@ def timeline_html(slot, extends, commits, shreds, rounds, builder=None):
             f'<td class="m">{what}</td>'
             f'<td class="m dim">{detail}</td>'
             f'<td class="bar"><span style="margin-left:{pct:.2f}%"></span></td></tr>')
+    legend = "".join(
+        f'<span class="lg"><i style="background:{colour}"></i>{text}</span>'
+        for colour, text in (
+            ("#64748b", "parent slot &mdash; the chain arriving before us"),
+            ("#c084fc", "builder &mdash; bifrost_events, clock-aligned"),
+            ("#2dd4bf", "context install &mdash; we can start sequencing"),
+            ("#60a5fa", "our extends"),
+            ("#fb923c", "commit: replay &mdash; we lost, their block re-executed"),
+            ("#4ade80", "commit: promote &mdash; we won, pointer move"),
+            ("#475569", "commit: empty &mdash; winnerless round"),
+            ("#22d3ee", "this slot on chain &mdash; complete, frozen")))
     return ('<div class="panel"><div class="dtlhead">slot timeline'
             "<span class='note'>starts on the PARENT slot, because a context "
             "cannot install until the parent's bank is frozen &middot; "
@@ -1649,6 +1788,7 @@ def timeline_html(slot, extends, commits, shreds, rounds, builder=None):
             "and the order is real &middot; relay and ClickHouse timestamps "
             "are excluded unless they can be ALIGNED &middot; extends are "
             "collapsed per round</span>" + align + "</div>"
+            f'<div class="legend">{legend}</div>'
             "<table><thead><tr><th class=n>offset</th><th>UTC</th><th>event</th>"
             "<th>what</th><th>detail</th><th></th></tr></thead>"
             f"<tbody>{''.join(rows)}</tbody></table></div>"
@@ -1675,7 +1815,7 @@ def compare_extras(slot):
 
 
 def compare_html(slot, rounds, extends, commits, relay_rounds=None,
-                 relay_err=None, extras=None):
+                 relay_err=None, extras=None, shreds=None):
     """Round-by-round: what won, what we offered, and what the lane spent.
 
     THEIR side comes from the relay when we have it, because the relay sees
@@ -1711,6 +1851,32 @@ def compare_html(slot, rounds, extends, commits, relay_rounds=None,
             return None, 0
         seen = [votes[p] for p in prefixes if p in votes]
         return sum(1 for v in seen if not v), len(prefixes) - len(seen)
+
+    # context install -> this slot's bank frozen: the window every round of
+    # this slot had to fit inside. Only meaningful on round 0, where there is
+    # no commit to report.
+    # What this slot was built ON, and how much room it had. The parent gates
+    # everything: no context installs until its bank is frozen.
+    ctx = (commits or {}).get("_context")
+    parent = (ctx or {}).get("parent") or (slot - 1)
+    pbucket = (shreds or {}).get(parent) or {}
+    at = lambda meas: ((pbucket.get(meas) or {}).get(SIM) or {}).get("t")
+    p_full, p_froze = at("shred_insert_is_full"), at("bank_frozen")
+    clock = lambda t: (dt.datetime.fromtimestamp(t / 1e9, dt.UTC)
+                       .strftime("%H:%M:%S.%f")[:-3] if t else "&mdash;")
+    facts = [("parent slot", f"{parent}"),
+             ("parent slot complete", clock(p_full)),
+             ("parent bank frozen", clock(p_froze))]
+    if ctx:
+        facts.append(("context installed", clock(ctx["t"])))
+        if p_froze:
+            facts.append(("parent froze &rarr; context",
+                          ms(int((ctx["t"] - p_froze) / 1000))))
+    parent_strip = ('<div class="pfacts">'
+                    + "".join(f'<span class="pf"><b>{k}</b>{v}</span>'
+                              for k, v in facts)
+                    + "</div>")
+    ready_window = None
 
     body = []
     for r in rounds:
@@ -1793,7 +1959,7 @@ def compare_html(slot, rounds, extends, commits, relay_rounds=None,
             f' / {big(ours_cu)}</td>'
             + pair(their_bundles, ours_bundles)
             + pair(their_nv, our_nv, their_unk, our_unk)
-            + f'<td class="n m">{commit_cell(com)}</td>'
+            + f'<td class="n m">{commit_cell(com, r["round"], ready_window)}</td>'
             + f'<td class="n m">{ext["n"] if ext else 0}</td>'
             f'<td class="n m">{ms(ext["body_p50"]) if ext else "&mdash;"}</td>'
             f'<td class="n m">{ms(ext["body_max"]) if ext else "&mdash;"}</td>'
@@ -1810,7 +1976,8 @@ def compare_html(slot, rounds, extends, commits, relay_rounds=None,
     src = ("relay" if relay_rounds else
            ("relay unavailable, using our own winner rows" if relay_err
             else "relay has no rows for this slot, using our own winner rows"))
-    return ('<div class="panel"><div class="dtlhead">round comparison'
+    return ('<div class="panel">' + parent_strip
+            + '<div class="dtlhead">round comparison'
             f'<span class="note">their side from <b>{src}</b> &middot; when '
             "they won it is their accepted block, when we won it is their best "
             "losing offer &middot; <b>ours is the final cumulative offer, not a "
@@ -1836,15 +2003,15 @@ def rounds_html(slot, sel_round):
         return f'<div class="err">rounds unavailable: {html.escape(str(exc))[:150]}</div>'
     rounds, extends, ext_err = data["rounds"], data["extends"], data["ext_err"]
     relay_rounds = data.get("relay") or {}
-    if not rounds:
-        return f'<div class="empty">no miniblock rows for slot <b>{slot}</b></div>'
 
     out = []
     if data["shred_err"]:
         out.append('<div class="err" style="margin:0 28px 8px">shred path '
                    f"unavailable: {html.escape(data['shred_err'])}</div>")
     else:
-        out.append(shred_html(slot, data["shreds"]))
+        out.append(shred_html(
+            slot, data["shreds"],
+            ((data.get("commits") or {}).get("_context") or {}).get("parent")))
     if ext_err:
         out.append('<div class="err" style="margin:0 28px 8px">sim-extend '
                    f"unavailable: {html.escape(ext_err)}</div>")
@@ -1852,11 +2019,16 @@ def rounds_html(slot, sel_round):
         w = r["winner"]
         stat = extends.get(r["round"])
         open_ = r["round"] == sel_round
-        base = f"/?win={window_of(slot)}&slot={slot}"
-        href = base if open_ else f"{base}&round={r['round']}"
+        # Every round's detail is rendered up front and toggled in the browser.
+        # It used to be a link, so opening a round was a navigation: a full
+        # round trip and a re-render of the strip for data the page already
+        # had. The slot fetch is one call either way, so there was nothing to
+        # gain by making the user wait for it again.
+        rnd = r["round"]
         summary = (
-            f'<a class="rnd {"open" if open_ else ""}" href="{href}">'
-            f'<span class="rid">round {r["round"]}</span>'
+            f'<div class="rnd{" open" if open_ else ""}" data-round="{rnd}" '
+            f'role="button" tabindex="0" aria-expanded="{str(open_).lower()}">'
+            f'<span class="rid">round {rnd}</span>'
             f'<span class="cnt">{len(r["offers"])} offer'
             f'{"" if len(r["offers"]) == 1 else "s"}</span>'
             + (f'<span class="won">won</span>' if w and w["won"]
@@ -1864,20 +2036,20 @@ def rounds_html(slot, sel_round):
                else '<span class="nowin">no winner echo</span>')
             + (f'<span class="last">is_last</span>' if w and w["is_last"] else "")
             + (f'<span class="ext">{stat["n"]} ext &middot; '
-               f'{ms(stat["body_sum"])}</span>' if stat
+               f'{ms(stat["body_sum"])} total extend time</span>' if stat
                else '<span class="noext">0 ext</span>' if not ext_err else "")
-            + f'<span class="chev">{"&minus;" if open_ else "+"}</span></a>')
-        detail = ""
-        if open_:
-            detail = ('<div class="detail">'
-                      + extend_table(stat)
-                      + pcache_table(stat)
-                      + detail_table(f"our offers &mdash; {len(r['offers'])}", r["offers"])
-                      + detail_table(
-                          "winner miniblock", [w] if w else [], show_won=True,
-                          winner_name=(relay_rounds.get(r["round"]) or {}).get(
-                              "win_builder") or None)
-                      + "</div>")
+            + f'<span class="chev">{"&minus;" if open_ else "+"}</span></div>')
+        detail = ('<div class="detail" data-round="{}"{}>'.format(
+                      rnd, "" if open_ else " hidden")
+                  + extend_table(stat)
+                  + pcache_table(stat)
+                  + detail_table(f"our offers &mdash; {len(r['offers'])}",
+                                 r["offers"])
+                  + detail_table(
+                      "winner miniblock", [w] if w else [], show_won=True,
+                      winner_name=(relay_rounds.get(rnd) or {}).get(
+                          "win_builder") or None)
+                  + "</div>")
         out.append(f'<div class="rndwrap">{summary}{detail}</div>')
     return "".join(out)
 
@@ -1978,6 +2150,7 @@ a.navlink:hover{background:#0f766e22;border-color:#5eead4}
   letter-spacing:.05em;cursor:pointer;vertical-align:1px;
   transition:opacity .1s;display:inline-block}
 .chip:hover .cp,.hascp:hover .cp,.cp:focus{opacity:1}
+tr:hover .cp,td:hover .cp{opacity:1}
 .cp:hover{color:#5eead4;border-color:#14b8a6;background:#0f766e22}
 .cp.ok{opacity:1;color:#5eead4;border-color:#14b8a6;background:#0f766e33}
 .cp.fail{opacity:1;color:#fca5a5;border-color:#7f1d1d}
@@ -2031,29 +2204,71 @@ a.tab{display:inline-block;padding:6px 15px;margin-right:6px;border-radius:8px 8
 a.tab:hover{color:#cfe0f0;border-color:#2f4256}
 a.tab.on{background:#0c141b;border-color:#14b8a6;color:#5eead4;font-weight:600}
 .tabs{padding:6px 28px 0;border-bottom:1px solid #1e2937;margin-bottom:14px}
-td.bar{width:22%;padding:0 9px}
-td.bar span{display:block;width:7px;height:7px;border-radius:50%;background:#2f4256}
-tr.tl-start td.bar span{background:#5eead4}
-tr.tl-replay td.bar span{background:#fbbf24}
-tr.tl-promote td.bar span{background:#5eead4}
-tr.tl-chain td.bar span{background:#93c5fd}
-tr.tl-parent td.bar span{background:#5b6b80}
-tr.tl-bld td.bar span{background:#c4b5fd}
-tr.tl-bld td{background:#12101d}
-tr.tl-parent td{background:#0b1218;color:#7d90a6}
-tr.tl-ext td.bar span{background:#a5b4fc}
-tr.tl-start td,tr.tl-chain td{background:#0e1720}
+td.bar{width:18%;padding:0 9px}
+td.bar span{display:block;width:9px;height:9px;border-radius:50%;
+  box-shadow:0 0 0 2px #0b1016}
+/* One hue per actor, applied THREE ways so a row is identifiable without
+   reading it: the dot, a left rule, a tinted band, and the event name.
+   Keep these in step with the legend in timeline_html -- they were allowed to
+   drift once and the legend then described colours the table never used. */
+tr.tl-parent  td.bar span{background:#64748b}
+tr.tl-bld     td.bar span{background:#c084fc}
+tr.tl-start   td.bar span{background:#2dd4bf}
+tr.tl-ext     td.bar span{background:#60a5fa}
+tr.tl-replay  td.bar span{background:#fb923c}
+tr.tl-promote td.bar span{background:#4ade80}
+tr.tl-empty   td.bar span{background:#475569}
+tr.tl-chain   td.bar span{background:#22d3ee}
+tr.tl-parent  td:first-child{border-left:3px solid #64748b}
+tr.tl-bld     td:first-child{border-left:3px solid #c084fc}
+tr.tl-start   td:first-child{border-left:3px solid #2dd4bf}
+tr.tl-ext     td:first-child{border-left:3px solid #60a5fa}
+tr.tl-replay  td:first-child{border-left:3px solid #fb923c}
+tr.tl-promote td:first-child{border-left:3px solid #4ade80}
+tr.tl-empty   td:first-child{border-left:3px solid #475569}
+tr.tl-chain   td:first-child{border-left:3px solid #22d3ee}
+tr.tl-parent  td{background:#0f1419}
+tr.tl-bld     td{background:#1b1230}
+tr.tl-start   td{background:#07231f}
+tr.tl-ext     td{background:#0d1a2c}
+tr.tl-replay  td{background:#2a1a0c}
+tr.tl-promote td{background:#0b2416}
+tr.tl-empty   td{background:#111820}
+tr.tl-chain   td{background:#07202a}
+tr.tl-parent  td:nth-child(3) b{color:#94a3b8}
+tr.tl-bld     td:nth-child(3) b{color:#d8b4fe}
+tr.tl-start   td:nth-child(3) b{color:#5eead4}
+tr.tl-ext     td:nth-child(3) b{color:#93c5fd}
+tr.tl-replay  td:nth-child(3) b{color:#fdba74}
+tr.tl-promote td:nth-child(3) b{color:#86efac}
+tr.tl-empty   td:nth-child(3) b{color:#94a3b8}
+tr.tl-chain   td:nth-child(3) b{color:#67e8f9}
+.panel tbody tr.tl-parent td,.panel tbody tr.tl-bld td,
+.panel tbody tr.tl-start td,.panel tbody tr.tl-ext td,
+.panel tbody tr.tl-replay td,.panel tbody tr.tl-promote td,
+.panel tbody tr.tl-empty td,.panel tbody tr.tl-chain td{
+  border-bottom:1px solid #0b1016;padding:6px 9px}
+.legend{display:flex;gap:14px;flex-wrap:wrap;padding:8px 0 2px}
+.lg{display:flex;gap:6px;align-items:center;color:#8fa6bf;font-size:10.5px}
+.lg i{width:9px;height:9px;border-radius:50%;display:inline-block;font-style:normal}
 .basis{color:#5b6b80;font-size:9.5px;margin-top:2px;text-transform:none}
+.pfacts{display:flex;gap:18px;flex-wrap:wrap;padding:2px 0 12px;
+  border-bottom:1px solid #1e2937;margin-bottom:11px}
+.pf{display:flex;flex-direction:column;gap:1px;font-size:11.5px;
+  font-family:ui-monospace,Menlo,monospace;color:#cfe0f0}
+.pf b{color:#61748b;font-size:9px;text-transform:uppercase;letter-spacing:.06em;
+  font-weight:500;font-family:ui-sans-serif,sans-serif}
 .wid{color:#7d90a6;font-size:9.5px;margin-top:3px;letter-spacing:-.02em}
 .rejnote{color:#fbbf24;font-size:9.5px;margin-top:3px}
 .goodc{color:#5eead4}
 .slotbar{padding:20px 28px 4px;color:#9fb2c8;font-size:13px}
 .slotbar b{color:#5eead4;font-family:ui-monospace,Menlo,monospace}
 .rndwrap{margin:0 28px 8px}
-a.rnd{display:flex;gap:14px;align-items:center;background:#111823;
+.rnd{display:flex;cursor:pointer;gap:14px;align-items:center;background:#111823;
   border:1px solid #1e2937;border-radius:9px;padding:10px 15px;text-decoration:none}
-a.rnd:hover{border-color:#2f4256}
-a.rnd.open{border-color:#14b8a6;background:#0f1a22;border-bottom-left-radius:0;
+
+.rnd:hover{border-color:#2f4256}
+.rnd.open{border-color:#14b8a6;background:#0f1a22;border-bottom-left-radius:0;
   border-bottom-right-radius:0}
 .rid{font-family:ui-monospace,Menlo,monospace;font-size:13px;color:#cfe0f0;min-width:78px}
 .cnt{color:#7d90a6;font-size:12.5px;min-width:74px}
@@ -2069,6 +2284,8 @@ a.rnd.open{border-color:#14b8a6;background:#0f1a22;border-bottom-left-radius:0;
   border-radius:5px;padding:1px 7px;font-family:ui-monospace,Menlo,monospace}
 .noext{color:#7f5a5a;font-size:11px;border:1px solid #7f1d1d55;border-radius:5px;
   padding:1px 7px;font-family:ui-monospace,Menlo,monospace}
+.votes{color:#93c5fd;font-size:11px;border:1px solid #1d4ed855;border-radius:5px;
+  padding:1px 7px}
 .chev{margin-left:auto;color:#5b6b80;font-family:ui-monospace,Menlo,monospace}
 .dtlhead .note{text-transform:none;letter-spacing:0;color:#4d5c70;font-size:10px;
   margin-left:10px}
@@ -2086,6 +2303,10 @@ a.rnd.open{border-color:#14b8a6;background:#0f1a22;border-bottom-left-radius:0;
 .panel .m{font-family:ui-monospace,Menlo,monospace}
 .panel .n{text-align:right}
 .panel .dim{color:#5b6b80}
+tr.shredgrp td{background:#111a24;color:#9fb2c8;font-size:11px;padding:7px 9px;
+  border-top:1px solid #1e2937}
+tr.shredgrp b{color:#5eead4;font-family:ui-monospace,Menlo,monospace}
+tr.shredgrp .basis{display:inline;margin-left:8px}
 .panel .good{color:#5eead4}
 .panel .bad{color:#fbbf24}
 .panel .none{color:#4d5c70;font-size:12px;padding:6px 0 0}
@@ -2196,6 +2417,43 @@ TICK_JS = """
   window.addEventListener('scroll', hide, true);
   document.addEventListener('keydown', function(ev){
     if (ev.key === 'Escape') hide();
+  });
+})();
+
+// Round rows expand in place. Everything is already in the DOM, so opening a
+// round is a class change rather than a navigation; the URL is kept in step
+// with replaceState so a link still deep-links, without costing a reload.
+(function(){
+  function setOpen(row, open){
+    var d = document.querySelector('.detail[data-round="' + row.dataset.round + '"]');
+    row.classList.toggle('open', open);
+    row.setAttribute('aria-expanded', open ? 'true' : 'false');
+    var chev = row.querySelector('.chev');
+    if (chev) chev.innerHTML = open ? '&minus;' : '+';
+    if (d) d.hidden = !open;
+  }
+  function toggle(row){
+    var open = !row.classList.contains('open');
+    document.querySelectorAll('.rnd.open').forEach(function(o){
+      if (o !== row) setOpen(o, false);
+    });
+    setOpen(row, open);
+    try {
+      var u = new URL(window.location.href);
+      if (open) u.searchParams.set('round', row.dataset.round);
+      else u.searchParams.delete('round');
+      history.replaceState(null, '', u);
+    } catch (e) { /* deep-linking is a nicety, not a requirement */ }
+  }
+  document.addEventListener('click', function(ev){
+    if (ev.target.closest('.cp') || ev.target.closest('.info')) return;
+    var row = ev.target.closest('.rnd');
+    if (row) toggle(row);
+  });
+  document.addEventListener('keydown', function(ev){
+    if (ev.key !== 'Enter' && ev.key !== ' ') return;
+    var row = ev.target.closest && ev.target.closest('.rnd');
+    if (row) { ev.preventDefault(); toggle(row); }
   });
 })();
 
@@ -2668,7 +2926,8 @@ def page(sel_win=None, sel_slot=None, sel_round=None, tab="rounds"):
                 d = slot_data(sel_slot)
                 inner = compare_html(sel_slot, d["rounds"], d["extends"],
                                      d["commits"], d.get("relay"),
-                                     d.get("relay_err"), compare_extras(sel_slot))
+                                     d.get("relay_err"), compare_extras(sel_slot),
+                                     d.get("shreds"))
             except Exception as exc:
                 inner = ('<div class="err">comparison unavailable: '
                          f"{html.escape(str(exc))[:160]}</div>")

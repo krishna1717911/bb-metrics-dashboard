@@ -140,6 +140,17 @@ and what the lane spent.
 | commit replay | `sim-commit body_us` — on a lost round this is the cost of replaying the foreign winner before we can build on it |
 | extends n / p50 / max | accepted extends for that round |
 
+A strip above the table carries what the slot was built on: parent slot,
+its completion and freeze, when our context installed, and the gap between the
+two — dead time before we can offer anything (17.7 ms on the slot above).
+
+Vote and non-vote are counted **from the payload**, not the chain. A `selected`
+payload carries whole transactions, so the vote program id appears verbatim in
+the account keys of each vote and `countSubstrings` classifies every offered
+transaction — including ones that never landed, which a chain lookup cannot
+classify at all. Votes are a real and dominant part of what we bid: 382 of 569
+transactions in one round's final offer.
+
 **Ours is the final offer, not the sum of the selected rows.** Those rows are
 cumulative prefixes — each is a superset of the last — so summing double-counts
 by 2–6×. Verified on rounds we won, where the winner row *is* our own
@@ -215,8 +226,12 @@ cells amber.
 
 ### 7. Shred path — leader vs our simulator
 
-Per slot, when each side saw it: first shred received, slot complete and
-bank frozen, with the sim-minus-leader delta.
+The **parent** slot's completion and bank freeze, with the sim-minus-leader
+delta. The parent, not this slot: a context cannot install until the parent's
+bank is frozen, so that is what gates the auction. This slot's own completion
+lands *after* its auction has finished — measured on 439391881 the last commit
+was at +368.6 ms and the slot did not complete until +414.8 ms — so it cannot
+have gated anything.
 
 **`first shred received` is derived, not read from a column.**
 `retransmit-first-shred` looks like the obvious source, but our simulator host
