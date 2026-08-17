@@ -86,11 +86,14 @@ and an extend badge — and expands to the detail.
 
 ### 3. Timeline tab
 
-What happened in this slot, in order, from the moment a leader-window context
-installed to the bank freezing.
+The whole causal chain for a slot, in order — starting on the **parent slot**,
+because that is what actually gates us: a context cannot install until the
+parent's bank is frozen.
 
 ```
-+0.0 ms     context installed      sequencing can begin      parent slot 439391880
++0.0 ms     parent · slot complete every shred in blockstore insert took 342 ms
++4.5 ms     parent · bank frozen
++22.2 ms    context installed      the parent is frozen      built on parent 439391880
 +1.0 ms     round 0 extends        20 accepted over 61 ms    p50 1.1 ms, 185/186 applied
 +100.4 ms   round 0 commit         replay, 30.6 ms           replay 183 orders
 +101.5 ms   round 1 extends        8 accepted over 27 ms     p50 1.8 ms

@@ -1029,6 +1029,10 @@ def slot_shreds(slot, stamps):
     have seen ClickHouse run 11.5s ahead of three Influx hosts that agreed with
     each other -- so a time join would be quietly wrong.
 
+    Covers the PARENT slot as well as this one. The parent's bank freezing is
+    what lets a context install at all, so without it the timeline starts one
+    step after the thing that gated it. Returned nested by slot.
+
     `retransmit-stage-slot-stats` is flushed minutes after the slot -- its row
     time is meaningless, so it gets its own wide window and its `outset_timestamp`
     field (epoch ms) is the real anchor."""
@@ -1041,7 +1045,8 @@ def slot_shreds(slot, stamps):
     series = influx_series(
         'SELECT "slot","total_time_ms","num_repaired","num_recovered" FROM '
         + ",".join(f'"{m}"' for m, _ in SHRED_STAGES)
-        + f" WHERE slot = {int(slot)} AND time >= '{lo}' AND time <= '{hi}' "
+        + f" WHERE slot >= {int(slot) - 1} AND slot <= {int(slot)} "
+        f"AND time >= '{lo}' AND time <= '{hi}' "
         'GROUP BY "host_id"')
     out = {}
     for ser in series:
@@ -1049,20 +1054,24 @@ def slot_shreds(slot, stamps):
         if host in OFF_CHAIN or (host not in LEADERS and host != SIM):
             continue
         col = {name: i for i, name in enumerate(ser["columns"])}
-        row = ser["values"][0]
+        for row in ser["values"]:
+            def val(name, r=row):
+                v = r[col[name]] if name in col else None
+                return None if v is None else int(v)
 
-        def val(name):
-            v = row[col[name]] if name in col else None
-            return None if v is None else int(v)
-
-        out.setdefault(ser["name"], {})[host] = {
-            "t": _rfc3339_ns(row[0]), "total_time_ms": val("total_time_ms"),
-            "num_repaired": val("num_repaired"), "num_recovered": val("num_recovered")}
+            at = val("slot")
+            if at is None:
+                continue
+            out.setdefault(at, {}).setdefault(ser["name"], {})[host] = {
+                "t": _rfc3339_ns(row[0]), "total_time_ms": val("total_time_ms"),
+                "num_repaired": val("num_repaired"),
+                "num_recovered": val("num_recovered")}
     return out
 
 
 def shred_html(slot, shreds):
     """A stage x host grid, with the sim-minus-leader delta called out."""
+    shreds = (shreds or {}).get(slot) or {}
     if not shreds:
         return ('<div class="panel"><div class="dtlhead">shred path &mdash; leader vs '
                 'our simulator</div><div class="none">no shred-path rows for this '
@@ -1406,21 +1415,45 @@ def big(v):
 
 
 def timeline_html(slot, extends, commits, shreds, rounds):
-    """What happened in this slot, in order.
+    """The whole causal chain for a slot, in order.
 
-    ONE CLOCK ONLY. Every row here comes from InfluxDB, and the shred rows are
-    pinned to our own host, so the ordering is trustworthy. Relay and
-    ClickHouse timestamps are deliberately absent: those are separate clocks
-    and have been observed 11.5s apart, which would silently reorder the
-    sequence. The comparison table below carries the relay's side instead.
+    It starts on the PARENT slot, because that is what actually gates us: a
+    context cannot install until the parent's bank is frozen, so the parent's
+    shreds arriving and its bank freezing are the events that decide when we
+    can begin sequencing at all. Then our own rounds, then this slot's shreds
+    arriving and its bank freezing underneath us -- note the auction normally
+    finishes before its own slot is even fully shredded.
 
-    Extends are collapsed per round -- twenty of them in a round is a burst,
-    not twenty things worth reading."""
+    ONE CLOCK ONLY. Every row is InfluxDB, pinned to our own host. Relay and
+    ClickHouse timestamps are excluded on purpose -- separate clocks, observed
+    11.5s apart, which would silently reorder the sequence."""
     ctx = (commits or {}).get("_context")
+    parent = ctx["parent"] if ctx and ctx.get("parent") else slot - 1
     ev = []
+
+    def shred_rows(which, tag, prefix):
+        for meas, label, note in (
+                ("retransmit-first-shred", "first shred received",
+                 "turbine delivered the leader's first shred"),
+                ("shred_insert_is_full", "slot complete",
+                 "every shred in the blockstore"),
+                ("bank_frozen", "bank frozen", "state final, replay done")):
+            e = ((shreds or {}).get(which) or {}).get(meas, {}).get(SIM)
+            if not e:
+                continue
+            extra = (f'insert took {e["total_time_ms"]:,} ms'
+                     + (f', {e["num_recovered"]:,} recovered'
+                        if e.get("num_recovered") else "")
+                     + (f', {e["num_repaired"]:,} repaired'
+                        if e.get("num_repaired") else "")
+                     if e.get("total_time_ms") is not None else "")
+            ev.append((e["t"], f"{prefix}{label}", note, extra, tag))
+
+    shred_rows(parent, "parent", f"parent {parent} &middot; ")
     if ctx:
-        ev.append((ctx["t"], "context installed", "sequencing can begin",
-                   f'parent slot {ctx["parent"]}', "start"))
+        ev.append((ctx["t"], "context installed",
+                   "the parent is frozen, so sequencing can begin",
+                   f"built on parent {parent}", "start"))
     for idx in sorted(k for k in (extends or {}) if isinstance(k, int)):
         e = extends[idx]
         span = max(0, (e["t_last"] - e["t_first"]) / 1e6)
@@ -1437,24 +1470,8 @@ def timeline_html(slot, extends, commits, shreds, rounds):
                   else "winnerless, nothing applied")
         ev.append((c["t"], f"round {idx} commit",
                    f'{kind} &middot; {ms(c["body"])}', detail, kind))
-    for meas, label, note in (("retransmit-first-shred", "first shred received",
-                               "turbine delivered the leader's first shred"),
-                              ("shred_insert_is_full", "slot complete",
-                               "every shred in the blockstore"),
-                              ("bank_frozen", "bank frozen",
-                               "state final, replay done"),
-                              ):
-        e = (shreds or {}).get(meas, {}).get(SIM)
-        if not e:
-            continue
-        # only shred_insert_is_full carries a duration; the rest are instants
-        extra = (f'insert took {e["total_time_ms"]:,} ms'
-                 + (f', {e["num_recovered"]:,} recovered'
-                    if e.get("num_recovered") else "")
-                 + (f', {e["num_repaired"]:,} repaired'
-                    if e.get("num_repaired") else "")
-                 if e.get("total_time_ms") is not None else "")
-        ev.append((e["t"], label, note, extra, "chain"))
+    shred_rows(slot, "chain", "")
+
     if not ev:
         return ('<div class="panel"><div class="dtlhead">slot timeline</div>'
                 '<div class="none">no InfluxDB events for this slot</div></div>')
@@ -1473,15 +1490,16 @@ def timeline_html(slot, extends, commits, shreds, rounds):
             f'<td class="m dim">{detail}</td>'
             f'<td class="bar"><span style="margin-left:{pct:.2f}%"></span></td></tr>')
     return ('<div class="panel"><div class="dtlhead">slot timeline'
-            "<span class='note'>InfluxDB only, and shred rows pinned to our own "
-            "host, so this is a single clock and the order is real &middot; "
-            "relay and ClickHouse timestamps are excluded on purpose -- separate "
-            "clocks, observed 11.5s apart &middot; extends are collapsed per "
-            "round &middot; offsets are from the first event, not slot start"
-            "</span></div>"
+            "<span class='note'>starts on the PARENT slot, because a context "
+            "cannot install until the parent's bank is frozen &middot; "
+            "InfluxDB only, pinned to our own host, so this is a single clock "
+            "and the order is real &middot; relay and ClickHouse timestamps "
+            "are excluded -- separate clocks, observed 11.5s apart &middot; "
+            "extends are collapsed per round</span></div>"
             "<table><thead><tr><th class=n>offset</th><th>UTC</th><th>event</th>"
             "<th>what</th><th>detail</th><th></th></tr></thead>"
-            f"<tbody>{''.join(rows)}</tbody></table></div>")
+            f"<tbody>{''.join(rows)}</tbody></table></div>"
+)
 
 
 _extra_cache = {}
@@ -1857,6 +1875,8 @@ tr.tl-start td.bar span{background:#5eead4}
 tr.tl-replay td.bar span{background:#fbbf24}
 tr.tl-promote td.bar span{background:#5eead4}
 tr.tl-chain td.bar span{background:#93c5fd}
+tr.tl-parent td.bar span{background:#5b6b80}
+tr.tl-parent td{background:#0b1218;color:#7d90a6}
 tr.tl-ext td.bar span{background:#a5b4fc}
 tr.tl-start td,tr.tl-chain td{background:#0e1720}
 .basis{color:#5b6b80;font-size:9.5px;margin-top:2px;text-transform:none}
