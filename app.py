@@ -1004,11 +1004,18 @@ def slot_extends(slot, stamps):
 #                     any node on a different chain or replaying history: such a
 #                     node can write the same measurement names at a wildly
 #                     different slot height and will pollute unpinned queries.
-LEADER = os.environ.get("SHRED_LEADER_ID", "")
+# Comma-separated, in preference order. Two identities are needed because they
+# are COMPLEMENTARY, not redundant: measured over 30 days one covers ~96% of
+# contested slots but none of the ones we won, while the other covers only the
+# ~800-slot stretches around our own leader windows. Whichever has data for a
+# given slot is the leader for that slot.
+LEADERS = [h.strip() for h in os.environ.get("SHRED_LEADER_ID", "").split(",")
+           if h.strip()]
+LEADER = LEADERS[0] if LEADERS else ""
 SIM = os.environ.get("SHRED_SIM_ID", "")
 OFF_CHAIN = [h.strip() for h in os.environ.get("SHRED_EXCLUDE_IDS", "").split(",")
              if h.strip()]
-HOST_NAME = {LEADER: "leader", SIM: "our simulator"}
+HOST_NAME = dict({h: "leader" for h in LEADERS}, **{SIM: "our simulator"})
 # measurement -> (row label, sort key). The timestamp IS the datum for all four.
 SHRED_STAGES = [("retransmit-first-shred", "first shred received"),
                 ("shred_insert_is_full", "slot complete"),
@@ -1040,7 +1047,7 @@ def slot_shreds(slot, stamps):
     out = {}
     for ser in series:
         host = ser["tags"]["host_id"]
-        if host in OFF_CHAIN or host not in (LEADER, SIM):
+        if host in OFF_CHAIN or (host not in LEADERS and host != SIM):
             continue
         col = {name: i for i, name in enumerate(ser["columns"])}
         row = ser["values"][0]
@@ -1061,7 +1068,12 @@ def shred_html(slot, shreds):
         return ('<div class="panel"><div class="dtlhead">shred path &mdash; leader vs '
                 'our simulator</div><div class="none">no shred-path rows for this '
                 "slot</div></div>")
-    hosts = [h for h in (LEADER, SIM) if h]   # the leader and us, nothing else
+    # Pick the leader identity that actually reported this slot. They are
+    # complementary, so at most one normally has it; ties break on the
+    # configured order.
+    present = {h for v in shreds.values() for h in v}
+    leader = next((h for h in LEADERS if h in present), LEADER)
+    hosts = [h for h in (leader, SIM) if h]
     head = ("<tr><th>stage</th>"
             + "".join(f"<th class=n>{html.escape(HOST_NAME[h])}</th>" for h in hosts)
             + "<th class=n>sim &minus; leader</th><th>detail</th></tr>")
@@ -1075,8 +1087,8 @@ def shred_html(slot, shreds):
             e = seen.get(h)
             cells.append(f"<td class='n m'>{dt.datetime.fromtimestamp(e['t']/1e9, dt.UTC).strftime('%H:%M:%S.%f')[:-3]}</td>"
                          if e else "<td class='n m dim'>&mdash;</td>")
-        if LEADER in seen and SIM in seen:
-            d = (seen[SIM]["t"] - seen[LEADER]["t"]) / 1e6
+        if leader in seen and SIM in seen:
+            d = (seen[SIM]["t"] - seen[leader]["t"]) / 1e6
             cls = "bad" if d > 0 else "good"
             delta = f"<td class='n m {cls}'>{d:+.1f} ms</td>"
         else:
@@ -1093,7 +1105,7 @@ def shred_html(slot, shreds):
                 'our simulator</div><div class="none">neither the leader nor our '
                 "simulator reported the shred path for this slot</div></div>")
     missing = ""
-    if not any(LEADER in v for v in shreds.values()):
+    if not any(leader in v for v in shreds.values()):
         # A leader's metric submission can be intermittent while peers report
         # continuously, so an empty leader column is a reporting gap rather
         # than evidence of a slow node. Say so, rather than let it read as a
@@ -1105,7 +1117,9 @@ def shred_html(slot, shreds):
         missing = '<span class="note">our simulator host wrote nothing here</span>'
     return ('<div class="panel"><div class="dtlhead">shred path &mdash; leader vs our '
             'simulator'
-            '<span class="note">positive delta = our simulator was later &middot; '
+            + (f'<span class="basis">leader identity {html.escape(leader)}</span>'
+               if leader else "")
+            + '<span class="note">positive delta = our simulator was later &middot; '
             'joined on slot, not on time &middot; our host does not emit '
             "retransmit-first-shred</span>" + missing + "</div>"
             f"<table><thead>{head}</thead><tbody>{''.join(body)}</tbody></table></div>")

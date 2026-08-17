@@ -199,7 +199,12 @@ Per slot, when each side saw it: slot complete, bank frozen, optimistic
 confirmed, with the sim-minus-leader delta. Positive (we were later) is amber,
 negative teal. `total_time_ms`, recovered and repaired shred counts ride along.
 
-Requires `SHRED_LEADER_ID` and `SHRED_SIM_ID`. A stage row appears only if at
+Requires `SHRED_LEADER_ID` and `SHRED_SIM_ID`. `SHRED_LEADER_ID` is
+comma-separated in preference order, because leader identities can be
+**complementary rather than redundant**: measured over 30 days, one covers
+~96% of contested slots but none of the 20 we won, while the other covers only
+the ~800-slot stretches around our own leader windows. The panel picks whichever
+reported the slot and names the identity it used. A stage row appears only if at
 least one side reported it. When the leader has no rows the column shows `—`
 with a note that it is a **reporting gap, not a slow node** — a leader's metric
 submission can be intermittent while peers report continuously, and an empty
