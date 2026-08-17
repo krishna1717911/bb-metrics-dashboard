@@ -1019,8 +1019,7 @@ HOST_NAME = dict({h: "leader" for h in LEADERS}, **{SIM: "our simulator"})
 # measurement -> (row label, sort key). The timestamp IS the datum for all four.
 SHRED_STAGES = [("retransmit-first-shred", "first shred received"),
                 ("shred_insert_is_full", "slot complete"),
-                ("bank_frozen", "bank frozen"),
-                ("optimistic_slot", "optimistic confirmed")]
+                ("bank_frozen", "bank frozen")]
 
 
 def slot_shreds(slot, stamps):
@@ -1444,8 +1443,7 @@ def timeline_html(slot, extends, commits, shreds, rounds):
                                "every shred in the blockstore"),
                               ("bank_frozen", "bank frozen",
                                "state final, replay done"),
-                              ("optimistic_slot", "optimistic confirmed",
-                               "supermajority voted")):
+                              ):
         e = (shreds or {}).get(meas, {}).get(SIM)
         if not e:
             continue

@@ -87,7 +87,7 @@ and an extend badge — and expands to the detail.
 ### 3. Timeline tab
 
 What happened in this slot, in order, from the moment a leader-window context
-installed to optimistic confirmation.
+installed to the bank freezing.
 
 ```
 +0.0 ms     context installed      sequencing can begin      parent slot 439391880
@@ -97,7 +97,6 @@ installed to optimistic confirmation.
 ...
 +392.5 ms   slot complete          every shred in blockstore insert took 343 ms
 +397.0 ms   bank frozen
-+480.6 ms   optimistic confirmed
 ```
 
 **One clock only.** Every row is InfluxDB, with the shred rows pinned to our own
@@ -195,8 +194,8 @@ cells amber.
 
 ### 7. Shred path — leader vs our simulator
 
-Per slot, when each side saw it: slot complete, bank frozen, optimistic
-confirmed, with the sim-minus-leader delta. Positive (we were later) is amber,
+Per slot, when each side saw it: first shred received, slot complete and
+bank frozen, with the sim-minus-leader delta. Positive (we were later) is amber,
 negative teal. `total_time_ms`, recovered and repaired shred counts ride along.
 
 Requires `SHRED_LEADER_ID` and `SHRED_SIM_ID`. `SHRED_LEADER_ID` is
