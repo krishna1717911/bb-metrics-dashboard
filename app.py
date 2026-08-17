@@ -747,6 +747,69 @@ def slot_winner_refs(slot):
     return out
 
 
+def slot_builder_events(slot, stamps):
+    """The builder's own view of the slot, from bifrost_events.
+
+    This is ClickHouse, a different clock from InfluxDB, so it cannot simply be
+    interleaved: the two have been observed 899ms apart on one slot and within
+    5ms on another. But `round_committed` exists on BOTH sides -- the builder
+    logs it here, the simulator emits sim-commit for the same round -- so the
+    shift can be measured per slot and applied.
+
+    It is a genuine clock offset rather than latency: across the rounds of a
+    slot the per-round differences agree to 0.1ms while being 899ms from zero.
+    Parallel, just displaced. The measured offset and its spread are reported
+    alongside so the alignment is auditable rather than assumed."""
+    if not stamps:
+        return {}
+    pad = dt.timedelta(minutes=10)
+    lo = (dt.datetime.fromisoformat(min(stamps)[:26]) - pad
+          ).strftime("%Y-%m-%d %H:%M:%S")
+    hi = (dt.datetime.fromisoformat(max(stamps)[:26]) + pad
+          ).strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        _, rows = clickhouse(
+            "SELECT event, toString(ts) AS at, "
+            "  attrs['leader_state'] AS leader_state, attrs['identity'] AS identity, "
+            "  attrs['source'] AS source, attrs['won_by_us'] AS won_by_us, "
+            "  toInt64OrZero(toString(nums['index'])) AS idx, "
+            "  toInt64OrZero(toString(nums['parent_slot'])) AS parent_slot, "
+            "  toInt64OrZero(toString(nums['chosen_refs'])) AS chosen_refs, "
+            "  toInt64OrZero(toString(nums['expected_refs'])) AS expected_refs "
+            f"FROM bifrost_events WHERE ts >= '{lo}' AND ts <= '{hi}' "
+            f"  AND instance_id = '{CH_INSTANCE}' AND nums['slot'] = {int(slot)} "
+            "  AND event IN ('progress','bank_ready','round_winner',"
+            "                'promote_mismatch','round_committed','dispatched') "
+            "ORDER BY ts")
+    except Exception:
+        return {}
+    out = []
+    for r in rows:
+        out.append({"event": r[0], "t": _rfc3339_ns(r[1][:26].replace(" ", "T")),
+                    "leader_state": r[2], "identity": r[3], "source": r[4],
+                    "won_by_us": r[5], "idx": ch_int(r[6]),
+                    "parent_slot": ch_int(r[7]), "chosen_refs": ch_int(r[8]),
+                    "expected_refs": ch_int(r[9])})
+    return {"events": out}
+
+
+def builder_offset(builder, commits):
+    """Nanoseconds to add to a ClickHouse timestamp to put it on the InfluxDB
+    clock. Anchored on round_committed, which both stores record."""
+    if not builder or not commits:
+        return None, None, 0
+    ch_by_round = {e["idx"]: e["t"] for e in builder.get("events", [])
+                   if e["event"] == "round_committed"}
+    diffs = [commits[i]["t"] - ch_by_round[i]
+             for i in ch_by_round if isinstance(i, int) and i in commits]
+    if not diffs:
+        return None, None, 0
+    diffs.sort()
+    median = diffs[len(diffs) // 2]
+    spread = (max(diffs) - min(diffs)) / 1e6
+    return median, spread, len(diffs)
+
+
 def slot_relay(slot, stamps):
     """Per-round opponent view from the relay, keyed by index_in_slot.
 
@@ -1248,10 +1311,11 @@ def _slot_data_uncached(slot, now):
     # 300s window, so run them together rather than back to back.
     import concurrent.futures as cf
 
-    with cf.ThreadPoolExecutor(max_workers=4) as pool:
+    with cf.ThreadPoolExecutor(max_workers=5) as pool:
         fut = {"ext": pool.submit(slot_extends, slot, stamps),
                "commit": pool.submit(slot_commits, slot, stamps),
                "relay": pool.submit(slot_relay, slot, stamps),
+               "builder": pool.submit(slot_builder_events, slot, stamps),
                "shred": pool.submit(slot_shreds, slot, stamps)}
     try:
         extends, ext_err = fut["ext"].result(), None
@@ -1262,6 +1326,10 @@ def _slot_data_uncached(slot, now):
     except Exception:
         commits = {}
     try:
+        builder_ev = fut["builder"].result()
+    except Exception:
+        builder_ev = {}
+    try:
         relay_rounds, relay_err = fut["relay"].result(), None
     except Exception as exc:
         relay_rounds, relay_err = {}, str(exc)[:140]
@@ -1270,7 +1338,7 @@ def _slot_data_uncached(slot, now):
     except Exception as exc:
         shreds, shred_err = {}, str(exc)[:140]
     data = {"rounds": rounds, "extends": extends, "ext_err": ext_err,
-            "commits": commits, "relay": relay_rounds,
+            "commits": commits, "relay": relay_rounds, "builder": builder_ev,
             "relay_err": relay_err,
             "shreds": shreds, "shred_err": shred_err}
 
@@ -1414,7 +1482,7 @@ def big(v):
     return f"{v:.0f}"
 
 
-def timeline_html(slot, extends, commits, shreds, rounds):
+def timeline_html(slot, extends, commits, shreds, rounds, builder=None):
     """The whole causal chain for a slot, in order.
 
     It starts on the PARENT slot, because that is what actually gates us: a
@@ -1472,6 +1540,52 @@ def timeline_html(slot, extends, commits, shreds, rounds):
                    f'{kind} &middot; {ms(c["body"])}', detail, kind))
     shred_rows(slot, "chain", "")
 
+    # The builder's own events, shifted onto the InfluxDB clock.
+    off, spread, anchors = builder_offset(builder, commits)
+    align = ""
+    if builder and builder.get("events"):
+        if off is None:
+            align = ('<span class="warn"> &#9888; builder events omitted: no '
+                     "round_committed in both stores to align the clocks</span>")
+        else:
+            align = ('<span class="note">builder events shifted '
+                     f"{off/1e6:+,.0f} ms onto the simulator's clock, measured "
+                     f"from {anchors} round_committed pairs (spread "
+                     f"{spread:.1f} ms)</span>")
+            per_round = {}
+            for e in builder["events"]:
+                t = e["t"] + off
+                if e["event"] == "progress":
+                    if e["leader_state"] and e["leader_state"] != "Inactive":
+                        ev.append((t, f'progress: {e["leader_state"]}',
+                                   "the connector entered this state",
+                                   html.escape(e["identity"] or ""), "bld"))
+                elif e["event"] == "bank_ready":
+                    ev.append((t, "bank_ready (builder)",
+                               f'source {html.escape(e["source"] or "?")}'
+                               + (" &mdash; real window" if e["source"] == "window"
+                                  else " &mdash; synthetic" if e["source"] else ""),
+                               f'parent {e["parent_slot"]}', "bld"))
+                elif e["event"] == "round_winner":
+                    ev.append((t, f'round {e["idx"]} winner announced',
+                               "relay told us who took the round",
+                               ("ours" if e["won_by_us"] == "true" else
+                                html.escape(e["identity"] or "not ours")), "bld"))
+                elif e["event"] == "promote_mismatch":
+                    ev.append((t, f'round {e["idx"]} promote mismatch',
+                               f'chosen {e["chosen_refs"]:,} refs vs expected '
+                               f'{e["expected_refs"]:,}',
+                               "our prefix was not the winner, so a replay "
+                               "follows", "bld"))
+                elif e["event"] == "dispatched":
+                    per_round[e["idx"]] = per_round.get(e["idx"], 0) + 1
+            for idx, n in sorted(per_round.items()):
+                first = min(e["t"] for e in builder["events"]
+                            if e["event"] == "dispatched" and e["idx"] == idx)
+                ev.append((first + off, f"round {idx} dispatched",
+                           f"{n:,} miniblock{'' if n == 1 else 's'} sent to the "
+                           "relay", "", "bld"))
+
     if not ev:
         return ('<div class="panel"><div class="dtlhead">slot timeline</div>'
                 '<div class="none">no InfluxDB events for this slot</div></div>')
@@ -1494,8 +1608,8 @@ def timeline_html(slot, extends, commits, shreds, rounds):
             "cannot install until the parent's bank is frozen &middot; "
             "InfluxDB only, pinned to our own host, so this is a single clock "
             "and the order is real &middot; relay and ClickHouse timestamps "
-            "are excluded -- separate clocks, observed 11.5s apart &middot; "
-            "extends are collapsed per round</span></div>"
+            "are excluded unless they can be ALIGNED &middot; extends are "
+            "collapsed per round</span>" + align + "</div>"
             "<table><thead><tr><th class=n>offset</th><th>UTC</th><th>event</th>"
             "<th>what</th><th>detail</th><th></th></tr></thead>"
             f"<tbody>{''.join(rows)}</tbody></table></div>"
@@ -1876,6 +1990,8 @@ tr.tl-replay td.bar span{background:#fbbf24}
 tr.tl-promote td.bar span{background:#5eead4}
 tr.tl-chain td.bar span{background:#93c5fd}
 tr.tl-parent td.bar span{background:#5b6b80}
+tr.tl-bld td.bar span{background:#c4b5fd}
+tr.tl-bld td{background:#12101d}
 tr.tl-parent td{background:#0b1218;color:#7d90a6}
 tr.tl-ext td.bar span{background:#a5b4fc}
 tr.tl-start td,tr.tl-chain td{background:#0e1720}
@@ -2491,7 +2607,8 @@ def page(sel_win=None, sel_slot=None, sel_round=None, tab="rounds"):
             try:
                 d = slot_data(sel_slot)
                 inner = timeline_html(sel_slot, d["extends"], d["commits"],
-                                      d.get("shreds"), d["rounds"])
+                                      d.get("shreds"), d["rounds"],
+                                      d.get("builder"))
             except Exception as exc:
                 inner = ('<div class="err">timeline unavailable: '
                          f"{html.escape(str(exc))[:160]}</div>")

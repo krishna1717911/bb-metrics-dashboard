@@ -102,10 +102,16 @@ parent's bank is frozen.
 +397.0 ms   bank frozen
 ```
 
-**One clock only.** Every row is InfluxDB, with the shred rows pinned to our own
-host, so the ordering is real. Relay and ClickHouse timestamps are deliberately
-excluded — separate clocks, observed 11.5 s apart, which would silently reorder
-the sequence. The comparison table below carries the relay's side instead.
+**Builder events are aligned, not assumed.** `bifrost_events` is ClickHouse, a
+different clock from InfluxDB — measured 899 ms apart on one slot and within
+5 ms on another. But `round_committed` is recorded on *both* sides, so the shift
+is measured per slot from those pairs and applied. It is a genuine clock offset
+rather than latency: across a slot's rounds the per-round differences agree to
+**0.1 ms** while sitting 899 ms from zero — parallel, just displaced. The header
+states the offset, how many pairs it came from, and the spread, so the alignment
+is auditable. With no anchor the builder events are dropped rather than guessed.
+
+Relay timestamps stay out entirely — no shared event to anchor them.
 
 Extends are collapsed per round: twenty extends in a round is one burst, not
 twenty things to read. The shape it exposes is the round cadence — extend
