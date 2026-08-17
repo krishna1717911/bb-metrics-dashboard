@@ -1080,9 +1080,25 @@ OFF_CHAIN = [h.strip() for h in os.environ.get("SHRED_EXCLUDE_IDS", "").split(",
              if h.strip()]
 HOST_NAME = dict({h: "leader" for h in LEADERS}, **{SIM: "our simulator"})
 # measurement -> (row label, sort key). The timestamp IS the datum for all four.
-SHRED_STAGES = [("retransmit-first-shred", "first shred received"),
+SHRED_STAGES = [("retransmit-first-shred", "first shred (retransmit stage)"),
                 ("shred_insert_is_full", "slot complete"),
                 ("bank_frozen", "bank frozen")]
+
+# "first shred received" is DERIVED, not read from a column.
+#
+# retransmit-first-shred looks like the obvious source, but our simulator host
+# never writes it -- it does not run the retransmit path -- so that row was
+# permanently blank on the one host we most want to measure.
+#
+# shred_insert_is_full.total_time_ms is documented as the completion time
+# measured from that node's OWN first shred, so
+#     first_shred = row time - total_time_ms
+# recovers it on every host that completes slots, ours included. Checked
+# against the real retransmit stamp where both exist: within 0.2-9.5ms on a
+# 4.2.0 host, but ~55ms early on a 4.1.0 one, so the two are NOT the same
+# instant and are not labelled as such. Using the derived value for every host
+# at least keeps the comparison on one basis.
+DERIVED_FIRST_SHRED = "first shred received"
 
 
 def slot_shreds(slot, stamps):
@@ -1132,9 +1148,25 @@ def slot_shreds(slot, stamps):
     return out
 
 
+def with_derived_first_shred(per_slot):
+    """Add the derived first-shred stage to a slot's bucket."""
+    full = (per_slot or {}).get("shred_insert_is_full") or {}
+    out = dict(per_slot or {})
+    derived = {}
+    for host, e in full.items():
+        if e.get("total_time_ms") is None:
+            continue
+        derived[host] = {"t": e["t"] - e["total_time_ms"] * 1_000_000,
+                         "total_time_ms": None, "num_repaired": None,
+                         "num_recovered": None}
+    if derived:
+        out[DERIVED_FIRST_SHRED] = derived
+    return out
+
+
 def shred_html(slot, shreds):
     """A stage x host grid, with the sim-minus-leader delta called out."""
-    shreds = (shreds or {}).get(slot) or {}
+    shreds = with_derived_first_shred((shreds or {}).get(slot) or {})
     if not shreds:
         return ('<div class="panel"><div class="dtlhead">shred path &mdash; leader vs '
                 'our simulator</div><div class="none">no shred-path rows for this '
@@ -1149,7 +1181,8 @@ def shred_html(slot, shreds):
             + "".join(f"<th class=n>{html.escape(HOST_NAME[h])}</th>" for h in hosts)
             + "<th class=n>sim &minus; leader</th><th>detail</th></tr>")
     body = []
-    for meas, label in SHRED_STAGES:
+    for meas, label in ([(DERIVED_FIRST_SHRED, DERIVED_FIRST_SHRED)]
+                        + SHRED_STAGES):
         seen = {h: e for h, e in (shreds.get(meas) or {}).items() if h in hosts}
         if not seen:                    # neither side reported this stage
             continue
@@ -1500,13 +1533,14 @@ def timeline_html(slot, extends, commits, shreds, rounds, builder=None):
     ev = []
 
     def shred_rows(which, tag, prefix):
+        bucket = with_derived_first_shred((shreds or {}).get(which) or {})
         for meas, label, note in (
-                ("retransmit-first-shred", "first shred received",
-                 "turbine delivered the leader's first shred"),
+                (DERIVED_FIRST_SHRED, "first shred received",
+                 "derived: slot complete minus total_time_ms"),
                 ("shred_insert_is_full", "slot complete",
                  "every shred in the blockstore"),
                 ("bank_frozen", "bank frozen", "state final, replay done")):
-            e = ((shreds or {}).get(which) or {}).get(meas, {}).get(SIM)
+            e = bucket.get(meas, {}).get(SIM)
             if not e:
                 continue
             extra = (f'insert took {e["total_time_ms"]:,} ms'

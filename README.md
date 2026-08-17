@@ -204,7 +204,23 @@ cells amber.
 ### 7. Shred path — leader vs our simulator
 
 Per slot, when each side saw it: first shred received, slot complete and
-bank frozen, with the sim-minus-leader delta. Positive (we were later) is amber,
+bank frozen, with the sim-minus-leader delta.
+
+**`first shred received` is derived, not read from a column.**
+`retransmit-first-shred` looks like the obvious source, but our simulator host
+never writes it — it does not run the retransmit path — so that row was
+permanently blank on the host we most want to measure. Instead:
+
+```
+first_shred = shred_insert_is_full.time − total_time_ms
+```
+
+because `total_time_ms` is the completion time measured from that node's *own*
+first shred. Checked against the real retransmit stamp where both exist: within
+0.2–9.5 ms on a 4.2.0 host, but ~55 ms early on a 4.1.0 one — so they are **not
+the same instant**, and the raw retransmit stamp is shown as its own separate
+row rather than conflated. Using the derived value on every host at least keeps
+the comparison on one basis. Positive (we were later) is amber,
 negative teal. `total_time_ms`, recovered and repaired shred counts ride along.
 
 Requires `SHRED_LEADER_ID` and `SHRED_SIM_ID`. `SHRED_LEADER_ID` is
