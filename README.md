@@ -126,7 +126,7 @@ and what the lane spent.
 
 | column | meaning |
 |---|---|
-| winner | from the relay's `round_chosen`, which names the actual builder |
+| winner | from the relay's `round_chosen`, which names the actual builder, plus the winning **miniblock uuid** |
 | their reward | **their accepted block when they won; their best losing offer when we won** |
 | ours | **the final cumulative offer**, not a sum — see below |
 | margin | ours vs theirs, in percent |
@@ -140,6 +140,12 @@ by 2–6×. Verified on rounds we won, where the winner row *is* our own
 composition: `winner.order_count` equals the max of selected (128=128, 208=208,
 278=278, 360=360) and never the sum (309, 569, 1246, 1990). Reward behaves the
 same way.
+
+The uuid under each winner is the winning miniblock's own id. It is on our
+winner row regardless of whether the relay is configured, and it is the *same*
+uuid the relay puts on its `round_winner` event — so it joins the two stores
+for a single round, and joins onward to `bifrost_events` for the orders that
+made up that block.
 
 **Their side comes from the relay** when `RELAY_URL` is configured. The relay
 sees every builder's submissions and its `round_chosen` event names the winner

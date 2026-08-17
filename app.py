@@ -1773,6 +1773,11 @@ def compare_html(slot, rounds, extends, commits, relay_rounds=None,
             + note + "</td>"
             f'<td class="m {"goodc" if we_won else ""}">{html.escape(winner)}'
             + (f'<div class="basis">their {basis}</div>' if basis else "")
+            # the winning miniblock's own id. Present on our winner row even
+            # with no relay configured, and it is the SAME uuid the relay puts
+            # on round_winner, so it joins the two stores for one round.
+            + (f'<div class="wid m">{html.escape(w["uuid"])}'
+               f'{copy_btn(w["uuid"])}</div>' if w and w.get("uuid") else "")
             + "</td>"
             f'<td class="n m">{big(their_reward) if their_reward is not None else "&mdash;"}</td>'
             f'<td class="n m">{big(ours_reward)}</td>'
@@ -2030,6 +2035,7 @@ tr.tl-parent td{background:#0b1218;color:#7d90a6}
 tr.tl-ext td.bar span{background:#a5b4fc}
 tr.tl-start td,tr.tl-chain td{background:#0e1720}
 .basis{color:#5b6b80;font-size:9.5px;margin-top:2px;text-transform:none}
+.wid{color:#7d90a6;font-size:9.5px;margin-top:3px;letter-spacing:-.02em}
 .rejnote{color:#fbbf24;font-size:9.5px;margin-top:3px}
 .goodc{color:#5eead4}
 .slotbar{padding:20px 28px 4px;color:#9fb2c8;font-size:13px}
