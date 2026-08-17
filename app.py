@@ -2171,6 +2171,18 @@ tr:hover .cp,td:hover .cp{opacity:1}
 
 /* won == we produced the block; everything else we bid on and lost */
 .chip .tag{font-size:10px;color:#4d5c70;margin-top:3px}
+.chip.runstart{border-left:3px solid #fbbf24}
+.runmark{font-size:8.5px;color:#fbbf24;text-transform:uppercase;
+  letter-spacing:.06em;margin-top:3px}
+.runbar{padding:10px 28px 0}
+.runjumps{display:flex;gap:6px;overflow-x:auto;padding:7px 0 2px;
+  scrollbar-width:thin}
+a.runjump{flex:0 0 auto;display:flex;flex-direction:column;gap:1px;
+  padding:4px 9px;border:1px solid #22303f;border-radius:6px;color:#9fb2c8;
+  font:10.5px/1.3 ui-monospace,Menlo,monospace;text-decoration:none}
+a.runjump:hover{border-color:#5eead4;color:#5eead4}
+a.runjump.cold{border-color:#78350f;color:#fbbf24}
+.rj{color:#5b6b80;font-size:9px}
 .chip .runline{font-size:9.5px;color:#5b6b80;margin-top:3px;
   font-family:ui-monospace,Menlo,monospace}
 .chip.on .runline{color:#a7f3ea}
@@ -2509,10 +2521,21 @@ TICK_JS = """
 
 def strip_html(windows, sel_win, sel_slot):
     """One chip per leader window, newest at the left."""
+    # The strip is newest-first, so a chip whose run differs from the chip to
+    # its LEFT is where that run began. Marking the boundary makes deploys
+    # navigable: 21 runs across ~700 windows is otherwise invisible scrolling.
+    seen_runs = []
+    for i, w in enumerate(windows):
+        newer = windows[i - 1]["run_id"] if i else None
+        w["run_starts_here"] = bool(w["run_id"]) and w["run_id"] != newer
+        if w["run_starts_here"]:
+            seen_runs.append(w)
+
     def chip(w):
         on = w["win"] == sel_win
         href = "/" if on else f"/?win={w['win']}"
-        cls = "chip" + (" on" if on else "") + (" won" if w["won"] else "")
+        cls = ("chip" + (" on" if on else "") + (" won" if w["won"] else "")
+               + (" runstart" if w.get("run_starts_here") else ""))
         return (f'<a class="{cls}" href="{href}" '
                 f'title="{html.escape(w["ts"][:19])} UTC &mdash; leader '
                 f'{html.escape(w["leader"])} &mdash; '
@@ -2529,7 +2552,9 @@ def strip_html(windows, sel_win, sel_slot):
                 f'<div class="ageline">{age_html(w["ts"])}</div>'
                 f'<div class="meta">{html.escape(short_id(w["leader"]))}'
                 f'{" &#9888;" if w["leader_split"] else ""}</div>'
-                f'<div class="runline">run {html.escape(short_run(w["run_id"]))}'
+                + (f'<div class="runmark" id="run-{html.escape(short_run(w["run_id"]))}">'
+                   f'run starts here</div>' if w.get("run_starts_here") else "")
+                + f'<div class="runline">run {html.escape(short_run(w["run_id"]))}'
                 + (' <span class="warn">&#9888;</span>' if w["run_split"] else "")
                 + (f'<span class="coldpill" tabindex="0" data-tip="{cold_why(w)}"'
                    f">cold</span>" if w.get("run_cold") else "")
@@ -2545,8 +2570,30 @@ def strip_html(windows, sel_win, sel_slot):
             f'&middot; <b class="okc">{won} won</b> &middot; {leaders} leaders '
             f'&middot; last 30d on <code>{CH_BUILDER}</code></span>'
             f'<span class="hint">newest at the left &mdash; scroll right for older</span>'
-            f'</div><div class="strip">{chips}</div>'
+            f'</div>{runbar(seen_runs)}<div class="strip">{chips}</div>'
             + window_html(windows, sel_win, sel_slot))
+
+
+def runbar(run_starts):
+    """One jump target per builder run, newest first.
+
+    run_id changes on every restart, so these are the deploy boundaries. The
+    strip is long -- hundreds of windows -- and a run change is exactly the
+    thing you want to land on when a metric shifts."""
+    if len(run_starts) < 2:
+        return ""
+    items = "".join(
+        f'<a class="runjump{" cold" if w.get("run_cold") else ""}" '
+        f'href="#run-{html.escape(short_run(w["run_id"]))}" '
+        f'title="{html.escape(w["run_id"])} &mdash; first window {w["win"]}, '
+        f'{w.get("run_slots", 0)} slots">'
+        f'{html.escape(short_run(w["run_id"]))}'
+        f'<span class="rj">{ago(w["ts"])}</span></a>'
+        for w in run_starts)
+    return ('<div class="runbar"><span class="cap">builder runs</span>'
+            f'<span class="sub">{len(run_starts)} in the strip &middot; newest '
+            "first &middot; jump to where each began</span>"
+            f'<div class="runjumps">{items}</div></div>')
 
 
 def window_html(windows, sel_win, sel_slot):

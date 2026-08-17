@@ -60,6 +60,13 @@ assignment.
 Each chip carries the window's first slot, a **live-ticking age**, the leader
 identity, the **`run_id`** that served it, and `N/4 won`.
 
+A **run bar** above the strip lists every builder run in view, newest first,
+and jumps to the window where it began. Each of those windows is marked with an
+amber rule and a `run starts here` label. `run_id` changes on every restart, so
+these are the deploy boundaries — with 25 runs across ~700 windows they are
+otherwise invisible scrolling, and they are the first thing to check when a
+metric shifts.
+
 `run_id` is one builder **process lifetime**, so it changes on every restart —
 putting it on the strip makes deploy boundaries visible while scanning, rather
 than only after opening a slot. A window served within ten minutes of a restart
