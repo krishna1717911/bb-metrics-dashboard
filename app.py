@@ -2145,6 +2145,54 @@ def compare_html(slot, rounds, extends, commits, relay_rounds=None,
             "</div>")
 
 
+def reward_badge(rnd, r, w, relay_rounds=None):
+    """Our best offer against what actually won the round.
+
+    OURS is the final cumulative offer, not a sum: selected rows are prefixes
+    of one another. THEIRS prefers the relay's round_chosen reward, which is
+    the accepted block, and falls back to our own winner-echo row.
+
+    A positive margin means we bid more and still lost -- which happens, and is
+    the reason this belongs next to the round rather than buried a tab away."""
+    offers = r.get("offers") or []
+    ours = max((o["reward"] for o in offers), default=None)
+    rl = (relay_rounds or {}).get(rnd) or {}
+    theirs = rl.get("win_reward") or (w["reward"] if w else None)
+    if not ours and not theirs:
+        return ""
+    if not theirs:
+        return (f'<span class="rwd"><b>{big(ours)}</b> ours &middot; '
+                "winner unknown</span>")
+    we_won = bool(w and w["won"])
+    pct = 100.0 * (ours - theirs) / theirs if (ours and theirs) else None
+    cls = "rwd" + (" ahead" if pct is not None and pct >= 0 else " behind")
+    if we_won:
+        # the second number is OUR OWN accepted block, so "vs" would read as
+        # though we lost to someone. A gap here means we kept bidding after
+        # the relay had already taken an earlier offer.
+        cls = "rwd ours"
+        tip = html.escape(
+            f"Round {rnd}: we won it. Our best offer reached {ours or 0:,} "
+            f"lamports and the block the relay accepted was {theirs:,}. A gap "
+            f"means we went on offering after the round had been decided, so "
+            f"the extra was never in play.", quote=True)
+        return (f'<span class="{cls}" data-tip="{tip}" tabindex="0">'
+                f'won with <b>{big(theirs)}</b>'
+                + (f' &middot; offered up to {big(ours)}'
+                   if ours and ours != theirs else "")
+                + "</span>")
+    tip = html.escape(
+        f"Round {rnd}: our best offer was {ours or 0:,} lamports, the winning "
+        f"block {theirs:,}. Ours is the final cumulative offer for the round, "
+        f"not a sum of the individual selected rows -- those are prefixes of "
+        f"one another. A positive margin means we bid MORE and still did not "
+        f"win the round.", quote=True)
+    return (f'<span class="{cls}" data-tip="{tip}" tabindex="0">'
+            f'<b>{big(ours)}</b> vs {big(theirs)} won'
+            + (f' <span class="pct">{pct:+.2f}%</span>' if pct is not None else "")
+            + "</span>")
+
+
 def rounds_html(slot, sel_round):
     try:
         data = slot_data(slot)
@@ -2187,6 +2235,7 @@ def rounds_html(slot, sel_round):
             + (f'<span class="ext">{stat["n"]} ext &middot; '
                f'{ms(stat["body_sum"])} total extend time</span>' if stat
                else '<span class="noext">0 ext</span>' if not ext_err else "")
+            + reward_badge(rnd, r, w, relay_rounds)
             + f'<span class="chev">{"&minus;" if open_ else "+"}</span></div>')
         detail = ('<div class="detail" data-round="{}"{}>'.format(
                       rnd, "" if open_ else " hidden")
@@ -2215,7 +2264,13 @@ header{padding:20px 28px 14px;display:flex;gap:16px;align-items:baseline;
 h1{margin:0;font-size:17px;font-weight:650;letter-spacing:-.01em}
 h1 span{color:#5eead4}
 .sub{color:#6b7f96;font-size:12.5px}
-a.navlink{margin-left:auto;color:#5eead4;font-size:12px;text-decoration:none;
+form.jump{margin-left:auto}
+form.jump input{background:#0e151d;border:1px solid #22303f;border-radius:6px;
+  color:#cfe0f0;padding:5px 11px;width:150px;
+  font:12px ui-monospace,Menlo,monospace}
+form.jump input:focus{outline:none;border-color:#5eead4}
+form.jump input::placeholder{color:#4d5c70}
+a.navlink{margin-left:14px;color:#5eead4;font-size:12px;text-decoration:none;
   border:1px solid #14b8a655;border-radius:6px;padding:4px 11px}
 a.navlink:hover{background:#0f766e22;border-color:#5eead4}
 .callout{margin:16px 28px;padding:12px 16px;border-radius:9px;
@@ -2456,6 +2511,15 @@ tr.sv-fatal td:first-child{border-left:3px solid #ef4444}
   border-radius:5px;padding:1px 7px;font-family:ui-monospace,Menlo,monospace}
 .noext{color:#7f5a5a;font-size:11px;border:1px solid #7f1d1d55;border-radius:5px;
   padding:1px 7px;font-family:ui-monospace,Menlo,monospace}
+.rwd{font-size:11px;border:1px solid #22303f;border-radius:5px;padding:1px 8px;
+  color:#9fb2c8;font-family:ui-monospace,Menlo,monospace;cursor:help}
+.rwd b{color:#cfe0f0;font-weight:600}
+.rwd.ahead{border-color:#14b8a655;background:#0f766e22}
+.rwd.ahead .pct{color:#5eead4}
+.rwd.behind{border-color:#78350f55;background:#78350f18}
+.rwd.behind .pct{color:#fbbf24}
+.rwd.ours{border-color:#14b8a655;background:#0f766e22;color:#5eead4}
+.rwd.ours b{color:#5eead4}
 .votes{color:#93c5fd;font-size:11px;border:1px solid #1d4ed855;border-radius:5px;
   padding:1px 7px}
 .chev{margin-left:auto;color:#5b6b80;font-family:ui-monospace,Menlo,monospace}
@@ -2708,7 +2772,7 @@ def strip_html(windows, sel_win, sel_slot):
                    if w.get("run_age") is not None else "")
                 + '">'
                 f'<div class="slot">{w["win"]}<span class="n">'
-                f'&nbsp;+{len(w["slots"]) - 1}</span>{copy_btn(w["win"])}</div>'
+                f'&ndash;{str(w["win"] + WINDOW - 1)[-2:]}</span>{copy_btn(w["win"])}</div>'
                 f'<div class="ageline">{age_html(w["ts"])}</div>'
                 f'<div class="meta">{html.escape(short_id(w["leader"]))}'
                 f'{" &#9888;" if w["leader_split"] else ""}</div>'
@@ -3163,6 +3227,10 @@ def page(sel_win=None, sel_slot=None, sel_round=None, tab="rounds"):
 <header>
   <h1>sim<span>bench</span></h1>
   <div class="sub">block-builder slot explorer</div>
+  <form class="jump" method="get" action="/">
+    <input name="slot" inputmode="numeric" pattern="[0-9]*" placeholder="go to slot"
+           aria-label="go to slot" />
+  </form>
   <a class="navlink" href="/reference">metrics reference &mdash; what is bad?</a>
 </header>
 {health_html()}

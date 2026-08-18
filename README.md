@@ -57,6 +57,11 @@ consecutive slots, so slots are folded into their window and keyed by the
 window's first slot — four rows in the strip were always four views of one
 assignment.
 
+Chips are labelled with the window's **slot range** (`440042240–43`), not just
+its first slot, and a **go to slot** box in the header resolves any slot to its
+window and selects it — a window chip labelled only `440027604` is unfindable
+when the number you are holding is `440027606`.
+
 Each chip carries the window's first slot, a **live-ticking age**, the leader
 identity, the **`run_id`** that served it, and `N/4 won`.
 
@@ -90,6 +95,13 @@ still shows ages consistent with the server rather than its own drift.
 Click a window to expand its slots; click a slot for its rounds. Each round
 collapses to one line — offer count, won / not ours / no winner echo, `is_last`,
 and an extend badge — and expands to the detail.
+
+Each round row also carries a **reward badge**: our best offer against the
+block that actually won, with the margin. Ours is the final cumulative offer,
+never a sum — selected rows are prefixes of one another. A won round reads
+`won with X · offered up to Y` instead, because there the second number is our
+*own* accepted block and a gap means we kept bidding after the round was
+already decided.
 
 The winner miniblock's last column is **won by**, carrying the actual builder
 id rather than a bare YES/-. Knowing it was not us is rarely the question; who
