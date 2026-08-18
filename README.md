@@ -131,7 +131,28 @@ twenty things to read. The shape it exposes is the round cadence — extend
 burst, commit, extend burst, commit — with the auction finishing well before
 the slot completes.
 
-### 4. Comparison tab
+### 4. Logs tab
+
+warn / error / fatal from ClickStack `otel_logs` for this slot, in order, amber
+for warn and red for error, with fatal darker still. Info-level status
+heartbeats are excluded — they are ~99% of the volume.
+
+Attribution is exact where it can be: most error rows carry
+`LogAttributes['slot']`, so they are matched on the slot itself with no clock
+involved. Lines without it — ALT refresh failures, teardowns — are picked up by
+time window and **marked as time-matched**, because they are often the ones
+that explain the round and dropping them would hide the cause. otel's clock
+agrees with InfluxDB (checked on slot 440027607: tagged errors 09:00:30.087–.400
+against sim-extend 09:00:30.075–.400), so the window is taken from InfluxDB.
+
+Runs of the same message are collapsed with a count and a span: one ALT failure
+repeated 146 times in a third of a second is one fact, and listing it 146 times
+buries the line that matters.
+
+A slot with no miniblock rows says so rather than reporting "not configured" —
+that case means the builder was down for it, which is when you want logs most.
+
+### 5. Comparison tab
 
 
 A per-slot tab beside the rounds view: what won each round, what we offered,
@@ -190,7 +211,7 @@ Without the relay it falls back to our own winner rows and the generic
 `commit replay` and the extend columns are ours only; there is no counterpart
 on their side.
 
-### 5. Mutation lane, per round
+### 6. Mutation lane, per round
 
 `sim-extend` points bucketed by round. Attribution is exact rather than a
 timestamp join: the simulator emits `("index", round.index_in_slot)` on every
@@ -216,7 +237,7 @@ before the worker runs, so the count is *accepted* calls only and a round's
 true offered load is not visible here. A round with zero accepted extends is
 rendered in red and says so explicitly, rather than showing a blank.
 
-### 6. Program cache, per round
+### 7. Program cache, per round
 
 The seven `program_cache_*` fields ride on the same `sim-extend` point as
 `index`, so they are round-attributed structurally — no timestamp matching.
@@ -237,7 +258,7 @@ and `clone us` are 0 on almost every round; a non-zero value is the signal, not
 the baseline. Compiles and forks raise a pill in the header and turn their
 cells amber.
 
-### 7. Shred path — leader vs our simulator
+### 8. Shred path — leader vs our simulator
 
 The **parent** slot's completion and bank freeze, with the sim-minus-leader
 delta. The parent, not this slot: a context cannot install until the parent's

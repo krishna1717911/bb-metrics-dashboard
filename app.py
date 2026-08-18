@@ -780,6 +780,54 @@ def slot_winner_refs(slot):
     return out
 
 
+def slot_logs(slot, stamps):
+    """warn / error / fatal log lines for one slot, from ClickStack.
+
+    Attribution is exact where it can be: 1,105 of the recent error rows carry
+    LogAttributes['slot'], so those are matched on the slot itself and need no
+    clock. Lines without that attribute -- ALT refresh failures, teardowns --
+    are picked up by time window instead and flagged as such, because they are
+    often the most interesting ones and dropping them would hide the cause.
+
+    otel's clock agrees with InfluxDB: on slot 440027607 the tagged errors span
+    09:00:30.087-.400 against sim-extend's 09:00:30.075-.400. That is unlike
+    bifrost_events, which has been seen 899ms out, so the window is taken from
+    InfluxDB times when we have them."""
+    # Two different reasons for no logs, and they were reported identically:
+    # an unconfigured ClickStack, and a slot with no miniblock rows to derive a
+    # time window from (which happens exactly when the builder was down -- the
+    # case you most want logs for).
+    if not (OTEL_URL and OTEL_SERVICE):
+        return {"unconfigured": True}
+    if not stamps:
+        return {"nowindow": True}
+    pad = dt.timedelta(seconds=6)
+    lo = (dt.datetime.fromisoformat(min(stamps)[:26]) - pad
+          ).strftime("%Y-%m-%d %H:%M:%S")
+    hi = (dt.datetime.fromisoformat(max(stamps)[:26]) + pad
+          ).strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        rows = otel(
+            "SELECT toString(Timestamp) AS ts, SeverityText AS sev, Body AS body, "
+            "  LogAttributes['slot'] AS s, LogAttributes['index'] AS idx "
+            "FROM otel_logs "
+            f"WHERE ServiceName = '{OTEL_SERVICE}' "
+            f"  AND Timestamp >= '{lo}' AND Timestamp <= '{hi}' "
+            "  AND SeverityText IN ('warn','error','fatal') "
+            f"  AND (LogAttributes['slot'] = '{int(slot)}' "
+            "       OR LogAttributes['slot'] = '') "
+            "ORDER BY Timestamp LIMIT 4000")
+    except Exception as exc:
+        return {"err": str(exc)[:140]}
+    out = []
+    for r in rows:
+        out.append({"t": _rfc3339_ns(r[0][:26].replace(" ", "T")),
+                    "sev": r[1], "body": r[2],
+                    "slot": ch_int(r[3], 0), "idx": r[4],
+                    "tagged": bool(r[3])})
+    return {"rows": out, "window": (lo, hi)}
+
+
 def slot_builder_events(slot, stamps):
     """The builder's own view of the slot, from bifrost_events.
 
@@ -1417,11 +1465,12 @@ def _slot_data_uncached(slot, now):
     # 300s window, so run them together rather than back to back.
     import concurrent.futures as cf
 
-    with cf.ThreadPoolExecutor(max_workers=5) as pool:
+    with cf.ThreadPoolExecutor(max_workers=6) as pool:
         fut = {"ext": pool.submit(slot_extends, slot, stamps),
                "commit": pool.submit(slot_commits, slot, stamps),
                "relay": pool.submit(slot_relay, slot, stamps),
                "builder": pool.submit(slot_builder_events, slot, stamps),
+               "logs": pool.submit(slot_logs, slot, stamps),
                "shred": pool.submit(slot_shreds, slot, stamps)}
     try:
         extends, ext_err = fut["ext"].result(), None
@@ -1436,6 +1485,10 @@ def _slot_data_uncached(slot, now):
     except Exception:
         builder_ev = {}
     try:
+        logs = fut["logs"].result()
+    except Exception as exc:
+        logs = {"err": str(exc)[:140]}
+    try:
         relay_rounds, relay_err = fut["relay"].result(), None
     except Exception as exc:
         relay_rounds, relay_err = {}, str(exc)[:140]
@@ -1445,6 +1498,7 @@ def _slot_data_uncached(slot, now):
         shreds, shred_err = {}, str(exc)[:140]
     data = {"rounds": rounds, "extends": extends, "ext_err": ext_err,
             "commits": commits, "relay": relay_rounds, "builder": builder_ev,
+            "logs": logs,
             "relay_err": relay_err,
             "shreds": shreds, "shred_err": shred_err}
 
@@ -1807,6 +1861,84 @@ def timeline_html(slot, extends, commits, shreds, rounds, builder=None):
             "<th>what</th><th>detail</th><th></th></tr></thead>"
             f"<tbody>{''.join(rows)}</tbody></table></div>"
 )
+
+
+SEV_CLASS = {"warn": "sv-warn", "error": "sv-err", "fatal": "sv-fatal"}
+
+
+def logs_html(slot, logs):
+    """warn / error / fatal for this slot, in order.
+
+    Runs of the same message are collapsed: one ALT failure repeated 171 times
+    in a third of a second is one fact, and listing it 171 times buries the
+    single line that actually explains the round."""
+    if not logs or logs.get("unconfigured"):
+        return ('<div class="panel"><div class="dtlhead">logs</div>'
+                '<div class="none">ClickStack not configured &mdash; set '
+                "OTEL_URL and OTEL_SERVICE</div></div>")
+    if logs.get("nowindow"):
+        return ('<div class="panel"><div class="dtlhead">logs</div>'
+                '<div class="none">this slot has no miniblock rows, so there '
+                "is no time window to search logs in &mdash; usually means the "
+                "builder was down for it</div></div>")
+    if logs.get("err"):
+        return ('<div class="panel"><div class="dtlhead">logs</div>'
+                f'<div class="err">{html.escape(logs["err"])}</div></div>')
+    rows = logs.get("rows") or []
+    if not rows:
+        return ('<div class="panel"><div class="dtlhead">logs'
+                "<span class='note'>warn, error and fatal only &mdash; the "
+                "info-level status heartbeats are excluded</span></div>"
+                '<div class="none">no warnings or errors for this slot</div>'
+                "</div>")
+
+    # collapse consecutive identical messages at the same severity
+    runs = []
+    for r in rows:
+        if runs and runs[-1]["body"] == r["body"] and runs[-1]["sev"] == r["sev"]:
+            runs[-1]["n"] += 1
+            runs[-1]["last"] = r["t"]
+            runs[-1]["tagged"] = runs[-1]["tagged"] or r["tagged"]
+        else:
+            runs.append({"body": r["body"], "sev": r["sev"], "n": 1,
+                         "first": r["t"], "last": r["t"], "idx": r["idx"],
+                         "tagged": r["tagged"]})
+    t0 = runs[0]["first"]
+    counts = {}
+    for r in rows:
+        counts[r["sev"]] = counts.get(r["sev"], 0) + 1
+    summary = " &middot; ".join(
+        f'<span class="{SEV_CLASS.get(k, "")}">{v:,} {k}</span>'
+        for k, v in sorted(counts.items(), key=lambda kv: -kv[1]))
+
+    body = []
+    for r in runs:
+        span = (r["last"] - r["first"]) / 1e6
+        body.append(
+            f'<tr class="{SEV_CLASS.get(r["sev"], "")}">'
+            f'<td class="n m">+{(r["first"] - t0) / 1e6:,.1f} ms</td>'
+            f'<td class="m dim">{dt.datetime.fromtimestamp(r["first"]/1e9, dt.UTC).strftime("%H:%M:%S.%f")[:-3]}</td>'
+            f'<td class="m sevcell">{html.escape(r["sev"])}</td>'
+            f'<td class="m">{html.escape(r["body"])}</td>'
+            f'<td class="n m">' + (f'&times;{r["n"]:,}' if r["n"] > 1 else "")
+            + (f'<div class="basis">over {span:,.0f} ms</div>'
+               if r["n"] > 1 and span >= 1 else "") + "</td>"
+            f'<td class="m dim">'
+            + (f'round {html.escape(r["idx"])}' if r["idx"] else "")
+            + ("" if r["tagged"] else '<span class="basis">time-matched, not '
+                                      "slot-tagged</span>")
+            + "</td></tr>")
+    return ('<div class="panel"><div class="dtlhead">logs'
+            f'<span class="sevsum">{summary}</span>'
+            "<span class='note'>warn, error and fatal only &mdash; info-level "
+            "status heartbeats are excluded &middot; lines carrying "
+            "LogAttributes['slot'] are matched on the slot exactly; the rest "
+            "are matched by time window and marked &middot; repeats of the "
+            "same message are collapsed</span></div>"
+            "<table><thead><tr><th class=n>offset</th><th>UTC</th>"
+            "<th>severity</th><th>message</th><th class=n>count</th>"
+            "<th>where</th></tr></thead>"
+            f"<tbody>{''.join(body)}</tbody></table></div>")
 
 
 _extra_cache = {}
@@ -2278,6 +2410,16 @@ tr.tl-chain   td:nth-child(3) b{color:#67e8f9}
 .panel tbody tr.tl-replay td,.panel tbody tr.tl-promote td,
 .panel tbody tr.tl-empty td,.panel tbody tr.tl-chain td{
   border-bottom:1px solid #0b1016;padding:6px 9px}
+.sevsum{margin-left:10px;font-size:11px;text-transform:none;letter-spacing:0}
+.sv-warn .sevcell,.sevsum .sv-warn{color:#fbbf24;font-weight:600}
+.sv-err .sevcell,.sevsum .sv-err{color:#f87171;font-weight:600}
+.sv-fatal .sevcell,.sevsum .sv-fatal{color:#fca5a5;font-weight:700}
+tr.sv-warn td{background:#2a1f06}
+tr.sv-warn td:first-child{border-left:3px solid #fbbf24}
+tr.sv-err td{background:#2a0f0f}
+tr.sv-err td:first-child{border-left:3px solid #f87171}
+tr.sv-fatal td{background:#3b0d0d}
+tr.sv-fatal td:first-child{border-left:3px solid #ef4444}
 .legend{display:flex;gap:14px;flex-wrap:wrap;padding:8px 0 2px}
 .lg{display:flex;gap:6px;align-items:center;color:#8fa6bf;font-size:10.5px}
 .lg i{width:9px;height:9px;border-radius:50%;display:inline-block;font-style:normal}
@@ -2974,8 +3116,16 @@ def page(sel_win=None, sel_slot=None, sel_round=None, tab="rounds"):
             f'<a class="tab{" on" if tab == key else ""}" '
             f'href="{base}{"" if key == "rounds" else "&tab=" + key}">{label}</a>'
             for key, label in (("rounds", "rounds"), ("compare", "comparison"),
-                               ("timeline", "timeline")))
-        if tab == "timeline":
+                               ("timeline", "timeline"), ("logs", "logs")))
+        if tab == "logs":
+            try:
+                d = slot_data(sel_slot)
+                inner = logs_html(sel_slot, d.get("logs"))
+            except Exception as exc:
+                inner = ('<div class="err">logs unavailable: '
+                         f"{html.escape(str(exc))[:160]}</div>")
+            blurb = "warnings and errors the builder logged during this slot."
+        elif tab == "timeline":
             try:
                 d = slot_data(sel_slot)
                 inner = timeline_html(sel_slot, d["extends"], d["commits"],
@@ -3048,7 +3198,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             tab = qs.get("tab", ["rounds"])[0]
             body = page(as_int("win"), as_int("slot"), as_int("round"),
-                        tab if tab in ("compare", "timeline") else "rounds"
+                        tab if tab in ("compare", "timeline", "logs") else "rounds"
                         ).encode()
         except Exception as exc:
             body = f"<pre>{html.escape(str(exc))}</pre>".encode()
