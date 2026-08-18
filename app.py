@@ -1494,7 +1494,8 @@ def extend_table(stat):
             f"<table><thead>{head}</thead><tbody>{row}</tbody></table></div>")
 
 
-def detail_table(title, items, show_won=False, winner_name=None):
+def detail_table(title, items, show_won=False, winner_name=None,
+                 relay_on=False):
     """`show_won` turns the last column into "won by". A bare YES/- only said
     whether it was us; the point of interest on a lost round is WHO, so the
     winning builder's id goes there when we can name it."""
@@ -1528,8 +1529,12 @@ def detail_table(title, items, show_won=False, winner_name=None):
         f"<td class='n m'>{i['bundles']:,}</td><td class='n m'>{sol(i['reward'])}</td>"
         f"<td class='n m'>{i['exec_cost']:,}</td><td class='n m'>{i['sel_cu']:,}</td>"
         f"<td class='m dim'>{html.escape(i['uuid'])}{copy_btn(i['uuid'])}</td>"
+        # The relay names the winner whoever it was, ourselves included, so
+        # prefer it in BOTH cases. Naming only the opponent meant our own
+        # wins fell through to a configured label and read as a generic "us"
+        # even when the relay had already named the builder.
         + (f"<td class='m {'goodc' if i['won'] else ''}'>"
-           f"{html.escape(OURS_NAME if i['won'] else (winner_name or 'not ours'))}"
+           f"{winner_name and html.escape(winner_name) or unnamed(i['won'], relay_on)}"
            "</td>" if show_won else "")
         + "</tr>"
         for i in items)
@@ -1590,12 +1595,21 @@ def pcache_table(stat):
 
 # ---------------------------------------------------- per-round comparison
 
-# The relay never tells us WHICH builder won a round it did not award us. The
-# opponent is therefore named by exclusion, not identified: won_by_us=false
-# only means someone else took it. Set OPPONENT_NAME when you know who that
-# is in practice; the label is a convenience, not evidence.
-OPPONENT = os.environ.get("OPPONENT_NAME", "other builder")
-OURS_NAME = os.environ.get("OUR_NAME", "us")
+# Our own data cannot name a winner: won_by_us=false only says someone else
+# took it. The relay's round_chosen does name them, so that is the only source
+# used -- no builder names are configured anywhere, and a builder added later
+# appears on its own.
+# Builder names are never configured. The relay's round_chosen names whoever
+# actually won, so a builder we have never seen shows up correctly with no
+# change here. Without a relay we can only report ours/not-ours, which is all
+# won_by_us actually tells us -- and we say so rather than invent a name.
+def unnamed(won, relay_on):
+    """We could not name the winner. Say WHY -- an unconfigured relay and a
+    round the relay never echoed a winner for are different problems, and
+    labelling both the same sent one investigation down the wrong path."""
+    why = "no relay configured" if not relay_on else "no winner echo from relay"
+    return f'{"ours" if won else "not ours"} <span class="dim">({why})</span>'
+
 
 
 def big(v):
@@ -1898,14 +1912,18 @@ def compare_html(slot, rounds, extends, commits, relay_rounds=None,
             their_reward, their_cu = rl["opp_reward"], rl["opp_cu"]
             their_orders = rl["opp_orders"]
         elif w and not we_won:
-            them_name, basis = (rl or {}).get("win_builder") or OPPONENT, "winner row"
+            them_name, basis = (rl or {}).get("win_builder"), "winner row"
             their_reward, their_cu = w["reward"], w["exec_cost"]
             their_orders = w["orders"]
         else:
             them_name, basis = None, ""
             their_reward = their_cu = their_orders = None
 
-        winner = OURS_NAME if we_won else (them_name or OPPONENT if w else "&mdash;")
+        # prefer the relay's actual builder id over our generic label
+        relay_winner = (rl or {}).get("win_builder")
+        winner = (html.escape(relay_winner) if relay_winner
+                  else unnamed(we_won, bool(RELAY_URL and RELAY_DS_UID))
+                  if w else "&mdash;")
         if their_reward and ours_reward is not None and their_reward > 0:
             pct = 100.0 * (ours_reward - their_reward) / their_reward
             margin = (f'<span class="{"goodc" if pct >= 0 else "redc"}">'
@@ -1942,8 +1960,7 @@ def compare_html(slot, rounds, extends, commits, relay_rounds=None,
             f'&round={r["round"]}">round {r["round"]}</a>'
             + (' <span class="last">is_last</span>' if w and w["is_last"] else "")
             + note + "</td>"
-            f'<td class="m {"goodc" if we_won else ""}">{html.escape(winner)}'
-            + (f'<div class="basis">their {basis}</div>' if basis else "")
+            f'<td class="m {"goodc" if we_won else ""}">{winner}'
             # the winning miniblock's own id. Present on our winner row even
             # with no relay configured, and it is the SAME uuid the relay puts
             # on round_winner, so it joins the two stores for one round.
@@ -2048,7 +2065,8 @@ def rounds_html(slot, sel_round):
                   + detail_table(
                       "winner miniblock", [w] if w else [], show_won=True,
                       winner_name=(relay_rounds.get(rnd) or {}).get(
-                          "win_builder") or None)
+                          "win_builder") or None,
+                      relay_on=bool(RELAY_URL and RELAY_DS_UID))
                   + "</div>")
         out.append(f'<div class="rndwrap">{summary}{detail}</div>')
     return "".join(out)

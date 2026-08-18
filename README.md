@@ -171,6 +171,12 @@ uuid the relay puts on its `round_winner` event — so it joins the two stores
 for a single round, and joins onward to `bifrost_events` for the orders that
 made up that block.
 
+**Builder names are never configured.** The relay's `round_chosen` names
+whoever actually won — us or anyone else — so a builder added later appears on
+its own with no change here. Without a relay the winner can only be reported as
+ours / not ours, and the cell says which of "no relay configured" or "no winner
+echo from relay" applies rather than inventing a label.
+
 **Their side comes from the relay** when `RELAY_URL` is configured. The relay
 sees every builder's submissions and its `round_chosen` event names the winner
 — something our own data structurally cannot do, since `won_by_us=false` only
