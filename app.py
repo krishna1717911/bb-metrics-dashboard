@@ -641,6 +641,62 @@ _block_cache = {}
 _block_lock = threading.Lock()
 
 
+def block_index(slot):
+    """The slot's block indexed by SigPrefix: signature, account keys with
+    their writability, and whether the transaction is a vote.
+
+    `transactionDetails: accounts` already returns every key's `writable` flag
+    with the address-lookup tables RESOLVED, so one call serves both the vote
+    columns and the conflict DAG. Reconstructing writability by hand from the
+    message header disagrees with the runtime on roughly one transaction in
+    250 -- an account invoked as a program is demoted to readonly -- so the
+    resolved flags are worth the heavier response."""
+    if not SOLANA_RPC:
+        return None
+    with _block_lock:
+        hit = _block_cache.get(slot)
+    if hit is not None:
+        return hit
+    # A shared endpoint answers 429 under load and the block is 8 MB, so a
+    # failure here is usually "come back in a moment", not "no such block".
+    blk = None
+    for attempt in range(4):
+        try:
+            req = urllib.request.Request(
+                SOLANA_RPC, headers={"Content-Type": "application/json"},
+                data=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "getBlock",
+                                 "params": [int(slot), {
+                                     "encoding": "json",
+                                     "transactionDetails": "accounts",
+                                     "rewards": False,
+                                     "maxSupportedTransactionVersion": 0}]}).encode())
+            blk = json.load(urllib.request.urlopen(req, timeout=120)).get("result")
+            break
+        except urllib.error.HTTPError as err:
+            if err.code != 429 or attempt == 3:
+                raise RuntimeError(f"getBlock({slot}) failed: HTTP {err.code}")
+            time.sleep(1.5 * (attempt + 1))
+        except Exception as err:
+            raise RuntimeError(f"getBlock({slot}) failed: "
+                               f"{type(err).__name__}: {str(err)[:80]}")
+    if blk is None:
+        raise RuntimeError(f"getBlock({slot}) returned nothing")
+    index = {}
+    for t in (blk or {}).get("transactions", []):
+        sig = t["transaction"]["signatures"][0]
+        keys = [(k["pubkey"], bool(k.get("writable"))) if isinstance(k, dict)
+                else (k, False) for k in t["transaction"]["accountKeys"]]
+        prefix = b58decode(sig)[:16]
+        index[prefix] = {
+            "sig": sig, "prefix": b58encode(prefix), "keys": keys,
+            "vote": any(k == VOTE_PROGRAM for k, _ in keys)}
+    with _block_lock:
+        if len(_block_cache) > 8:
+            _block_cache.clear()
+        _block_cache[slot] = index
+    return index
+
+
 def slot_votes(slot):
     """Which of this slot's transactions are votes, keyed by SigPrefix.
 
@@ -648,37 +704,14 @@ def slot_votes(slot):
     winner's 553 transaction refs were votes, and 680 of our 1,209 selected
     signatures. So "non-vote" is a real distinction and not a formality.
 
-    Needs the block, hence an RPC call, hence optional: without SOLANA_RPC the
-    non-vote columns read as unknown rather than as zero. Only the comparison
-    tab asks for this."""
-    if not SOLANA_RPC:
-        return None
-    with _block_lock:
-        if slot in _block_cache:
-            return _block_cache[slot]
+    Needs the block, hence an RPC call, hence optional: without SOLANA_RPC, or
+    when the call fails, the non-vote columns read as unknown rather than as
+    zero."""
     try:
-        req = urllib.request.Request(
-            SOLANA_RPC, headers={"Content-Type": "application/json"},
-            data=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "getBlock",
-                             "params": [int(slot), {
-                                 "encoding": "json",
-                                 "transactionDetails": "accounts",
-                                 "rewards": False,
-                                 "maxSupportedTransactionVersion": 0}]}).encode())
-        blk = json.load(urllib.request.urlopen(req, timeout=120)).get("result")
-    except Exception:
-        blk = None
-    votes = {}
-    for t in (blk or {}).get("transactions", []):
-        sig = t["transaction"]["signatures"][0]
-        keys = [k["pubkey"] if isinstance(k, dict) else k
-                for k in t["transaction"]["accountKeys"]]
-        votes[b58decode(sig)[:16]] = (VOTE_PROGRAM in keys)
-    with _block_lock:
-        if len(_block_cache) > 32:
-            _block_cache.clear()
-        _block_cache[slot] = votes
-    return votes
+        index = block_index(slot)
+    except RuntimeError:
+        return None
+    return None if index is None else {p: v["vote"] for p, v in index.items()}
 
 
 VOTE_PROGRAM = "Vote111111111111111111111111111111111111111"
@@ -696,6 +729,15 @@ def b58decode(s):
         n = n * 58 + _B58.index(c)
     body = n.to_bytes((n.bit_length() + 7) // 8, "big") if n else b""
     return b"\0" * (len(s) - len(s.lstrip("1"))) + body
+
+
+def b58encode(raw):
+    n = int.from_bytes(raw, "big")
+    out = ""
+    while n:
+        n, rem = divmod(n, 58)
+        out = _B58[rem] + out
+    return "1" * (len(raw) - len(raw.lstrip(b"\0"))) + out
 
 
 def slot_offer_sigs(slot):
@@ -979,7 +1021,7 @@ def slot_commits(slot, stamps):
     # sim-context rides along: one query, and it is the timeline's t0 -- the
     # moment a leader-window context installed and sequencing could begin.
     series = influx_series(
-        'SELECT "index","body_us","queue_us","replayed","promoted_len","applied",'
+        'SELECT "index","body_us","queue_us","replayed","critical_path","initial_width","promoted_len","applied",'
         '"winner","refusal","parent_slot","hold_us" '
         f'FROM "sim-commit","sim-context" WHERE slot = {int(slot)} '
         + "".join(f"AND \"host_id\" != '{h}' " for h in OFF_CHAIN)
@@ -1009,13 +1051,22 @@ def slot_commits(slot, stamps):
         idx = num("index")
         e = out.setdefault(idx, {"n": 0, "body": 0, "replayed": 0,
                                  "promoted": 0, "queue": 0, "kind": 0,
-                                 "refusal": 0, "t": _rfc3339_ns(r[at["time"]])})
+                                 "refusal": 0, "critical_path": 0,
+                                 "initial_width": 0,
+                                 "t": _rfc3339_ns(r[at["time"]])})
         e["n"] += 1
         e["body"] += num("body_us")
         e["queue"] += num("queue_us")
         e["replayed"] += num("replayed")
         e["promoted"] += num("promoted_len")
         e["refusal"] += num("refusal")
+        # The DAG the simulator measured while replaying this round's winner.
+        # Unlike the extend path's, this one covers the WHOLE miniblock in a
+        # single call, so it is the number a round-level rebuild is checked
+        # against. Keep the largest: a round commits once, but a retry would
+        # re-emit and the fuller graph is the one that ran.
+        e["critical_path"] = max(e.get("critical_path", 0), num("critical_path"))
+        e["initial_width"] = max(e.get("initial_width", 0), num("initial_width"))
         # workers.rs winner_kind(): 0 empty, 1 promote, 2 replay. Keep the
         # heaviest kind seen -- a replay is what actually costs.
         e["kind"] = max(e["kind"], num("winner"))
@@ -1084,7 +1135,8 @@ def slot_extends(slot, stamps):
           ).strftime("%Y-%m-%dT%H:%M:%SZ")
     cols, rows = influx(
         'SELECT "index","body_us","queue_us","orders","applied","status",'
-        '"exec_wall_us","program_cache_us","program_cache_clone_us",'
+        '"exec_wall_us","critical_path","initial_width","exec_pool","prefix_len",'
+        '"cu","program_cache_us","program_cache_clone_us",'
         '"program_cache_compile_us","program_cache_compiles",'
         '"program_cache_entries","program_cache_entries_cloned",'
         '"program_cache_loaded" '
@@ -1106,6 +1158,9 @@ def slot_extends(slot, stamps):
             "queue": num("queue_us"), "orders": num("orders"),
             "applied": num("applied"), "status": num("status"),
             "exec": num("exec_wall_us"),
+            "crit": num("critical_path"), "iwidth": num("initial_width"),
+            "pool": num("exec_pool"), "prefix": num("prefix_len"),
+            "cu": num("cu"),
             "pc_us": num("program_cache_us"),
             "pc_clone_us": num("program_cache_clone_us"),
             "pc_compile_us": num("program_cache_compile_us"),
@@ -1144,8 +1199,863 @@ def slot_extends(slot, stamps):
             "pc_forks": sum(1 for c in calls if c["pc_clone_us"] or c["pc_cloned"]),
             "pc_cloned_max": max(c["pc_cloned"] for c in calls),
             "pc_entries_max": max(c["pc_entries"] for c in calls),
+            # The DAG shape the simulator measured, per accepted call. These are
+            # per CALL -- sixteen orders at a time -- not for the round's order
+            # list, so they do not compare against a round-level rebuild.
+            "exec_pool": max(c["pool"] for c in calls),
+            "crit_max": max(c["crit"] for c in calls),
+            "crit_sum": sum(c["crit"] for c in calls),
+            "iwidth_p50": _p50([c["iwidth"] for c in calls]),
+            "prefix_end": max(c["prefix"] for c in calls),
+            "cu_end": max(c["cu"] for c in calls),
+            "calls": [{"t": c["t"], "orders": c["orders"], "applied": c["applied"],
+                       "crit": c["crit"], "iwidth": c["iwidth"],
+                       "prefix": c["prefix"], "cu": c["cu"], "body": c["body"],
+                       "exec": c["exec"], "status": c["status"]} for c in calls],
         }
     return out
+
+
+# ------------------------------------------------------------- conflict DAG
+#
+# The simulator does not ship its DAG anywhere -- `sim-extend` and `sim-commit`
+# carry only its SHAPE (critical_path, initial_width, exec_pool). So the graph
+# here is rebuilt, by porting simulation-service/src/replay.rs `build_stream`
+# line for line: RAW and WAW edges through `last_writer`, WAR edges through
+# `readers_since_write`, then linear runs coalesced into chains.
+#
+# Two things make the rebuild checkable rather than decorative:
+#
+#   * the account keys come from the block with the address-lookup tables
+#     ALREADY RESOLVED, so the read/write sets are the ones the runtime used,
+#     not a guess;
+#   * `sim-commit` records the critical_path and initial_width the simulator
+#     itself measured while replaying the winner, so the rebuild can be scored
+#     against it. On the cleanest round measured -- slot 440267808 round 0, two
+#     orders unresolved -- the rebuilt critical path was 55 against a recorded
+#     55, and the initial width 32 against 33. Every panel shows that
+#     comparison rather than asserting the graph is right.
+#
+# The residual is foreign bundles. A bundle reaches us as a 32-byte id; its
+# member transactions are only knowable if WE received the bundle too, and the
+# builder that won a round usually has bundles we never saw. Those orders are
+# counted and reported, never silently dropped.
+
+MAX_CHAIN_TXS = 64          # replay.rs
+
+
+def dag_stream(orders, merge_chains):
+    """Port of replay.rs build_stream(). `orders` is an ordered list of
+    {"txs": [{"keys": [(pubkey, writable)], "sig": str}], "is_bundle": bool}.
+
+    merge_chains follows the caller the simulator itself uses: the extend path
+    passes false (every order is its own chain, because the round-budget
+    verdict can refuse an order a merged chain's worker would already have
+    carried forward), the winner-replay path passes true."""
+    n = len(orders)
+    last_writer, readers = {}, {}
+    blocked = [0] * n
+    dependents = [[] for _ in range(n)]
+    for i, order in enumerate(orders):
+        deps = set()
+        for tx in order["txs"]:
+            for key, writable in tx["keys"]:
+                writer = last_writer.get(key)
+                if writer is not None:
+                    deps.add(writer)                    # RAW and WAW
+                if writable:
+                    deps.update(readers.get(key, ()))   # WAR
+        for tx in order["txs"]:
+            for key, writable in tx["keys"]:
+                if writable:
+                    last_writer[key] = i
+                    readers.pop(key, None)
+                else:
+                    readers.setdefault(key, []).append(i)
+        blocked[i] = len(deps)
+        for dep in deps:
+            dependents[dep].append(i)
+
+    # An order touching a duplicated signature never merges: the settle verdict
+    # refuses duplicates, and a refused order's writes must not reach a
+    # same-chain successor.
+    dup = [False] * n
+    if merge_chains:
+        holder = {}
+        for i, order in enumerate(orders):
+            for tx in order["txs"]:
+                if tx["sig"] in holder:
+                    dup[holder[tx["sig"]]] = True
+                    dup[i] = True
+                else:
+                    holder[tx["sig"]] = i
+
+    # A linear run: order i flows into its sole dependent when it is also that
+    # dependent's sole blocker, and neither side is a bundle.
+    nxt = [None] * n
+    if merge_chains:
+        for i in range(n):
+            if orders[i]["is_bundle"] or dup[i] or len(dependents[i]) != 1:
+                continue
+            j = dependents[i][0]
+            if blocked[j] == 1 and not orders[j]["is_bundle"] and not dup[j]:
+                nxt[i] = j
+
+    # Links point forward, so an ascending sweep reaches every head first.
+    chain_of = [-1] * n
+    chains = []
+    for start in range(n):
+        if chain_of[start] != -1:
+            continue
+        cid = len(chains)
+        chain_of[start] = cid
+        if orders[start]["is_bundle"]:
+            chains.append([start])
+            continue
+        members, ntx, cur = [start], len(orders[start]["txs"]), start
+        while nxt[cur] is not None:
+            j = nxt[cur]
+            if ntx + len(orders[j]["txs"]) > MAX_CHAIN_TXS:
+                break
+            chain_of[j] = cid
+            members.append(j)
+            ntx += len(orders[j]["txs"])
+            cur = j
+        chains.append(members)
+
+    m = len(chains)
+    cblocked = [0] * m
+    cdeps = [[] for _ in range(m)]
+    seen = set()
+    for i, targets in enumerate(dependents):
+        for t in targets:
+            a, b = chain_of[i], chain_of[t]
+            if a != b and (a, b) not in seen:
+                seen.add((a, b))
+                cdeps[a].append(b)
+                cblocked[b] += 1
+    # Height is the longest chain-path below, computable in reverse because an
+    # edge always points at a chain with a larger head index.
+    height = [0] * m
+    for cid in range(m - 1, -1, -1):
+        for nb in cdeps[cid]:
+            if height[nb] + 1 > height[cid]:
+                height[cid] = height[nb] + 1
+    return {"chains": chains, "chain_of": chain_of, "cdeps": cdeps,
+            "cblocked": cblocked, "height": height,
+            "critical_path": (max(height) + 1) if height else 0,
+            "initial_width": sum(1 for b in cblocked if b == 0)}
+
+
+def dag_schedule(stream, weights, pool):
+    """Replay the simulator's dispatch: ready chains pop deepest-remaining-path
+    first onto `pool` workers -- replay.rs keeps `ready` as a max-heap on
+    (height, id) and hands the top of it to whichever worker is idle.
+
+    The clock is MODEL time in compute units, not wall time. A chain costs the
+    sum of its members' CU, so the x axis answers "how long would this DAG take
+    on `pool` workers if cost tracked CU", which is the question the shape is
+    for. Wall time per extend is measured separately and shown beside it."""
+    import heapq
+
+    m = len(stream["chains"])
+    cost = [max(1, sum(weights.get(i, 0) for i in members))
+            for members in stream["chains"]]
+    remaining = list(stream["cblocked"])
+    ready = [(-stream["height"][i], i) for i in range(m) if remaining[i] == 0]
+    heapq.heapify(ready)
+    running = []                       # (finish_time, chain, worker)
+    idle = list(range(max(1, pool)))
+    now = 0
+    out = [None] * m
+    while ready or running:
+        while ready and idle:
+            _, cid = heapq.heappop(ready)
+            worker = idle.pop(0)
+            out[cid] = {"w": worker, "t0": now, "t1": now + cost[cid]}
+            heapq.heappush(running, (now + cost[cid], cid, worker))
+        if not running:
+            break
+        now = running[0][0]
+        while running and running[0][0] == now:
+            _, cid, worker = heapq.heappop(running)
+            idle.append(worker)
+            idle.sort()
+            for nb in stream["cdeps"][cid]:
+                remaining[nb] -= 1
+                if remaining[nb] == 0:
+                    heapq.heappush(ready, (-stream["height"][nb], nb))
+    span = max((s["t1"] for s in out if s), default=0)
+    # The critical path is a WALK from the deepest chain downward. Its edges
+    # are the consecutive pairs only -- two chains can both sit on the path and
+    # still be joined by an edge the path does not take.
+    crit, crit_edges = set(), set()
+    if m:
+        cur = max(range(m), key=lambda i: stream["height"][i])
+        while True:
+            crit.add(cur)
+            nxts = stream["cdeps"][cur]
+            if not nxts:
+                break
+            nxt = max(nxts, key=lambda i: stream["height"][i])
+            crit_edges.add((cur, nxt))
+            cur = nxt
+    return out, span, crit, crit_edges
+
+
+def bundle_members(slot, ids, stamps):
+    """bundle id (hex) -> its member signatures, in submission order.
+
+    The wire carries a bundle as an opaque 32-byte id. The only place its
+    contents survive is the `received` event we logged when the bundle reached
+    us -- which is exactly why a bundle only WE received can be expanded, and a
+    rival's cannot."""
+    if not ids or not stamps:
+        return {}
+    lo, hi = _ch_window(stamps, minutes=6)
+    quoted = ",".join("'" + i + "'" for i in sorted(ids) if re.fullmatch(r"[0-9a-f]{64}", i))
+    if not quoted:
+        return {}
+    _, rows = clickhouse(
+        "SELECT entity, attrs['sigs'] FROM bifrost_events "
+        f"WHERE ts >= '{lo}' AND ts <= '{hi}' AND entity_kind = 'bundle' "
+        f"AND entity IN ({quoted}) AND attrs['sigs'] != ''")
+    out = {}
+    for entity, sigs in rows:
+        out.setdefault(entity, [s for s in sigs.split(",") if s])
+    return out
+
+
+def _ch_window(stamps, minutes):
+    pad = dt.timedelta(minutes=minutes)
+    lo = (dt.datetime.fromisoformat(min(stamps)[:26]) - pad
+          ).strftime("%Y-%m-%d %H:%M:%S")
+    hi = (dt.datetime.fromisoformat(max(stamps)[:26]) + pad
+          ).strftime("%Y-%m-%d %H:%M:%S")
+    return lo, hi
+
+
+def order_outcomes(slot, stamps):
+    """entity -> (cu, included) from our own `executed` events.
+
+    This is the only per-order cost we hold. The block's own
+    computeUnitsConsumed would need the heavier `full` transaction detail, and
+    it would be the WINNER's cost rather than what our simulator spent."""
+    if not stamps:
+        return {}
+    lo, hi = _ch_window(stamps, minutes=3)
+    _, rows = clickhouse(
+        "SELECT entity, entity_kind, reason, toUInt64(nums['cu']) AS cu "
+        f"FROM bifrost_events WHERE ts >= '{lo}' AND ts <= '{hi}' "
+        f"AND event = 'executed' AND nums['slot'] = {int(slot)}")
+    out = {}
+    for entity, kind, reason, cu in rows:
+        out[entity] = {"cu": ch_int(cu), "included": reason == "included",
+                       "reason": reason or "?"}
+    return out
+
+
+def dag_orders(slot, rnd, source, rounds, stamps):
+    """The round's order list, in wire order, resolved to account sets.
+
+    Two different sources, because they answer different questions and are
+    stored differently:
+
+      winner  the miniblock that WON the round. Its payload is a list of order
+              refs, so the order is exact. This is the one the simulator
+              replayed, and therefore the one `sim-commit` measured.
+      ours    what we OFFERED. Our own payload embeds whole transactions rather
+              than refs, so the list is rebuilt from the row's `signatures`
+              array, with bundle members folded back into one order at the
+              position of their first transaction."""
+    try:
+        index = block_index(slot)
+    except RuntimeError as err:
+        return None, {"err": str(err) + ". The account sets come from the "
+                                        "block, so the graph cannot be built "
+                                        "without it."}
+    if index is None:
+        return None, {"err": "SOLANA_RPC is not configured, so the block's "
+                             "account sets are unavailable"}
+    entry = next((r for r in rounds if r["round"] == rnd), None)
+    if entry is None:
+        return None, {"err": f"round {rnd} has no miniblock rows"}
+
+    stats = {"votes": 0, "unresolved": 0, "bundles": 0, "opaque": 0,
+             "ungrouped": 0}
+    refs = []
+    if source == "winner":
+        win = entry.get("winner")
+        if not win:
+            return None, {"err": "the relay never echoed a winner for this round"}
+        _, rows = clickhouse(
+            f"SELECT hex(payload) FROM bifrost_miniblocks WHERE slot = {int(slot)} "
+            f"AND index_in_slot = {int(rnd)} AND kind = 'winner' LIMIT 1")
+        if not rows:
+            return None, {"err": "no winner payload stored"}
+        refs = _decode_refs(bytes.fromhex(rows[0][0]))
+    else:
+        offers = entry.get("offers") or []
+        if not offers:
+            return None, {"err": "we made no offer in this round"}
+        best = max(offers, key=lambda o: o["orders"])
+        _, rows = clickhouse(
+            "SELECT arrayStringConcat(signatures, ' '), "
+            "       arrayStringConcat(bundle_ids, ' ') "
+            f"FROM bifrost_miniblocks WHERE slot = {int(slot)} "
+            f"AND uuid = '{best['uuid']}' LIMIT 1")
+        if not rows:
+            return None, {"err": "our offer row disappeared"}
+        sigs = [s for s in rows[0][0].split(" ") if s]
+        bids = [b for b in rows[0][1].split(" ") if b]
+        members = bundle_members(slot, set(bids), stamps)
+        owner, emitted = {}, set()
+        for bid in bids:
+            for sig in members.get(bid, []):
+                owner[sig] = bid
+        for sig in sigs:
+            bid = owner.get(sig)
+            if bid is None:
+                refs.append(("sig", sig))
+            elif bid not in emitted:
+                emitted.add(bid)
+                refs.append(("bundle", bid))
+        stats["bundles"] = len(bids)
+        stats["ungrouped"] = sum(1 for b in bids if b not in members)
+        refs += [("bundle", b) for b in bids if b not in emitted and b in members]
+
+    by_sig = {v["sig"]: v for v in index.values()}
+    if source == "winner":
+        wanted = {r.hex() for kind, r in refs if kind == "bundle"}
+        members = bundle_members(slot, wanted, stamps)
+        stats["bundles"] = len(wanted)
+
+    orders = []
+    for kind, ref in refs:
+        if kind == "sig":
+            tx = by_sig.get(ref)
+        elif kind == "tx":
+            tx = index.get(ref)
+        else:
+            bid = ref if isinstance(ref, str) else ref.hex()
+            sigs = members.get(bid)
+            txs = [by_sig[s] for s in sigs or [] if s in by_sig]
+            if not sigs or len(txs) != len(sigs):
+                stats["opaque"] += 1
+                stats["unresolved"] += 1
+                continue
+            if all(t["vote"] for t in txs):
+                stats["votes"] += 1
+                continue
+            orders.append({"is_bundle": True, "ref": bid, "label": bid,
+                           "txs": [{"keys": t["keys"], "sig": t["sig"]} for t in txs]})
+            continue
+        if tx is None:
+            stats["unresolved"] += 1
+            continue
+        if tx["vote"]:
+            stats["votes"] += 1
+            continue
+        orders.append({"is_bundle": False, "ref": tx["prefix"], "label": tx["sig"],
+                       "txs": [{"keys": tx["keys"], "sig": tx["sig"]}]})
+    stats["refs"] = len(refs)
+    return orders, stats
+
+
+def _decode_refs(payload):
+    """Winner payload: a 55-byte header, then [u32 tag][body] order refs, then
+    16 bytes of zero padding. tag 0 is a 16-byte SigPrefix, tag 1 a raw 32-byte
+    bundle id."""
+    import struct
+    off, refs = 55, []
+    while off + 4 <= len(payload):
+        tag = struct.unpack("<I", payload[off:off + 4])[0]
+        size = {0: 16, 1: 32}.get(tag)
+        if size is None or off + 4 + size > len(payload):
+            break
+        refs.append(("tx" if tag == 0 else "bundle", payload[off + 4:off + 4 + size]))
+        off += 4 + size
+    return refs
+
+
+def dag_payload(slot, rnd, source, data):
+    """Everything the browser needs to draw one round's dispatch DAG."""
+    rounds = data["rounds"]
+    stamps = [i["ts"] for r in rounds
+              for i in r["offers"] + ([r["winner"]] if r["winner"] else [])]
+    orders, stats = dag_orders(slot, rnd, source, rounds, stamps)
+    if orders is None:
+        return {"err": stats["err"]}
+    if not orders:
+        return {"err": "no order in this round could be resolved to its "
+                       "account set" + (" -- every ref was a bundle we never "
+                                        "received" if stats.get("opaque") else "")}
+    # The extend path runs singleton chains; winner replay merges linear runs.
+    merge = source == "winner"
+    stream = dag_stream(orders, merge_chains=merge)
+    outcomes = order_outcomes(slot, stamps)
+    weights, resolved_cu = {}, 0
+    for i, order in enumerate(orders):
+        hit = outcomes.get(order["ref"])
+        if hit and hit["cu"]:
+            weights[i] = hit["cu"]
+            resolved_cu += 1
+        else:
+            weights[i] = 5000          # a placeholder, flagged in the panel
+    ext = (data.get("extends") or {}).get(rnd) or {}
+    pool = ext.get("exec_pool") or 8
+    placed, span, crit, crit_edges = dag_schedule(stream, weights, pool)
+
+    nodes = []
+    for cid, members in enumerate(stream["chains"]):
+        slotted = placed[cid] or {"w": 0, "t0": 0, "t1": 0}
+        head = orders[members[0]]
+        outs = [outcomes.get(orders[i]["ref"]) for i in members]
+        known = [o for o in outs if o]
+        state = ("unknown" if not known
+                 else "included" if all(o["included"] for o in known)
+                 else "excluded")
+        nodes.append({
+            "i": cid, "w": slotted["w"], "t0": slotted["t0"], "t1": slotted["t1"],
+            "b": 1 if head["is_bundle"] else 0,
+            "n": len(members), "s": state, "c": 1 if cid in crit else 0,
+            "h": stream["height"][cid], "d": stream["cblocked"][cid],
+            "cu": sum(weights[i] for i in members),
+            "r": head.get("label", head["ref"]),
+        })
+    edges = [[a, b, 1] if (a, b) in crit_edges else [a, b]
+             for a, deps in enumerate(stream["cdeps"]) for b in deps]
+    return {
+        "nodes": nodes, "edges": edges, "pool": pool, "span": span,
+        "chains": len(stream["chains"]), "orders": len(orders),
+        "critical_path": stream["critical_path"],
+        "initial_width": stream["initial_width"],
+        "merged": merge, "stats": stats, "cu_known": resolved_cu,
+    }
+
+
+def dag_html(slot, rnd, source, data):
+    rounds = data["rounds"]
+    if not rounds:
+        return ('<div class="panel"><div class="dtlhead">dispatch DAG</div>'
+                '<div class="none">this slot has no miniblock rows</div></div>')
+    have = [r["round"] for r in rounds]
+    if rnd not in have:
+        rnd = have[0]
+    base = f"/?win={window_of(slot)}&slot={slot}&tab=dag"
+    chips = "".join(
+        f'<a class="dchip{" on" if r == rnd else ""}" '
+        f'href="{base}&round={r}&src={source}">round {r}</a>' for r in have)
+    srcs = "".join(
+        f'<a class="dchip{" on" if source == key else ""}" '
+        f'href="{base}&round={rnd}&src={key}">{label}</a>'
+        for key, label in (("ours", "our offer"), ("winner", "the winner")))
+
+    try:
+        payload = dag_payload(slot, rnd, source, data)
+    except Exception as exc:
+        payload = {"err": f"{type(exc).__name__}: {exc}"}
+    head = (f'<div class="panel"><div class="dtlhead">dispatch DAG &mdash; '
+            f'round {rnd}</div>'
+            f'<div class="dagbar"><span class="dlab">round</span>{chips}'
+            f'<span class="dlab">graph of</span>{srcs}</div>')
+    if payload.get("err"):
+        return head + f'<div class="none">{html.escape(payload["err"])}</div></div>'
+
+    st = payload["stats"]
+    recorded = _dag_recorded(rnd, source, data)
+    fid = _dag_fidelity(payload, recorded)
+    unres = st["unresolved"]
+    votes = ""
+    if st["votes"]:
+        why = ("The simulator drops them too on this path: "
+               "<code>replayed</code> counts the winner's orders MINUS the "
+               "votes billed to <code>votes_cu</code>, which is how the two "
+               "figures reconcile."
+               if source == "winner" else
+               "They are excluded here because a vote touches only its own "
+               "vote account, so it adds width to the graph and no depth. "
+               "Whether the extend path is handed votes at all is not on "
+               "record either way.")
+        votes = (f'<div class="dagnote">{st["votes"]:,} of {st["refs"]:,} refs '
+                 f"are vote transactions and are not in the graph. {why}</div>")
+    warn = ""
+    if unres:
+        warn = (f'<div class="dagwarn">{unres:,} of {st["refs"]:,} order refs '
+                "could not be resolved to an account set"
+                + (f' &mdash; {st["opaque"]:,} '
+                   + ("is a bundle" if st["opaque"] == 1 else "are bundles")
+                   + " we never received, so the member transactions are "
+                     "unknown"
+                   if st.get("opaque") else "")
+                + ". They are absent from the graph, which shortens the "
+                  "critical path and understates the width.</div>")
+    if st.get("ungrouped"):
+        n = st["ungrouped"]
+        warn += (f'<div class="dagnote">{n:,} bundle{"" if n == 1 else "s"} in '
+                 "our offer could not be expanded, so its transactions appear "
+                 "as separate orders rather than one. Every transaction is "
+                 "still in the graph and the edges between them are real; what "
+                 "is wrong is the grouping, which lets the scheduler interleave "
+                 "orders a bundle would have kept together.</div>")
+    cu_note = ""
+    if payload["cu_known"] < payload["orders"]:
+        miss = payload["orders"] - payload["cu_known"]
+        cu_note = (f'<div class="dagwarn">{miss:,} order'
+                   f'{"" if miss == 1 else "s"} had no <code>executed</code> '
+                   "event, so a flat 5,000 CU stands in for the measured cost. "
+                   "Their bars are the wrong width; the edges are not affected."
+                   "</div>")
+
+    summary = (
+        '<table class="dagsum"><tr>'
+        f"<td><b>{payload['orders']:,}</b><span>orders in the graph</span></td>"
+        f"<td><b>{payload['chains']:,}</b><span>chains"
+        + (" (linear runs merged)" if payload["merged"] else " (one per order)")
+        + "</span></td>"
+        f"<td><b>{payload['critical_path']:,}</b><span>critical path"
+        f"{fid['cp']}</span></td>"
+        f"<td><b>{payload['initial_width']:,}</b><span>start with no blocker"
+        f"{fid['iw']}</span></td>"
+        f"<td><b>{payload['pool']}</b><span>worker lanes</span></td>"
+        f"<td><b>{payload['span']/1e6:.2f}M</b><span>CU on the longest lane</span></td>"
+        "</tr></table>")
+
+    legend = (
+        '<div class="daglegend">'
+        '<span><i class="dn pending"></i>pending</span>'
+        '<span><i class="dn running"></i>executing</span>'
+        '<span><i class="dn included"></i>result: included</span>'
+        '<span><i class="dn excluded"></i>not included</span>'
+        '<span><i class="dn unknown"></i>no result recorded</span>'
+        '<span><i class="dn bundlei"></i>bundle</span>'
+        '<span><i class="dn criti"></i>critical path</span>'
+        "</div>")
+
+    controls = (
+        '<div class="dagctl">'
+        '<button type="button" data-act="start" title="back to the start">&#9198;</button>'
+        '<button type="button" data-act="play" title="play">&#9654;</button>'
+        '<button type="button" data-act="end" title="jump to the end">&#9197;</button>'
+        '<input type="range" id="dagscrub" min="0" max="1000" value="1000">'
+        '<span class="dagt" id="dagt">t = end</span>'
+        + "".join(f'<button type="button" class="spd" data-spd="{s}">{s}&times;</button>'
+                  for s in ("0.5", "1", "2", "4"))
+        + '<label class="dagdep"><input type="checkbox" id="dagdep">'
+          "only orders with a dependency"
+          '<span class="daghint" id="daghide"></span></label></div>')
+
+    blob = json.dumps({"nodes": payload["nodes"], "edges": payload["edges"],
+                       "pool": payload["pool"], "span": payload["span"]},
+                      separators=(",", ":"))
+    return (head + votes + warn + cu_note + summary + controls
+            + '<div class="dagwrap"><svg id="dagsvg"></svg></div>' + legend
+            + _dag_extends(rnd, data)
+            + _dag_basis(payload, recorded, source)
+            + f'<script id="dagdata" type="application/json">{blob}</script>'
+            + f"<script>{DAG_JS}</script></div>")
+
+
+def _dag_recorded(rnd, source, data):
+    """What the simulator itself measured for this round, when it measured it.
+
+    Only the winner-replay path has a recorded comparison: `sim-commit` runs the
+    whole winning miniblock through the DAG in one call, so its critical_path
+    and initial_width describe exactly the graph drawn here. The extend path
+    reports per CALL -- sixteen orders at a time -- so there is no round-level
+    number to compare our offer against."""
+    if source != "winner":
+        return None
+    com = (data.get("commits") or {}).get(rnd)
+    if not com:
+        return None
+    # kind 2 is replay -- see workers.rs winner_kind(). A promote (we won the
+    # round) and an empty commit never call run_stream, so their critical_path
+    # and initial_width are absent rather than zero.
+    if com.get("kind") != 2 or not com.get("critical_path"):
+        return {"promoted": com.get("kind") == 1}
+    return {"cp": com.get("critical_path"), "iw": com.get("initial_width"),
+            "replayed": com.get("replayed")}
+
+
+def _dag_fidelity(payload, recorded):
+    if not recorded or recorded.get("cp") in (None, "", 0):
+        return {"cp": "", "iw": ""}
+    def cmp(got, rec):
+        if rec in (None, ""):
+            return ""
+        rec = int(rec)
+        if got == rec:
+            return f' &middot; <b class="ok">matches the {rec:,} recorded</b>'
+        return f' &middot; <span class="off">{rec:,} recorded</span>'
+    return {"cp": cmp(payload["critical_path"], recorded["cp"]),
+            "iw": cmp(payload["initial_width"], recorded["iw"])}
+
+
+def _dag_extends(rnd, data):
+    """Each accepted extend's own DAG, as the simulator measured it.
+
+    This is the per-extend view, and it is a TABLE rather than a graph on
+    purpose: `sim-extend` records the shape of each call -- its critical path,
+    how many orders started unblocked -- but never which orders were in it. The
+    batch is capped at sixteen, and nothing in ClickHouse or InfluxDB ties those
+    sixteen back to identities, so an honest per-extend graph cannot be drawn.
+    What can be shown is the shape, and it is the simulator's own measurement
+    rather than a rebuild.
+
+    `prefix` is the running total of orders accepted into the round so far, so
+    the gap between consecutive rows is that call's contribution."""
+    ext = (data.get("extends") or {}).get(rnd) or {}
+    calls = ext.get("calls") or []
+    if not calls:
+        return ('<div class="dagx"><div class="dagxh">per extend</div>'
+                '<div class="none">no sim-extend point landed in this round '
+                "&mdash; every extend was refused, or none was attempted"
+                "</div></div>")
+    rows = []
+    prev = 0
+    for i, c in enumerate(calls):
+        gained = c["prefix"] - prev
+        prev = c["prefix"]
+        bad = c["status"] != 1
+        dropped = c["orders"] - c["applied"]
+        rows.append(
+            f'<tr{" class=xbad" if bad else ""}>'
+            f'<td class="n m">{i}</td>'
+            f'<td class="n m">{c["orders"]:,}</td>'
+            f'<td class="n m">{c["applied"]:,}'
+            + (f' <span class="dropn">-{dropped}</span>' if dropped > 0 else "")
+            + "</td>"
+            f'<td class="n m">{c["crit"]:,}</td>'
+            f'<td class="n m">{c["iwidth"]:,}</td>'
+            f'<td class="n m">{c["prefix"]:,}'
+            + (f' <span class="dim">+{gained}</span>' if gained else "")
+            + "</td>"
+            f'<td class="n m">{ms(c["body"])}</td>'
+            f'<td class="n m">{ms(c["exec"])}</td>'
+            f'<td class="m">{EXT_STATUS.get(c["status"], c["status"])}</td></tr>')
+    return ('<div class="dagx"><div class="dagxh">per extend &mdash; '
+            f'{len(calls)} accepted call{"" if len(calls) == 1 else "s"}</div>'
+            '<table><tr><th class=n>#</th><th class=n>orders</th>'
+            "<th class=n>applied</th><th class=n>critical path</th>"
+            "<th class=n>start unblocked</th><th class=n>prefix after</th>"
+            "<th class=n>body</th><th class=n>exec</th><th>status</th></tr>"
+            + "".join(rows) + "</table>"
+            '<div class="dagxn">These are the simulator\'s own numbers, one row '
+            "per accepted call, each capped at sixteen orders. They are NOT "
+            "comparable to the round figures above: that graph is the round's "
+            "whole order list at once, this is the same work cut into batches. "
+            "Which orders were in which batch is not recorded anywhere, which "
+            "is why this is a table and not sixteen little graphs. Refused "
+            "extends are missing entirely &mdash; a throttled call never "
+            "reaches the worker and emits no point.</div></div>")
+
+
+def _dag_basis(payload, recorded, source):
+    merged = ("Linear runs are merged into one chain, capped at 64 "
+              "transactions, exactly as the winner-replay path does."
+              if payload["merged"] else
+              "Every order is its own chain, as on the extend path: the "
+              "round-budget verdict can refuse an order that a merged chain's "
+              "worker would already have carried forward.")
+    rec = ""
+    if recorded and recorded.get("promoted"):
+        rec = (" Nothing checks these figures on this round: we WON it, so the "
+               "commit promoted our own block instead of replaying a rival's, "
+               "and the promote path never builds a DAG to measure.")
+    elif recorded and recorded.get("cp") not in (None, "", 0):
+        rec = (" The recorded figures beside them come from <code>sim-commit</code>, "
+               "which is the simulator measuring this same graph as it replayed "
+               f"the winner's {int(recorded['replayed']):,} orders.")
+    elif source != "winner":
+        rec = (" There is nothing to check this against: <code>sim-extend</code> "
+               "reports a critical path per CALL, sixteen orders at a time, not "
+               "for the round's order list as a whole. Switch to "
+               "<b>the winner</b> for a round where the simulator's own number "
+               "is on record.")
+    return ('<div class="dagbasis"><b>How this is built.</b> Edges are the '
+            "conflict edges the simulator uses &mdash; read-after-write and "
+            "write-after-write through the last writer of each account, "
+            "write-after-read through the readers since that write &mdash; "
+            "ported from <code>replay.rs</code>. Account keys come from the "
+            "block with lookup tables already resolved, so the read and write "
+            f"sets are the ones the runtime used. {merged}{rec} "
+            "The x axis is <b>model time in compute units</b>, not wall time: "
+            "a chain costs the sum of its orders' measured CU and the lanes "
+            "run the simulator's own dispatch order, deepest remaining path "
+            "first. Wall time per extend is measured, and lives in the rounds "
+            "tab.</div>")
+
+
+# Drawn in the browser rather than server-side because the interesting part is
+# the playback: the same node changes colour as the clock crosses its dispatch
+# and its finish, and a scrubbed SVG that re-renders locally beats refetching
+# the page for every frame.
+DAG_JS = r"""
+(function(){
+  var el = document.getElementById('dagdata');
+  if(!el) return;
+  var D = JSON.parse(el.textContent);
+  var svg = document.getElementById('dagsvg');
+  var NS = 'http://www.w3.org/2000/svg';
+  var LANE = 17, PADT = 12, PADL = 46, PADR = 16, PADB = 26;
+  var W = 0, H = D.pool * LANE + PADT + PADB;
+  var depOnly = false, t = D.span, playing = false, speed = 1, raf = null;
+
+  var deg = {};
+  D.edges.forEach(function(e){ deg[e[0]] = 1; deg[e[1]] = 1; });
+  function visible(n){ return !depOnly || deg[n.i]; }
+  var loners = D.nodes.filter(function(n){ return !deg[n.i]; }).length;
+  var hint = document.getElementById('daghide');
+  if(hint) hint.textContent = loners
+    ? '\u2014 hides ' + loners + ' with no edge either way'
+    : '\u2014 every order here has an edge';
+
+  function layout(){
+    W = Math.max(svg.clientWidth || 900, 320);
+    svg.setAttribute('viewBox', '0 0 ' + W + ' ' + H);
+    svg.setAttribute('height', H);
+  }
+  function x(v){
+    var span = D.span || 1;
+    return PADL + (W - PADL - PADR) * (v / span);
+  }
+  function y(w){ return PADT + w * LANE + LANE / 2; }
+
+  function state(n){
+    if(t < n.t0) return 'pending';
+    if(t < n.t1) return 'running';
+    return n.s;
+  }
+
+  function draw(){
+    while(svg.firstChild) svg.removeChild(svg.firstChild);
+    layout();
+    var i, n;
+    // lanes
+    for(i = 0; i < D.pool; i++){
+      var ln = document.createElementNS(NS, 'line');
+      ln.setAttribute('x1', PADL); ln.setAttribute('x2', W - PADR);
+      ln.setAttribute('y1', y(i)); ln.setAttribute('y2', y(i));
+      ln.setAttribute('class', 'dlane');
+      svg.appendChild(ln);
+      var tx = document.createElementNS(NS, 'text');
+      tx.setAttribute('x', PADL - 8); tx.setAttribute('y', y(i) + 3);
+      tx.setAttribute('class', 'dlanelbl'); tx.setAttribute('text-anchor', 'end');
+      tx.textContent = 'w' + i;
+      svg.appendChild(tx);
+    }
+    // x ticks, in compute units
+    var span = D.span || 1;
+    for(i = 0; i <= 4; i++){
+      var v = span * i / 4;
+      var tk = document.createElementNS(NS, 'text');
+      tk.setAttribute('x', x(v)); tk.setAttribute('y', H - 8);
+      tk.setAttribute('class', 'dtick');
+      tk.setAttribute('text-anchor', i === 0 ? 'start' : (i === 4 ? 'end' : 'middle'));
+      tk.textContent = (v / 1e6).toFixed(2) + 'M cu';
+      svg.appendChild(tk);
+    }
+    var pos = {};
+    D.nodes.forEach(function(nd){ pos[nd.i] = nd; });
+    // edges first, so nodes sit on top
+    var g = document.createElementNS(NS, 'g');
+    g.setAttribute('class', 'dedges');
+    D.edges.forEach(function(e){
+      var a = pos[e[0]], b = pos[e[1]];
+      if(!a || !b || !visible(a) || !visible(b)) return;
+      var x1 = x(a.t1), y1 = y(a.w), x2 = x(b.t0), y2 = y(b.w);
+      var p = document.createElementNS(NS, 'path');
+      var mx = (x1 + x2) / 2;
+      p.setAttribute('d', 'M' + x1 + ',' + y1 + ' C' + mx + ',' + y1 + ' '
+                     + mx + ',' + y2 + ' ' + x2 + ',' + y2);
+      p.setAttribute('class', 'dedge' + (e[2] ? ' dcrit' : ''));
+      g.appendChild(p);
+    });
+    svg.appendChild(g);
+    for(i = 0; i < D.nodes.length; i++){
+      n = D.nodes[i];
+      if(!visible(n)) continue;
+      var cx = x(n.t0), cy = y(n.w), s = state(n);
+      var shape;
+      if(n.b){
+        shape = document.createElementNS(NS, 'rect');
+        shape.setAttribute('x', cx - 3.5); shape.setAttribute('y', cy - 3.5);
+        shape.setAttribute('width', 7); shape.setAttribute('height', 7);
+      } else {
+        shape = document.createElementNS(NS, 'circle');
+        shape.setAttribute('cx', cx); shape.setAttribute('cy', cy);
+        shape.setAttribute('r', 3.6);
+      }
+      shape.setAttribute('class', 'dn ' + s + (n.c ? ' crit' : ''));
+      var ttl = document.createElementNS(NS, 'title');
+      ttl.textContent = (n.b ? 'bundle ' : 'order ') + n.r
+        + (n.n > 1 ? '  (' + n.n + ' orders merged)' : '')
+        + '\nlane w' + n.w + '   depth ' + n.h + '   blockers ' + n.d
+        + '\n' + n.cu.toLocaleString() + ' cu'
+        + '\nresult: ' + n.s + (n.c ? '\non the critical path' : '');
+      shape.appendChild(ttl);
+      svg.appendChild(shape);
+    }
+    // the playhead
+    if(t < D.span){
+      var ph = document.createElementNS(NS, 'line');
+      ph.setAttribute('x1', x(t)); ph.setAttribute('x2', x(t));
+      ph.setAttribute('y1', PADT - 4); ph.setAttribute('y2', H - PADB + 4);
+      ph.setAttribute('class', 'dplay');
+      svg.appendChild(ph);
+    }
+    var lbl = document.getElementById('dagt');
+    if(lbl) lbl.textContent = t >= D.span ? 't = end'
+      : 't = ' + (t / 1e6).toFixed(2) + 'M cu';
+  }
+
+  var scrub = document.getElementById('dagscrub');
+  scrub.addEventListener('input', function(){
+    playing = false;
+    t = D.span * (scrub.value / 1000);
+    draw();
+  });
+  document.getElementById('dagdep').addEventListener('change', function(e){
+    depOnly = e.target.checked; draw();
+  });
+  document.querySelectorAll('.dagctl [data-act]').forEach(function(b){
+    b.addEventListener('click', function(){
+      var a = b.getAttribute('data-act');
+      if(a === 'start'){ playing = false; t = 0; }
+      else if(a === 'end'){ playing = false; t = D.span; }
+      else { playing = !playing; if(t >= D.span) t = 0; }
+      b.textContent = (a === 'play' && playing) ? '⏸' : b.textContent;
+      scrub.value = 1000 * t / (D.span || 1);
+      draw();
+      if(playing) tick();
+    });
+  });
+  document.querySelectorAll('.dagctl .spd').forEach(function(b){
+    b.addEventListener('click', function(){
+      speed = parseFloat(b.getAttribute('data-spd'));
+      document.querySelectorAll('.dagctl .spd').forEach(function(o){
+        o.classList.toggle('on', o === b);
+      });
+    });
+  });
+  var last = null;
+  function tick(){
+    if(!playing) return;
+    raf = requestAnimationFrame(function(ts){
+      if(last === null) last = ts;
+      var dt = (ts - last) / 1000; last = ts;
+      t += D.span * speed * dt / 6;      // six seconds end to end at 1x
+      if(t >= D.span){ t = D.span; playing = false; }
+      scrub.value = 1000 * t / (D.span || 1);
+      draw();
+      if(playing) tick(); else last = null;
+    });
+  }
+  window.addEventListener('resize', draw);
+  draw();
+})();
+"""
 
 
 # ----------------------------------------- shred path: leader vs simulator
@@ -2633,6 +3543,89 @@ details.errdrop li{margin:2px 0}
   border:1px solid #78350f;background:#78350f22;border-radius:4px;padding:1px 6px}
 .detail .bad{color:#fbbf24}
 
+/* dispatch DAG */
+.dagbar{display:flex;align-items:center;flex-wrap:wrap;gap:5px;
+  padding:8px 0 10px;border-bottom:1px solid #141d27;margin-bottom:10px}
+.dlab{color:#61748b;font-size:10.5px;text-transform:uppercase;
+  letter-spacing:.06em;margin:0 4px 0 10px}
+.dlab:first-child{margin-left:0}
+.dchip{display:inline-block;padding:2px 9px;border:1px solid #223142;
+  border-radius:11px;color:#8fa3ba;font-size:11px;text-decoration:none}
+.dchip:hover{border-color:#2f4459;color:#cfe0f0}
+.dchip.on{background:#16303f;border-color:#2c6b86;color:#7fd8f0}
+.dagsum{width:100%;border-collapse:collapse;margin:2px 0 12px}
+.dagsum td{border:none;border-left:2px solid #1c2836;padding:1px 0 1px 10px;
+  vertical-align:top}
+.dagsum td:first-child{border-left:none;padding-left:0}
+.dagsum b{display:block;font-size:16px;color:#dbe7f3;font-weight:600;
+  font-family:ui-monospace,Menlo,monospace}
+.dagsum span{display:block;color:#61748b;font-size:10.5px;margin-top:1px}
+.dagsum .ok{display:inline;font-size:10.5px;color:#5eead4;font-family:inherit}
+.dagsum .off{color:#fbbf24}
+.dagnote{background:#0e1721;border:1px solid #1d2b3a;border-radius:4px;
+  color:#8fa3ba;font-size:11.5px;padding:6px 10px;margin:0 0 9px}
+.dagnote code{font-family:ui-monospace,Menlo,monospace;color:#a9bed4}
+.dagwarn{background:#22190c;border:1px solid #4a3714;border-radius:4px;
+  color:#e3c07a;font-size:11.5px;padding:6px 10px;margin:0 0 9px}
+.dagwarn code{font-family:ui-monospace,Menlo,monospace;color:#f0d49a}
+.dagctl{display:flex;align-items:center;gap:7px;margin:0 0 6px}
+.dagctl button{background:#131e29;border:1px solid #223142;color:#9db2c8;
+  border-radius:4px;font-size:11px;padding:2px 8px;cursor:pointer;
+  line-height:1.5}
+.dagctl button:hover{border-color:#2f4459;color:#dbe7f3}
+.dagctl .spd{padding:2px 6px;font-size:10px}
+.dagctl .spd.on{background:#16303f;border-color:#2c6b86;color:#7fd8f0}
+.dagctl input[type=range]{flex:1;accent-color:#2c6b86;height:3px}
+.dagt{color:#8fa3ba;font-size:11px;font-family:ui-monospace,Menlo,monospace;
+  min-width:96px;text-align:right}
+.daghint{color:#4d5c70;margin-left:5px}
+.dagdep{color:#61748b;font-size:10.5px;display:flex;align-items:center;gap:4px;
+  cursor:pointer;white-space:nowrap}
+.dagwrap{background:#080e14;border:1px solid #16212c;border-radius:4px;
+  overflow-x:auto;padding:2px 0}
+#dagsvg{width:100%;display:block}
+.dlane{stroke:#141f2a;stroke-width:1}
+.dlanelbl{fill:#4d5c70;font-size:9px;font-family:ui-monospace,Menlo,monospace}
+.dtick{fill:#4d5c70;font-size:9px;font-family:ui-monospace,Menlo,monospace}
+.dedge{fill:none;stroke:#31445a;stroke-width:.5;opacity:.5}
+.dedge.dcrit{stroke:#b6822a;opacity:.85;stroke-width:.9}
+.dplay{stroke:#7fd8f0;stroke-width:1;opacity:.8}
+svg .dn{stroke-width:1}
+svg .dn.pending{fill:#1d2c3b;stroke:#2b4055}
+svg .dn.running{fill:#7fd8f0;stroke:#a9e8f7}
+svg .dn.included{fill:#8fa3ba;stroke:#b3c4d6}
+svg .dn.excluded{fill:#6b4a2c;stroke:#8d6338}
+svg .dn.unknown{fill:#243244;stroke:#35485e}
+svg rect.dn{fill:#3b82c4;stroke:#5ea3e0}
+svg rect.dn.pending{fill:#1e3245;stroke:#2d4a66}
+svg .dn.crit{stroke:#facc15;stroke-width:1.6}
+.daglegend{display:flex;flex-wrap:wrap;gap:14px;padding:8px 2px 0;
+  color:#61748b;font-size:10.5px}
+.daglegend span{display:flex;align-items:center;gap:5px}
+.daglegend i{width:8px;height:8px;border-radius:50%;display:inline-block;
+  border:1px solid}
+.daglegend i.pending{background:#1d2c3b;border-color:#2b4055}
+.daglegend i.running{background:#7fd8f0;border-color:#a9e8f7}
+.daglegend i.included{background:#8fa3ba;border-color:#b3c4d6}
+.daglegend i.excluded{background:#6b4a2c;border-color:#8d6338}
+.daglegend i.unknown{background:#243244;border-color:#35485e}
+.daglegend i.bundlei{background:#3b82c4;border-color:#5ea3e0;border-radius:1px}
+.daglegend i.criti{background:transparent;border-color:#facc15;border-width:2px}
+.dagx{margin:14px 0 0;padding-top:11px;border-top:1px solid #141d27}
+.dagxh{color:#61748b;font-size:10.5px;text-transform:uppercase;
+  letter-spacing:.06em;margin-bottom:6px}
+.dagx table{width:100%;border-collapse:collapse;font-size:11.5px}
+.dagx th{color:#61748b;font-weight:500;text-align:left;padding:3px 9px;
+  border-bottom:1px solid #1e2937}
+.dagx td{padding:3px 9px;border-bottom:1px solid #141d27;color:#a9bed4}
+.dagx th.n,.dagx td.n{text-align:right}
+.dagx tr.xbad td{background:#2a1a0d;color:#e3c07a}
+.dagx .dim{color:#4d5c70}
+.dagxn{color:#61748b;font-size:11px;line-height:1.6;margin-top:8px}
+.dagbasis{color:#61748b;font-size:11px;line-height:1.6;margin:12px 0 0;
+  padding-top:9px;border-top:1px solid #141d27}
+.dagbasis b{color:#8fa3ba;font-weight:600}
+.dagbasis code{font-family:ui-monospace,Menlo,monospace;color:#8fa3ba}
 /* shred-path panel */
 .panel{margin:0 28px 14px;background:#0c141b;border:1px solid #1e2937;
   border-radius:9px;padding:12px 15px 14px}
@@ -3255,7 +4248,8 @@ def reference_page():
 {''.join(out)}
 </body></html>"""
 
-def page(sel_win=None, sel_slot=None, sel_round=None, tab="rounds"):
+def page(sel_win=None, sel_slot=None, sel_round=None, tab="rounds",
+         src="ours"):
     try:
         windows = produced_windows()
     except Exception as exc:
@@ -3284,8 +4278,20 @@ def page(sel_win=None, sel_slot=None, sel_round=None, tab="rounds"):
             f'<a class="tab{" on" if tab == key else ""}" '
             f'href="{base}{"" if key == "rounds" else "&tab=" + key}">{label}</a>'
             for key, label in (("rounds", "rounds"), ("compare", "comparison"),
-                               ("timeline", "timeline"), ("logs", "logs")))
-        if tab == "logs":
+                               ("timeline", "timeline"), ("dag", "dag"),
+                               ("logs", "logs")))
+        if tab == "dag":
+            try:
+                d = slot_data(sel_slot)
+                pick = sel_round if sel_round is not None else (
+                    d["rounds"][0]["round"] if d["rounds"] else 0)
+                inner = dag_html(sel_slot, pick, src, d)
+            except Exception as exc:
+                inner = ('<div class="err">dispatch DAG unavailable: '
+                         f"{html.escape(str(exc))[:160]}</div>")
+            blurb = ("the conflict graph the simulator executes, and how it "
+                     "spreads across the worker lanes.")
+        elif tab == "logs":
             try:
                 d = slot_data(sel_slot)
                 inner = logs_html(sel_slot, d.get("logs"))
@@ -3369,9 +4375,11 @@ class Handler(BaseHTTPRequestHandler):
                 return None
         try:
             tab = qs.get("tab", ["rounds"])[0]
+            src = qs.get("src", ["ours"])[0]
             body = page(as_int("win"), as_int("slot"), as_int("round"),
-                        tab if tab in ("compare", "timeline", "logs") else "rounds"
-                        ).encode()
+                        tab if tab in ("compare", "timeline", "dag", "logs")
+                        else "rounds",
+                        src if src in ("ours", "winner") else "ours").encode()
         except Exception as exc:
             body = f"<pre>{html.escape(str(exc))}</pre>".encode()
         self.send_response(200)

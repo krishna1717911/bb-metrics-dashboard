@@ -331,6 +331,67 @@ with a note that it is a **reporting gap, not a slow node** — a leader's metri
 submission can be intermittent while peers report continuously, and an empty
 cell must not read as a measurement.
 
+### The `dag` tab
+
+The conflict graph the simulator executes, and how it spreads over the worker
+lanes. Pick a round, then whether to graph **our offer** or **the winner**.
+
+The graph is REBUILT, not fetched. `sim-extend` and `sim-commit` record only the
+DAG's shape — `critical_path`, `initial_width`, `exec_pool` — never its nodes or
+edges, so the panel ports `build_stream` out of
+`simulation-service/src/replay.rs`: read-after-write and write-after-write
+edges through the last writer of each account, write-after-read edges through
+the readers since that write. Account keys come from the block with the
+address-lookup tables already resolved, so the read and write sets are the ones
+the runtime used rather than a reconstruction.
+
+The two sources use the two merge modes the simulator itself uses. Winner replay
+coalesces linear runs into one chain, capped at 64 transactions; the extend path
+keeps every order its own chain, because the round-budget verdict can refuse an
+order that a merged chain's worker would already have carried forward.
+
+**The rebuild is scored, not asserted.** On a lost round, `sim-commit` holds the
+critical path and initial width the simulator measured replaying that same
+winning miniblock, and the panel prints them next to the rebuilt figures. On the
+cleanest round measured — slot 440267808 round 0, two refs unresolved — the
+rebuild produced a critical path of 55 against a recorded 55, and an initial
+width of 32 against 33. Where the two diverge, the unresolved count above the
+graph is the reason. On a round we WON there is no comparison at all: the commit
+promotes our own block instead of replaying, and the promote path never builds a
+DAG.
+
+What the graph cannot show, and says so on the page:
+
+- **Foreign bundles.** A bundle arrives as an opaque 32-byte id; its members are
+  only knowable if we received the bundle too, and the builder that won a round
+  usually has bundles we never saw. In the winner graph those orders are absent
+  entirely. In our own offer they are not lost — the transactions are in the
+  row's `signatures` either way — but they appear as separate orders instead of
+  one, so the grouping is wrong even though the edges are real.
+- **Votes** are excluded. On the replay path that matches the simulator exactly:
+  `replayed` is the winner's order count minus the votes billed to `votes_cu`,
+  which is how the two numbers reconcile. On the extend path it is a choice — a
+  vote touches only its own vote account, so it adds width and no depth.
+- **The x axis is model time in compute units, not wall time.** A chain costs
+  the sum of its orders' measured CU, from our own `executed` events, and the
+  lanes run the simulator's dispatch order: deepest remaining path first, which
+  is what `replay.rs` pops off its ready heap. Orders with no `executed` event
+  fall back to a flat 5,000 CU and are counted on the page.
+
+### Per extend
+
+Below the graph, one row per accepted extend with the DAG shape the simulator
+measured for that call — critical path, how many orders started unblocked, and
+the running prefix.
+
+This is a table rather than a graph on purpose. The simulator records the shape
+of each call but never which orders were in it, batches are capped at sixteen,
+and nothing in ClickHouse or InfluxDB ties those sixteen back to identities, so
+a per-extend graph would have to invent its own membership. The round figures
+above and these rows are NOT comparable: one is the round's whole order list at
+once, the other is the same work cut into batches. Refused extends are missing
+entirely — a throttled call never reaches the worker and emits no point.
+
 ## Metrics reference — `/reference`
 
 A page documenting every metric: what it measures, its source field, the amber
