@@ -2145,6 +2145,58 @@ def compare_html(slot, rounds, extends, commits, relay_rounds=None,
             "</div>")
 
 
+def applied_badge(stat):
+    """Orders applied vs dropped by this round's extends.
+
+    Both come from sim-extend and are summed over the round's accepted
+    extends, so the attribution is exact. `orders` is the batch each extend was
+    handed and `applied` is what stuck, so the difference is what the simulator
+    refused to apply -- per-order reasons are not in InfluxDB, only the
+    per-call status, which is what the dropdown carries.
+
+    Note this cannot see extends that were REFUSED outright: a throttled
+    request never reaches the worker and emits no datapoint, so the true
+    offered load was higher than `orders`."""
+    if not stat:
+        return ""
+    orders, applied = stat.get("orders", 0), stat.get("applied", 0)
+    if not orders:
+        return ""
+    dropped = max(0, orders - applied)
+    tip = html.escape(
+        f"{applied:,} of {orders:,} orders were applied across this round's "
+        f"{stat['n']} accepted extends; {dropped:,} were not. Refused extends "
+        f"emit no datapoint at all, so the real offered load was higher than "
+        f"{orders:,}.", quote=True)
+    return (f'<span class="apl{" haddrop" if dropped else ""}" '
+            f'data-tip="{tip}" tabindex="0">'
+            f'<b>{applied:,}</b>/{orders:,} applied'
+            + (f' &middot; <span class="dropn">{dropped:,} dropped</span>'
+               if dropped else "")
+            + "</span>")
+
+
+def extend_errors(stat):
+    """A dropdown of non-SUCCESS extend statuses, only when there are any.
+
+    Sits outside the round row so opening it does not also toggle the round."""
+    if not stat:
+        return ""
+    bad = [(name, n) for name, n in stat.get("statuses", []) if name != "SUCCESS"]
+    if not bad:
+        return ""
+    total = sum(n for _, n in bad)
+    items = "".join(
+        f'<li><span class="sv-err">{html.escape(name)}</span>'
+        f'<span class="dim"> &times;{n:,}</span></li>' for name, n in bad)
+    return ('<details class="errdrop"><summary>'
+            f'{total:,} extend error{"" if total == 1 else "s"}</summary>'
+            f'<ul>{items}</ul>'
+            '<div class="basis">status returned by the simulator per extend '
+            "call; per-order reasons are not recorded in InfluxDB</div>"
+            "</details>")
+
+
 def replay_badge(rnd, commits):
     """What this round had to replay before it could extend.
 
@@ -2267,7 +2319,9 @@ def rounds_html(slot, sel_round):
                else '<span class="noext">0 ext</span>' if not ext_err else "")
             + reward_badge(rnd, r, w, relay_rounds)
             + replay_badge(rnd, commits)
+            + applied_badge(stat)
             + f'<span class="chev">{"&minus;" if open_ else "+"}</span></div>')
+        errdrop = extend_errors(stat)
         detail = ('<div class="detail" data-round="{}"{}>'.format(
                       rnd, "" if open_ else " hidden")
                   + extend_table(stat)
@@ -2280,7 +2334,7 @@ def rounds_html(slot, sel_round):
                           "win_builder") or None,
                       relay_on=bool(RELAY_URL and RELAY_DS_UID))
                   + "</div>")
-        out.append(f'<div class="rndwrap">{summary}{detail}</div>')
+        out.append(f'<div class="rndwrap">{summary}{errdrop}{detail}</div>')
     return "".join(out)
 
 
@@ -2549,6 +2603,21 @@ tr.sv-fatal td:first-child{border-left:3px solid #ef4444}
 .rwd.ahead .pct{color:#5eead4}
 .rwd.behind{border-color:#78350f55;background:#78350f18}
 .rwd.behind .pct{color:#fbbf24}
+.apl{font-size:11px;border:1px solid #22303f;border-radius:5px;padding:1px 8px;
+  color:#9fb2c8;font-family:ui-monospace,Menlo,monospace;cursor:help}
+.apl b{color:#cfe0f0;font-weight:600}
+.apl.haddrop{border-color:#78350f55;background:#78350f18}
+.dropn{color:#fbbf24}
+details.errdrop{margin:0 28px 8px;background:#2a0f0f;border:1px solid #7f1d1d;
+  border-radius:0 0 9px 9px;border-top:none;padding:6px 15px;font-size:11.5px}
+details.errdrop summary{cursor:pointer;color:#f87171;font-weight:600;
+  list-style:none}
+details.errdrop summary::-webkit-details-marker{display:none}
+details.errdrop summary::before{content:"\25B8 ";color:#f87171}
+details.errdrop[open] summary::before{content:"\25BE "}
+details.errdrop ul{margin:7px 0 0;padding-left:18px;color:#cfe0f0;
+  font-family:ui-monospace,Menlo,monospace;font-size:11px}
+details.errdrop li{margin:2px 0}
 .rpl{font-size:11px;border:1px solid #78350f55;background:#78350f18;
   border-radius:5px;padding:1px 8px;color:#fbbf24;cursor:help;
   font-family:ui-monospace,Menlo,monospace}

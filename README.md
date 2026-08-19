@@ -103,6 +103,18 @@ never a sum — selected rows are prefixes of one another. A won round reads
 *own* accepted block and a gap means we kept bidding after the round was
 already decided.
 
+Each round also shows **applied / dropped** — orders the round's extends
+applied against what they were handed, both summed from `sim-extend`, so the
+attribution is exact. Neither number sees extends that were *refused*: a
+throttled request never reaches the worker and emits no datapoint, so the real
+offered load was higher.
+
+When a round had non-SUCCESS extends, a red **error dropdown** appears between
+the row and its detail, listing each status with a count. Per-order drop
+reasons are not available per round — `check_dropped` and `dropped` in
+`bifrost_events` carry `index = 0` on every row, so they are slot-scoped — and
+only the per-call status can be attributed to a round.
+
 Rounds that had to replay also carry a **replay badge** — `replay 34.7 ms ·
 203 orders`. It is commit **N−1** on row N, the same attribution the comparison
 tab uses: commit N applies round N's winner and round N+1 builds on it, so the
