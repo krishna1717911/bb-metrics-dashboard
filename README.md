@@ -103,6 +103,18 @@ never a sum — selected rows are prefixes of one another. A won round reads
 *own* accepted block and a gap means we kept bidding after the round was
 already decided.
 
+Rounds that had to replay also carry a **replay badge** — `replay 34.7 ms ·
+203 orders`. It is commit **N−1** on row N, the same attribution the comparison
+tab uses: commit N applies round N's winner and round N+1 builds on it, so the
+cost gating a round is the previous round's commit, and round 0 has none. It
+appears only when that commit was a real replay, which is exactly when the
+previous round was lost — a promote is a pointer move and says nothing.
+
+That means the badge can sit on a round marked `won` (because the round before
+it was lost) and be absent from one marked `lost` (because the round before it
+was won). It answers "what did this round have to replay before it could
+start", not "what did losing this round cost".
+
 The winner miniblock's last column is **won by**, carrying the actual builder
 id rather than a bare YES/-. Knowing it was not us is rarely the question; who
 took it is. The name comes from the relay when configured, and falls back to

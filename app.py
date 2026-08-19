@@ -2145,6 +2145,35 @@ def compare_html(slot, rounds, extends, commits, relay_rounds=None,
             "</div>")
 
 
+def replay_badge(rnd, commits):
+    """What this round had to replay before it could extend.
+
+    Shows commit N-1, the same attribution the comparison tab uses: commit N
+    applies round N's winner and round N+1 builds on it, so the cost gating
+    round N is the previous round's commit. Round 0 therefore has none -- it
+    builds on the parent bank.
+
+    Only shown when that commit was an actual REPLAY, which is exactly the case
+    where we lost the previous round and had to re-execute someone else's
+    block. A promote is a pointer move at tens of microseconds and says
+    nothing worth a badge."""
+    if rnd == 0:
+        return ""
+    com = (commits or {}).get(rnd - 1)
+    if not com or COMMIT_KIND.get(com["kind"]) != "replay":
+        return ""
+    tip = html.escape(
+        f"Before round {rnd} could extend, round {rnd - 1}'s winning block had "
+        f"to be re-executed on our bank: {com['replayed']:,} orders in "
+        f"{com['body']/1000:.1f} ms. This is the cost of having lost round "
+        f"{rnd - 1}; winning it instead would have made this a promote, which "
+        f"runs in tens of microseconds. Round 0 has no such cost, it builds on "
+        f"the parent bank.", quote=True)
+    return (f'<span class="rpl" data-tip="{tip}" tabindex="0">'
+            f'replay <b>{ms(com["body"])}</b> &middot; {com["replayed"]:,} orders'
+            "</span>")
+
+
 def reward_badge(rnd, r, w, relay_rounds=None):
     """Our best offer against what actually won the round.
 
@@ -2200,6 +2229,7 @@ def rounds_html(slot, sel_round):
         return f'<div class="err">rounds unavailable: {html.escape(str(exc))[:150]}</div>'
     rounds, extends, ext_err = data["rounds"], data["extends"], data["ext_err"]
     relay_rounds = data.get("relay") or {}
+    commits = data.get("commits") or {}
 
     out = []
     if data["shred_err"]:
@@ -2236,6 +2266,7 @@ def rounds_html(slot, sel_round):
                f'{ms(stat["body_sum"])} total extend time</span>' if stat
                else '<span class="noext">0 ext</span>' if not ext_err else "")
             + reward_badge(rnd, r, w, relay_rounds)
+            + replay_badge(rnd, commits)
             + f'<span class="chev">{"&minus;" if open_ else "+"}</span></div>')
         detail = ('<div class="detail" data-round="{}"{}>'.format(
                       rnd, "" if open_ else " hidden")
@@ -2518,6 +2549,10 @@ tr.sv-fatal td:first-child{border-left:3px solid #ef4444}
 .rwd.ahead .pct{color:#5eead4}
 .rwd.behind{border-color:#78350f55;background:#78350f18}
 .rwd.behind .pct{color:#fbbf24}
+.rpl{font-size:11px;border:1px solid #78350f55;background:#78350f18;
+  border-radius:5px;padding:1px 8px;color:#fbbf24;cursor:help;
+  font-family:ui-monospace,Menlo,monospace}
+.rpl b{color:#fdba74;font-weight:600}
 .rwd.ours{border-color:#14b8a655;background:#0f766e22;color:#5eead4}
 .rwd.ours b{color:#5eead4}
 .votes{color:#93c5fd;font-size:11px;border:1px solid #1d4ed855;border-radius:5px;
