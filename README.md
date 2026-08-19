@@ -303,6 +303,38 @@ lands *after* its auction has finished — measured on 439391881 the last commit
 was at +368.6 ms and the slot did not complete until +414.8 ms — so it cannot
 have gated anything.
 
+The grid carries four milestones, ordered by the clock rather than by which
+store they came from, so the row order is the sequence:
+
+| milestone | source | writers |
+|---|---|---|
+| `warmup` | `bifrost_events` | builder only |
+| `sequencing` | `bifrost_events` | builder only |
+| `bank ready` | `bifrost_events` | builder only |
+| `slot complete` | InfluxDB `shred_insert_is_full` | every node that saw the slot |
+| `bank frozen` | InfluxDB `bank_frozen` | every node that saw the slot |
+
+The bottom two are the comparable ones: the leader and our simulator are two
+independent observations of the same event, so the delta between them means
+something. The top three come from our own builder and have **exactly one
+writer** — no validator emits them — so the leader column is `—` and there is no
+delta. The detail cell says "builder only" on each, because an empty cell must
+not read as a gap in someone else's reporting.
+
+`warmup` and `sequencing` are the connector's `leader_state`, which walks
+Inactive → Warmup → Sequencing → Cooldown(slot) with one row per slot per
+identity. Which of the two appears on the parent depends on where the parent
+falls: at a window start the parent is outside the window and only reached
+Warmup, mid-window it is being sequenced and has a `bank ready` of its own.
+
+**The two stores are on different clocks.** `bifrost_events` is ClickHouse and
+the shred stages are InfluxDB, and the two have been measured 899 ms apart on
+one slot and within 5 ms on another. The builder rows are therefore shifted onto
+the InfluxDB clock using the offset measured on `round_committed`, which both
+stores record, and the header states the shift and its spread. If no round of
+the slot was committed in both stores the offset cannot be measured, and the
+header says so rather than silently ordering rows that cannot be ordered.
+
 **`first shred received` is derived, not read from a column.**
 `retransmit-first-shred` looks like the obvious source, but our simulator host
 never writes it — it does not run the retransmit path — so that row was

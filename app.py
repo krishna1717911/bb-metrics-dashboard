@@ -2085,6 +2085,19 @@ HOST_NAME = dict({h: "leader" for h in LEADERS}, **{SIM: "our simulator"})
 SHRED_STAGES = [("shred_insert_is_full", "slot complete"),
                 ("bank_frozen", "bank frozen")]
 
+# The builder's own milestones for the same slot, from bifrost_events rather
+# than InfluxDB. They have exactly ONE writer -- our builder -- so unlike the
+# two above there is no leader column to compare against, and no delta.
+BUILDER_STAGES = [
+    ("warmup", "warmup",
+     "builder only &mdash; leader_state entered Warmup, the run-up before the "
+     "window"),
+    ("sequencing", "sequencing",
+     "builder only &mdash; leader_state reached Sequencing for this slot"),
+    ("bank_ready", "bank ready",
+     "builder only &mdash; the scheduler had a bank and could build on it"),
+]
+
 # "first shred received" is DERIVED, not read from a column.
 #
 # retransmit-first-shred looks like the obvious source, but our simulator host
@@ -2149,6 +2162,66 @@ def slot_shreds(slot, stamps):
     return out
 
 
+def slot_readiness(slot, stamps):
+    """The builder's readiness milestones for this slot AND its parent.
+
+    Two facts, both per SLOT rather than per round, and both from
+    bifrost_events -- which means the ClickHouse clock, so the caller shifts
+    them onto InfluxDB's before showing them next to the per-host stamps:
+
+      bank_ready   the scheduler has a bank for this slot and could start
+                   building on it. Emitted once per slot of the leader window,
+                   carrying window_end and parent_slot, so the window's shape
+                   is recoverable from the row itself.
+      sequencing   the connector's leader_state reached `Sequencing` for this
+                   slot. The state walks Inactive -> Warmup -> Sequencing ->
+                   Cooldown(slot) and a row is written per slot per identity,
+                   so this is the moment this slot was actually being
+                   sequenced rather than merely anticipated. Warmup is kept
+                   too: the gap between them is the run-up.
+
+    Unlike slot complete and bank frozen these have exactly one source. They
+    are OUR builder's view; no validator writes them, so there is no dogo
+    column to put beside them and the panel says so rather than leaving an
+    empty cell that reads like missing data."""
+    if not stamps:
+        return {}
+    pad = dt.timedelta(minutes=10)
+    lo = (dt.datetime.fromisoformat(min(stamps)[:26]) - pad
+          ).strftime("%Y-%m-%d %H:%M:%S")
+    hi = (dt.datetime.fromisoformat(max(stamps)[:26]) + pad
+          ).strftime("%Y-%m-%d %H:%M:%S")
+    want = f"({int(slot) - 1},{int(slot)})"
+    try:
+        _, rows = clickhouse(
+            "SELECT event, toString(ts) AS at, "
+            "  toInt64OrZero(toString(nums['slot'])) AS at_slot, "
+            "  toInt64OrZero(toString(nums['parent_slot'])) AS parent, "
+            "  toInt64OrZero(toString(nums['window_end'])) AS window_end, "
+            "  attrs['leader_state'] AS state, attrs['identity'] AS identity "
+            f"FROM bifrost_events WHERE ts >= '{lo}' AND ts <= '{hi}' "
+            f"  AND instance_id = '{CH_INSTANCE}' "
+            f"  AND nums['slot'] IN {want} "
+            "  AND (event = 'bank_ready' "
+            "       OR (event = 'progress' AND attrs['leader_state'] != 'Inactive')) "
+            "ORDER BY ts")
+    except Exception:
+        return {}
+    out = {}
+    for event, at, at_slot, parent, window_end, state, identity in rows:
+        at_slot = ch_int(at_slot)
+        t = _rfc3339_ns(at[:26].replace(" ", "T"))
+        bucket = out.setdefault(at_slot, {})
+        if event == "bank_ready":
+            bucket["bank_ready"] = {"t": t, "parent": ch_int(parent),
+                                    "window_end": ch_int(window_end)}
+        elif state.startswith("Sequencing"):
+            bucket.setdefault("sequencing", {"t": t, "identity": identity})
+        elif state.startswith("Warmup"):
+            bucket.setdefault("warmup", {"t": t, "identity": identity})
+    return out
+
+
 def with_derived_first_shred(per_slot):
     """Add the derived first-shred stage to a slot's bucket."""
     full = (per_slot or {}).get("shred_insert_is_full") or {}
@@ -2165,7 +2238,8 @@ def with_derived_first_shred(per_slot):
     return out
 
 
-def shred_html(slot, shreds, parent=None):
+def shred_html(slot, shreds, parent=None, ready=None, shift=0,
+               spread=None, anchors=0):
     """A stage x host grid, with the sim-minus-leader delta called out.
 
     Shows the PARENT slot as well, and puts it first, because that is the one
@@ -2207,6 +2281,7 @@ def shred_html(slot, shreds, parent=None):
             f'<tr class="shredgrp"><td colspan="{len(hosts) + 3}">'
             f'parent slot <b>{which}</b>'
             f' <span class="basis">{why}</span></td></tr>')
+        staged = []
         for meas, label in SHRED_STAGES:
             seen = {h: e for h, e in (bucket.get(meas) or {}).items()
                     if h in hosts}
@@ -2232,15 +2307,66 @@ def shred_html(slot, shreds, parent=None):
                    if e.get("num_repaired") else "")
                 for h in hosts
                 if (e := seen.get(h)) and e.get("total_time_ms") is not None)
-            body.append(f"<tr><td class=m>{label}</td>{''.join(cells)}{delta}"
-                        f"<td class='m dim'>{note}</td></tr>")
+            # sort on the leader's stamp when it exists, so the ordering does
+            # not flip about with our own host's reception jitter
+            key = (seen.get(leader) or seen.get(SIM) or
+                   next(iter(seen.values())))["t"]
+            staged.append((key,
+                           f"<tr><td class=m>{label}</td>{''.join(cells)}{delta}"
+                           f"<td class='m dim'>{note}</td></tr>"))
+
+        # The builder's own milestones for the same slot. They sit in the
+        # simulator column because that is the host they belong to, and the
+        # leader column stays empty because no validator writes them -- the
+        # detail cell says so, so an empty cell is never read as a gap.
+        for key, label, why in BUILDER_STAGES:
+            e = ((ready or {}).get(which) or {}).get(key)
+            if not e:
+                continue
+            at = e["t"] + shift
+            cells = []
+            for h in hosts:
+                cells.append(
+                    f"<td class='n m'>{dt.datetime.fromtimestamp(at/1e9, dt.UTC).strftime('%H:%M:%S.%f')[:-3]}</td>"
+                    if h == SIM else "<td class='n m dim'>&mdash;</td>")
+            staged.append((at,
+                           f"<tr class='bstage'><td class=m>{label}</td>"
+                           f"{''.join(cells)}<td class='n m dim'>&mdash;</td>"
+                           f"<td class='m dim'>{why}</td></tr>"))
+        body += [row for _, row in sorted(staged, key=lambda kv: kv[0])]
 
     if not body:
         return ('<div class="panel"><div class="dtlhead">shred path &mdash; leader vs '
                 'our simulator</div><div class="none">neither the leader nor our '
                 "simulator reported the shred path for this slot</div></div>")
+    # The last three rows come from ClickHouse and the rest from InfluxDB, so
+    # they only sit in one column together once the offset between the two
+    # clocks is applied. Say which, because an unstated shift would make the
+    # ordering look like a measurement when it is an alignment.
+    clocknote = ""
+    if any((ready or {}).get(w) for w, _ in groups):
+        if anchors:
+            clocknote = (
+                f'<span class="basis">builder rows shifted {shift / 1e6:+.0f} ms '
+                "onto the InfluxDB clock, measured on <code>round_committed</code>, "
+                f"which both stores record"
+                + (f" (spread {spread:.1f} ms over {anchors} "
+                   f"round{'' if anchors == 1 else 's'})" if spread is not None
+                   else "") + "</span>")
+        else:
+            clocknote = (
+                '<span class="warn">builder rows are NOT clock-shifted &mdash; no '
+                "round of this slot was committed in both stores, so the offset "
+                "could not be measured. The two have been seen 899 ms apart, so "
+                "do not read the builder rows against the host rows</span>")
+
+    def wrote(host):
+        return any(host in per_meas
+                   for per_slot_b in (shreds or {}).values()
+                   for per_meas in per_slot_b.values())
+
     missing = ""
-    if not any(leader in v for v in shreds.values()):
+    if not wrote(leader):
         # A leader's metric submission can be intermittent while peers report
         # continuously, so an empty leader column is a reporting gap rather
         # than evidence of a slow node. Say so, rather than let it read as a
@@ -2248,7 +2374,7 @@ def shred_html(slot, shreds, parent=None):
         missing = ('<span class="warn">the leader wrote no shred metrics for this slot '
                    "&mdash; its submission is intermittent, so this is a gap in "
                    "reporting rather than a slow node</span>")
-    elif not any(SIM in v for v in shreds.values()):
+    elif not wrote(SIM):
         missing = '<span class="note">our simulator host wrote nothing here</span>'
     return ('<div class="panel"><div class="dtlhead">shred path &mdash; leader vs our '
             'simulator, parent slot'
@@ -2256,7 +2382,7 @@ def shred_html(slot, shreds, parent=None):
                if leader else "")
             + '<span class="note">positive delta = our simulator was later &middot; '
             'joined on slot, not on time &middot; our host does not emit '
-            "retransmit-first-shred</span>" + missing + "</div>"
+            "retransmit-first-shred</span>" + missing + clocknote + "</div>"
             f"<table><thead>{head}</thead><tbody>{''.join(body)}</tbody></table></div>")
 
 
@@ -2381,7 +2507,8 @@ def _slot_data_uncached(slot, now):
                "relay": pool.submit(slot_relay, slot, stamps),
                "builder": pool.submit(slot_builder_events, slot, stamps),
                "logs": pool.submit(slot_logs, slot, stamps),
-               "shred": pool.submit(slot_shreds, slot, stamps)}
+               "shred": pool.submit(slot_shreds, slot, stamps),
+               "ready": pool.submit(slot_readiness, slot, stamps)}
     try:
         extends, ext_err = fut["ext"].result(), None
     except Exception as exc:
@@ -2406,11 +2533,15 @@ def _slot_data_uncached(slot, now):
         shreds, shred_err = fut["shred"].result(), None
     except Exception as exc:
         shreds, shred_err = {}, str(exc)[:140]
+    try:
+        ready = fut["ready"].result()
+    except Exception:
+        ready = {}
     data = {"rounds": rounds, "extends": extends, "ext_err": ext_err,
             "commits": commits, "relay": relay_rounds, "builder": builder_ev,
             "logs": logs,
             "relay_err": relay_err,
-            "shreds": shreds, "shred_err": shred_err}
+            "shreds": shreds, "shred_err": shred_err, "ready": ready}
 
     if ext_err is None and shred_err is None:
         with _slot_lock:
@@ -3198,9 +3329,12 @@ def rounds_html(slot, sel_round):
         out.append('<div class="err" style="margin:0 28px 8px">shred path '
                    f"unavailable: {html.escape(data['shred_err'])}</div>")
     else:
+        shift, spread, anchors = builder_offset(data.get("builder"),
+                                                data.get("commits"))
         out.append(shred_html(
             slot, data["shreds"],
-            ((data.get("commits") or {}).get("_context") or {}).get("parent")))
+            ((data.get("commits") or {}).get("_context") or {}).get("parent"),
+            data.get("ready"), shift or 0, spread, anchors))
     if ext_err:
         out.append('<div class="err" style="margin:0 28px 8px">sim-extend '
                    f"unavailable: {html.escape(ext_err)}</div>")
@@ -3543,6 +3677,8 @@ details.errdrop li{margin:2px 0}
   border:1px solid #78350f;background:#78350f22;border-radius:4px;padding:1px 6px}
 .detail .bad{color:#fbbf24}
 
+tr.bstage td{background:#0d1620}
+tr.bstage td:first-child{color:#8fa3ba}
 /* dispatch DAG */
 .dagbar{display:flex;align-items:center;flex-wrap:wrap;gap:5px;
   padding:8px 0 10px;border-bottom:1px solid #141d27;margin-bottom:10px}
@@ -3640,6 +3776,7 @@ tr.shredgrp td{background:#111a24;color:#9fb2c8;font-size:11px;padding:7px 9px;
   border-top:1px solid #1e2937}
 tr.shredgrp b{color:#5eead4;font-family:ui-monospace,Menlo,monospace}
 tr.shredgrp .basis{display:inline;margin-left:8px}
+.dtlhead .basis{display:inline-block;margin-left:10px;margin-top:0}
 .panel .good{color:#5eead4}
 .panel .bad{color:#fbbf24}
 .panel .none{color:#4d5c70;font-size:12px;padding:6px 0 0}
