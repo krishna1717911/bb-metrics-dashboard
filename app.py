@@ -437,7 +437,13 @@ def produced_windows(days=30):
     _, rows = clickhouse(
         "SELECT slot, toString(min(ts)) AS first_ts, any(connector_identity) AS leader, "
         "       max(won_by_us) AS won, countIf(kind = 'selected') AS offers, "
-        "       any(run_id) AS run_id "
+        "       any(run_id) AS run_id, "
+        # A slot is several auction rounds and we can take some and lose the
+        # rest, so "did we win this slot" throws the interesting part away:
+        # over 7 days the slots we won at all ranged from 1 round to all 8.
+        # One `winner` row per round, `won_by_us` on the ones we produced.
+        "       countIf(kind = 'winner') AS rounds, "
+        "       countIf(kind = 'winner' AND won_by_us) AS won_rounds "
         "FROM bifrost_miniblocks "
         f"WHERE ts > now() - INTERVAL {int(days)} DAY "
         f"  AND local_builder_id = '{CH_BUILDER}' "
@@ -448,7 +454,9 @@ def produced_windows(days=30):
         win = windows.setdefault(window_of(slot),
                                  {"win": window_of(slot), "slots": [], "leaders": set()})
         win["slots"].append({"slot": slot, "ts": r[1], "won": r[3] in TRUEISH,
-                             "offers": ch_int(r[4])})
+                             "offers": ch_int(r[4]),
+                             "rounds": ch_int(r[6]) if len(r) > 6 else 0,
+                             "won_rounds": ch_int(r[7]) if len(r) > 7 else 0})
         if r[2]:
             win["leaders"].add(r[2])
         if len(r) > 5 and r[5]:
@@ -458,6 +466,8 @@ def produced_windows(days=30):
         win["slots"].sort(key=lambda s: s["slot"])
         win["ts"] = min(s["ts"] for s in win["slots"])
         win["won"] = sum(1 for s in win["slots"] if s["won"])
+        win["rounds"] = sum(s["rounds"] for s in win["slots"])
+        win["won_rounds"] = sum(s["won_rounds"] for s in win["slots"])
         leaders = sorted(win.pop("leaders"))
         # one leader per window is the invariant; surface a violation rather than
         # silently picking one with any().
@@ -3531,6 +3541,11 @@ a.runjump.cold{border-color:#78350f;color:#fbbf24}
   box-shadow:0 10px 30px #000a;pointer-events:none;white-space:normal}
 .chip.won{border-color:#14b8a655;background:#0f1c1f}
 .chip.won .tag{color:#5eead4}
+.chip .tag .allc{color:#5eead4;font-weight:600}
+.chip .tag .okc{color:#5eead4}
+.chip .tag .lostc{color:#5b6b80}
+.chip .tag .dimc{color:#46566b}
+.dimc{color:#5b6b80}
 .chip.won:hover{border-color:#5eead4}
 .chip.on .tag{color:#c8fff7}
 
@@ -4150,6 +4165,24 @@ NAV_JS = r"""
 """
 
 
+def rounds_tag(entry):
+    """"won" is per ROUND, so say how many.
+
+    A slot runs several auction rounds and each is won or lost on its own, so
+    "we produced this slot" collapsed a slot where we took one round of eight
+    into the same label as one where we took all eight -- and measured over
+    seven days both really happen. The denominator is the rounds the relay
+    echoed a winner for, which is what there was to win."""
+    won, total = entry.get("won_rounds", 0), entry.get("rounds", 0)
+    if not total:
+        # we competed, but the relay never echoed a winner for any round
+        return '<span class="dimc">no rounds echoed</span>'
+    if not won:
+        return '<span class="lostc">0/%d rounds</span>' % total
+    cls = "allc" if won == total else "okc"
+    return '<span class="%s">%d/%d rounds</span>' % (cls, won, total)
+
+
 def strip_html(windows, sel_win, sel_slot):
     """One chip per leader window, newest at the left."""
     # The strip is newest-first, so a chip whose run differs from the chip to
@@ -4170,7 +4203,8 @@ def strip_html(windows, sel_win, sel_slot):
         return (f'<a class="{cls}" href="{href}" '
                 f'title="{html.escape(w["ts"][:19])} UTC &mdash; leader '
                 f'{html.escape(w["leader"])} &mdash; '
-                f'{w["won"]}/{len(w["slots"])} slots won &mdash; run '
+                f'{w["won_rounds"]}/{w["rounds"]} rounds won across '
+                f'{w["won"]}/{len(w["slots"])} slots &mdash; run '
                 f'{html.escape(w["run_id"] or "?")}'
                 + (f' started {html.escape((w.get("run_started") or "")[:19])} '
                    f'UTC, {w.get("run_slots", 0)} slots'
@@ -4190,15 +4224,20 @@ def strip_html(windows, sel_win, sel_slot):
                 + (f'<span class="coldpill" tabindex="0" data-tip="{cold_why(w)}"'
                    f">cold</span>" if w.get("run_cold") else "")
                 + "</div>"
-                f'<div class="tag">{w["won"]}/{len(w["slots"])} won</div></a>')
+                + f'<div class="tag">{rounds_tag(w)}</div></a>')
 
     chips = "".join(chip(w) for w in windows)
     slots = sum(len(w["slots"]) for w in windows)
     won = sum(w["won"] for w in windows)
+    # Rounds first, slots second: a bare "27 won" was slots, which reads
+    # like 27 whole blocks when most of those slots were one round of eight.
+    won_rounds = sum(w.get("won_rounds", 0) for w in windows)
+    rounds = sum(w.get("rounds", 0) for w in windows)
     leaders = len({w["leader"] for w in windows if w["leader"]})
     return (f'<div class="striphead"><span class="cap">leader windows</span>'
             f'<span class="sub">{len(windows)} windows &middot; {slots} slots contested '
-            f'&middot; <b class="okc">{won} won</b> &middot; {leaders} leaders '
+            f'&middot; <b class="okc">{won_rounds:,}/{rounds:,} rounds won</b>'
+            f'<span class="dimc"> across {won} slots</span> &middot; {leaders} leaders '
             f'&middot; last 30d on <code>{CH_BUILDER}</code></span>'
             f'<span class="hint">newest at the left &mdash; scroll right for older</span>'
             f'</div>{runbar(seen_runs)}<div class="strip">{chips}</div>'
@@ -4243,14 +4282,15 @@ def window_html(windows, sel_win, sel_slot):
                 f'<div class="slot">{s["slot"]}{copy_btn(s["slot"])}</div>'
                 f'<div class="ageline">+{s["slot"] - sel_win} &middot; '
                 f'{age_html(s["ts"])}</div>'
-                f'<div class="tag">{"we produced" if s["won"] else "lost"} '
+                + f'<div class="tag">{rounds_tag(s)} '
                 f'&middot; {s["offers"]} offers</div></a>')
 
     return (f'<div class="winbar"><span class="cap hascp">window {sel_win}'
             f'{copy_btn(sel_win)}</span>'
             f'<span class="sub">slots {sel_win}&ndash;{sel_win + WINDOW - 1} &middot; '
             f'{len(win["slots"])} contested &middot; '
-            f'<b class="okc">{win["won"]} won</b>'
+            f'<b class="okc">{win["won_rounds"]}/{win["rounds"]} rounds won</b>'
+            f'<span class="dimc"> across {win["won"]}/{len(win["slots"])} slots</span>'
             + (f' &middot; <span class="warn">{missing} with no offers from us</span>'
                if missing else "")
             + f'</span><span class="sub hascp">leader '

@@ -63,7 +63,22 @@ window and selects it — a window chip labelled only `440027604` is unfindable
 when the number you are holding is `440027606`.
 
 Each chip carries the window's first slot, a **live-ticking age**, the leader
-identity, the **`run_id`** that served it, and `N/4 won`.
+identity, the **`run_id`** that served it, and **how many rounds we won**.
+
+**Rounds, not slots.** A slot is several auction rounds and each is won or lost
+on its own, so `N/4 won` — slots we produced — hid the interesting half:
+measured over seven days, the slots we won at all ranged from one round of eight
+to all eight. Window 440354548 read as `2/4 won` when it was really **4 of 32
+rounds**, one slot taking three and another taking one. So a window chip now
+reads `4/32 rounds`, a slot chip `3/8 rounds`, and the slot count survives in
+the chip's hover title and beside the window bar.
+
+The denominator is the rounds the relay **echoed a winner for**, which is what
+there was to win. It is scoped to slots we competed in, the same scope as the
+rest of the strip — over 30 days that is 25,414 rounds, against 25,520 across
+every slot seen; the 106-round difference is 18 slots we never offered into at
+all. A slot that was contested but where the relay echoed no winner for any
+round reads `no rounds echoed` rather than `0/0`.
 
 A **run bar** above the strip lists every builder run in view, newest first,
 and jumps to the window where it began. Each of those windows is marked with an
