@@ -3679,6 +3679,7 @@ details.errdrop li{margin:2px 0}
 
 tr.bstage td{background:#0d1620}
 tr.bstage td:first-child{color:#8fa3ba}
+#view.loading{opacity:.45;transition:opacity .12s ease-in 80ms}
 /* dispatch DAG */
 .dagbar{display:flex;align-items:center;flex-wrap:wrap;gap:5px;
   padding:8px 0 10px;border-bottom:1px solid #141d27;margin-bottom:10px}
@@ -3804,8 +3805,11 @@ tr.shredgrp .basis{display:inline;margin-left:8px}
 TICK_JS = """
 (function(){
   var skew = __SERVER_NOW__ * 1000 - Date.now();   // server clock minus ours
-  var nodes = [].slice.call(document.querySelectorAll('.age[data-t]'));
-  if (!nodes.length) return;
+  var nodes = [];
+  // Re-scanned rather than captured once: swapping the panel replaces these
+  // nodes, and a captured list would keep ticking elements no longer on screen.
+  function rescan(){ nodes = [].slice.call(document.querySelectorAll('.age[data-t]')); }
+  window.__simbenchAges = function(){ rescan(); tick(); };
   function fmt(s){
     if (s < 0) return 'now';
     var d = Math.floor(s/86400), h = Math.floor(s%86400/3600),
@@ -3816,6 +3820,7 @@ TICK_JS = """
     return sec+'s';
   }
   function tick(){
+    if (!nodes.length) rescan();
     var now = (Date.now() + skew) / 1000;
     for (var i = 0; i < nodes.length; i++){
       var n = nodes[i], suffix = n.dataset.suffix;
@@ -3826,8 +3831,9 @@ TICK_JS = """
       n.textContent = fmt(Math.floor(now - (+n.dataset.t))) + suffix;
     }
   }
+  rescan();
   tick();
-  setInterval(tick, 1000);
+  setInterval(function(){ rescan(); tick(); }, 1000);
   // a backgrounded tab throttles timers; resync the moment it comes back
   document.addEventListener('visibilitychange', function(){
     if (!document.hidden) tick();
@@ -3977,6 +3983,173 @@ TICK_JS = """
 """
 
 
+# Within one leader window the header, the 30-day strip and the window bar are
+# identical for all four slots and all five tabs -- only the panel below them
+# changes. So a click there re-fetches just that panel and swaps it in, and the
+# other nineteen combinations are pulled in the background afterwards. Once the
+# window is warm, moving between its slots and tabs costs nothing.
+#
+# The links stay real hrefs and the handler still serves the whole page, so
+# with JavaScript off, or if a fetch fails, navigation simply falls back to
+# what it always did.
+NAV_JS = r"""
+(function(){
+  var view = document.getElementById('view');
+  if (!view || !window.fetch || !window.history || !history.pushState) return;
+
+  var cache = new Map();          // url -> html of #view
+  var inflight = new Map();       // url -> promise, so a click never duplicates
+                                  // a prefetch already in the air
+  var current = location.pathname + location.search;
+  cache.set(key(current), view.innerHTML);
+
+  function key(u){
+    // `round` only opens a row, which is done in the DOM, so two URLs that
+    // differ by it share one rendering.
+    try {
+      var url = new URL(u, location.origin);
+      url.searchParams.delete('round');
+      return url.pathname + '?' + url.searchParams.toString();
+    } catch (e) { return u; }
+  }
+  function sameWindow(u){
+    try {
+      var a = new URL(u, location.origin), b = new URL(location.href);
+      return a.pathname === b.pathname &&
+             a.searchParams.get('win') === b.searchParams.get('win') &&
+             a.searchParams.get('win') !== null;
+    } catch (e) { return false; }
+  }
+  function fetchView(u){
+    var k = key(u);
+    if (cache.has(k)) return Promise.resolve(cache.get(k));
+    if (inflight.has(k)) return inflight.get(k);
+    var sep = u.indexOf('?') === -1 ? '?' : '&';
+    var p = fetch(u + sep + 'partial=1', {headers: {'X-Partial': '1'}})
+      .then(function(r){
+        if (!r.ok) throw new Error('http ' + r.status);
+        return r.text();
+      })
+      .then(function(html){ cache.set(k, html); inflight.delete(k); return html; })
+      .catch(function(err){ inflight.delete(k); throw err; });
+    inflight.set(k, p);
+    return p;
+  }
+
+  // innerHTML never runs a <script>, and the DAG panel ships one. Re-create
+  // them so the panel wires itself up exactly as it does on a full load.
+  function runScripts(root){
+    var list = [].slice.call(root.querySelectorAll('script'));
+    for (var i = 0; i < list.length; i++){
+      var old = list[i];
+      if (old.type && old.type !== 'text/javascript') continue;   // JSON payloads
+      var s = document.createElement('script');
+      if (old.src) s.src = old.src; else s.textContent = old.textContent;
+      old.parentNode.replaceChild(s, old);
+    }
+  }
+
+  function markSelection(u){
+    var slot = new URL(u, location.origin).searchParams.get('slot');
+    document.querySelectorAll('.winbar ~ .strip .chip.sm[data-slot]')
+      .forEach(function(c){
+        c.classList.toggle('on', c.dataset.slot === slot);
+      });
+  }
+
+  function show(u, push){
+    return fetchView(u).then(function(html){
+      view.innerHTML = html;
+      runScripts(view);
+      markSelection(u);
+      if (window.__simbenchAges) window.__simbenchAges();
+      var slot = new URL(u, location.origin).searchParams.get('slot');
+      document.title = 'simbench' + (slot ? ' · slot ' + slot : '');
+      if (push) history.pushState({v: 1}, '', u);
+      current = u;
+      view.classList.remove('loading');
+    }).catch(function(){
+      // one failure and we stop pretending: hand the click back to the browser
+      window.location.href = u;
+    });
+  }
+
+  document.addEventListener('click', function(ev){
+    if (ev.defaultPrevented || ev.button || ev.metaKey || ev.ctrlKey ||
+        ev.shiftKey || ev.altKey) return;
+    if (ev.target.closest('.cp')) return;               // copy buttons
+    var a = ev.target.closest('a');
+    if (!a || a.target || a.hasAttribute('download')) return;
+    var href = a.getAttribute('href');
+    if (!href || href.charAt(0) !== '/') return;
+    var isSlot = !a.closest('.tabs') && !!a.closest('.winbar ~ .strip');
+    if (!isSlot && !a.closest('.tabs')) return;
+    if (!sameWindow(href)) return;
+    // A slot chip is rendered without a tab, so following it verbatim would
+    // drop whoever is on the dag tab back to rounds every time they step to
+    // the next slot. Carry the current tab across instead: the point of this
+    // is moving freely in both directions.
+    if (isSlot) {
+      try {
+        var t = new URL(href, location.origin), now = new URL(location.href);
+        // The hrefs were rendered when some other slot was selected, and the
+        // selected chip's own href deliberately drops `slot`. After a swap
+        // that stale href would navigate to "no slot selected", so the chip's
+        // identity comes from data-slot, which is always right.
+        if (a.dataset.slot) t.searchParams.set('slot', a.dataset.slot);
+        if (!t.searchParams.get('tab') && now.searchParams.get('tab')) {
+          t.searchParams.set('tab', now.searchParams.get('tab'));
+          if (now.searchParams.get('src'))
+            t.searchParams.set('src', now.searchParams.get('src'));
+        }
+        href = t.pathname + '?' + t.searchParams.toString();
+      } catch (e) { /* fall through with the literal href */ }
+    }
+    ev.preventDefault();
+    if (key(href) === key(current)) return;
+    if (!cache.has(key(href))) view.classList.add('loading');
+    show(href, true);
+  });
+
+  window.addEventListener('popstate', function(){
+    show(location.pathname + location.search, false);
+  });
+
+  // Warm the rest of the window: every tab of every slot in it. Two at a time
+  // and only once the page is idle, so the view the user is actually looking
+  // at never waits behind a prefetch.
+  var TABS = ['', 'compare', 'timeline', 'dag', 'logs'];
+  function prefetchAll(){
+    var here = new URL(location.href);
+    var win = here.searchParams.get('win');
+    if (!win) return;
+    var slots = [].slice.call(
+      document.querySelectorAll('.winbar ~ .strip .chip.sm[data-slot]'))
+      .map(function(c){ return c.dataset.slot; });
+    var queue = [];
+    slots.forEach(function(s){
+      TABS.forEach(function(t){
+        queue.push('/?win=' + win + '&slot=' + s + (t ? '&tab=' + t : ''));
+      });
+    });
+    queue = queue.filter(function(u){ return !cache.has(key(u)); });
+    var active = 0;
+    function pump(){
+      while (active < 2 && queue.length){
+        active++;
+        fetchView(queue.shift())
+          .catch(function(){})
+          .then(function(){ active--; pump(); });
+      }
+    }
+    pump();
+  }
+  if ('requestIdleCallback' in window) requestIdleCallback(prefetchAll, {timeout: 2500});
+  else setTimeout(prefetchAll, 1200);
+})();
+"""
+
+
 def strip_html(windows, sel_win, sel_slot):
     """One chip per leader window, newest at the left."""
     # The strip is newest-first, so a chip whose run differs from the chip to
@@ -4066,7 +4239,7 @@ def window_html(windows, sel_win, sel_slot):
         on = s["slot"] == sel_slot
         href = f"/?win={sel_win}" if on else f"/?win={sel_win}&slot={s['slot']}"
         cls = "chip sm" + (" on" if on else "") + (" won" if s["won"] else "")
-        return (f'<a class="{cls}" href="{href}">'
+        return (f'<a class="{cls}" href="{href}" data-slot="{s["slot"]}">'
                 f'<div class="slot">{s["slot"]}{copy_btn(s["slot"])}</div>'
                 f'<div class="ageline">+{s["slot"] - sel_win} &middot; '
                 f'{age_html(s["ts"])}</div>'
@@ -4386,23 +4559,31 @@ def reference_page():
 </body></html>"""
 
 def page(sel_win=None, sel_slot=None, sel_round=None, tab="rounds",
-         src="ours"):
-    try:
-        windows = produced_windows()
-    except Exception as exc:
-        strip = (f'<div class="err">produced-window list unavailable: '
-                 f"{html.escape(str(exc))[:160]}</div>")
-        windows = []
+         src="ours", partial=False):
+    # A partial serves only the panel, so the 30-day strip -- the expensive
+    # half of this page -- is not built at all.
+    strip, windows = "", []
+    if partial:
+        if sel_slot is not None and sel_win is None:
+            sel_win = window_of(sel_slot)
     else:
-        if not windows:
-            strip = '<div class="err">no produced slots in the last 30 days</div>'
+        try:
+            windows = produced_windows()
+        except Exception as exc:
+            strip = (f'<div class="err">produced-window list unavailable: '
+                     f"{html.escape(str(exc))[:160]}</div>")
+            windows = []
         else:
-            if sel_slot is not None and sel_win is None:
-                sel_win = window_of(sel_slot)
-            strip = strip_html(windows, sel_win, sel_slot)
-            # people walk a whole leader window, so warm its other slots in
-            # the background as soon as the window is known
-            warm_window(sel_win, skip=sel_slot)
+            if not windows:
+                strip = ('<div class="err">no produced slots in the last 30 '
+                         "days</div>")
+            else:
+                if sel_slot is not None and sel_win is None:
+                    sel_win = window_of(sel_slot)
+                strip = strip_html(windows, sel_win, sel_slot)
+                # people walk a whole leader window, so warm its other slots in
+                # the background as soon as the window is known
+                warm_window(sel_win, skip=sel_slot)
 
     if sel_slot is None:
         note = ("Pick a leader window above, then a slot inside it."
@@ -4465,6 +4646,10 @@ def page(sel_win=None, sel_slot=None, sel_round=None, tab="rounds",
         body = (f'<div class="slotbar hascp">slot <b>{sel_slot}</b>'
                 f"{copy_btn(sel_slot)} &mdash; {blurb}</div>"
                 f'<div class="tabs">{tabs}</div>{inner}')
+    # Inside a window the header, the strip and the window bar are the same
+    # for every slot and every tab, so only this much travels on a click.
+    if partial:
+        return body
     title = f" &middot; slot {sel_slot}" if sel_slot else \
             f" &middot; window {sel_win}" if sel_win else ""
     return f"""<!doctype html><html><head><meta charset="utf-8">
@@ -4482,8 +4667,9 @@ def page(sel_win=None, sel_slot=None, sel_round=None, tab="rounds",
 </header>
 {health_html()}
 {strip}
-{body}
+<div id="view">{body}</div>
 <script>{TICK_JS.replace("__SERVER_NOW__", f"{dt.datetime.now(dt.UTC).timestamp():.3f}")}</script>
+<script>{NAV_JS}</script>
 </body></html>"""
 
 
@@ -4516,7 +4702,8 @@ class Handler(BaseHTTPRequestHandler):
             body = page(as_int("win"), as_int("slot"), as_int("round"),
                         tab if tab in ("compare", "timeline", "dag", "logs")
                         else "rounds",
-                        src if src in ("ours", "winner") else "ours").encode()
+                        src if src in ("ours", "winner") else "ours",
+                        partial=qs.get("partial", ["0"])[0] == "1").encode()
         except Exception as exc:
             body = f"<pre>{html.escape(str(exc))}</pre>".encode()
         self.send_response(200)

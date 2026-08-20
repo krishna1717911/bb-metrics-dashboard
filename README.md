@@ -470,6 +470,45 @@ band at all. Either it is a p50 target we barely meet, or it is stale.
 
 ## Performance
 
+### Moving inside a window costs nothing
+
+Within one leader window the header, the 30-day strip and the window bar are
+identical for all four slots and all five tabs — only the panel below them
+changes. That panel is the small half of the page:
+
+| tab | whole page | panel alone |
+|---|---|---|
+| rounds | 782 KB | 41 KB |
+| comparison | 748 KB | 7 KB |
+| timeline | 756 KB | 15 KB |
+| dag | 772 KB | 32 KB |
+| logs | 742 KB | 0.8 KB |
+
+So a click on a slot chip or a tab fetches `?partial=1`, which renders the panel
+and nothing else, and swaps it into `#view`. Once the page is idle the remaining
+nineteen combinations — every tab of every slot in the window — are pulled two
+at a time in the background. After that, moving anywhere inside the window
+issues **zero** network requests and does not reload.
+
+Three details that make it behave rather than merely work:
+
+- **Scripts are re-run on swap.** `innerHTML` never executes a `<script>`, and
+  the dag panel ships one, so the swapped subtree's scripts are re-created as
+  fresh elements. Most other behaviour — tooltips, copy buttons, expanding a
+  round — is on delegated document-level listeners and survives untouched. The
+  live age ticker re-scans instead of holding a captured node list, which would
+  otherwise keep ticking elements no longer on screen.
+- **Slot identity comes from `data-slot`, not the href.** Chip hrefs are
+  rendered server-side and the selected chip's own href deliberately omits
+  `slot`; after a swap that stale href would navigate to "no slot selected".
+- **The current tab carries across a slot switch.** A slot chip is rendered
+  without a tab, so following it verbatim would drop you from `dag` back to
+  `rounds` on every step. The point is moving freely in both directions.
+
+The links stay real hrefs and the server still returns the whole page for any of
+them, so with JavaScript off — or if a fetch fails, where the handler falls back
+to a normal navigation — this degrades to exactly what it did before.
+
 Opening a slot, or merely expanding a leader window, warms the window's other
 slots in the background. A window is the unit people actually inspect — you
 open one slot and then walk the other three — so those clicks become cache hits
