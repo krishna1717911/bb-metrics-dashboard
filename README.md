@@ -383,6 +383,44 @@ cell must not read as a measurement.
 The conflict graph the simulator executes, and how it spreads over the worker
 lanes. Pick a round, then whether to graph **our offer** or **the winner**.
 
+**Our own offer is read, not rebuilt.** A `selected` payload is a wincode
+`WireMiniblock`, and it carries the builder's dependency graph in CSR form:
+`row_offsets`/`col_indices` for the edges, and a node list with each node's
+remaining-path `depth`. So for our own offers nothing is inferred — the panel
+decodes the payload and draws what the builder planned.
+
+This replaced a rebuild that was **wrong**. The old version took its order from
+the row's `signatures` array, which is *not* wire order: `miniblock_recording.rs`
+builds it by walking `orders.txs` and then every bundle's txs, i.e. the order the
+BYTES were supplied in, with all bundle members appended at the end. A conflict
+DAG is sequence-dependent — last-writer and readers-since-write both are — so
+the wrong sequence produced the wrong edges. Only `graph.nodes` has the real
+order. On slot 440266475 round 0 the difference is not subtle: the rebuild
+claimed 74 orders with a critical path of 47, the recorded graph has **453 nodes,
+441 edges and a critical path of 52**.
+
+The decode is checked against every `selected` row of a slot: node count equals
+the `order_count` column, `row_offsets` is nodes+1 long, uuid/slot/index/reward
+match their columns, tx and bundle counts match theirs, every edge points
+forward, `depth` reproduces as the remaining-path height, and the payload is
+consumed to the last byte. Only `payload_version` 0 is decoded; anything else is
+refused rather than guessed at.
+
+Two things fall out of reading the payload instead of the block. Bundles are no
+longer opaque — their member transactions are in the payload — and no RPC call
+is needed at all, so orders that never landed on chain are still in the graph.
+
+Votes stay in as nodes, because dropping one would renumber the CSR. They are
+counted above the graph, and since a vote touches only its own vote account
+every one of them starts unblocked with no edges — **only orders with a
+dependency** hides them (372 of 453 on that round).
+
+### The winner's graph is rebuilt
+
+A `WireChosenMiniblock` carries a flat `Vec<NodeOrderRef>` and no CSR, so the
+winner's edges have to be recomputed. That is where the reconstruction, and the
+`sim-commit` scoring below, still apply.
+
 The graph is REBUILT, not fetched. `sim-extend` and `sim-commit` record only the
 DAG's shape — `critical_path`, `initial_width`, `exec_pool` — never its nodes or
 edges, so the panel ports `build_stream` out of

@@ -21,6 +21,7 @@ import json
 import os
 import re
 import socket
+import struct
 import threading
 import time
 import urllib.error
@@ -1576,7 +1577,6 @@ def _decode_refs(payload):
     """Winner payload: a 55-byte header, then [u32 tag][body] order refs, then
     16 bytes of zero padding. tag 0 is a 16-byte SigPrefix, tag 1 a raw 32-byte
     bundle id."""
-    import struct
     off, refs = 55, []
     while off + 4 <= len(payload):
         tag = struct.unpack("<I", payload[off:off + 4])[0]
@@ -1588,25 +1588,236 @@ def _decode_refs(payload):
     return refs
 
 
+# --------------------------------------------- our own offer, as recorded
+#
+# A `selected` payload is a wincode WireMiniblock, and it carries the builder's
+# OWN dependency graph -- so for our own offers there is nothing to rebuild.
+#
+#   reward           Option<u64>              1-byte tag, then 8 if Some
+#   execution_cost   Option<u64>              same
+#   graph            WireMiniBlockGraph
+#     slot           u64
+#     index_in_slot  u32
+#     uuid           16 bytes
+#     row_offsets    Vec<u32>                 u64 count, then count * 4
+#     col_indices    Vec<u32>                 u64 count, then count * 4
+#     nodes          Vec<CsrNode>             u64 count, then count *
+#                                             (u32 tag, 16|32 ref, u32 depth)
+#   orders           BuilderOriginatedOrders
+#     txs            Vec<WireSharableTx>      u64 count, each u64 len then bytes
+#     bundles        Vec<WireSharableBundle>  u64 count, each 32-byte id then Vec<tx>
+#
+# Node i's successors are col_indices[row_offsets[i]..row_offsets[i+1]], and an
+# edge i -> s means i must land before s is ready. `depth` is the remaining-path
+# height: 1 for a sink, 1 + max(successor depth) otherwise.
+#
+# WHY THIS REPLACED A REBUILD. The old "ours" graph took its order from the
+# row's `signatures` array, which is NOT wire order: miniblock_recording.rs
+# builds it by walking `orders.txs` and then every bundle's txs, i.e. the order
+# the BYTES were supplied in, with all bundle members appended at the end. A
+# conflict DAG is sequence-dependent -- last-writer and readers-since-write both
+# are -- so feeding it the wrong sequence produced the wrong edges. Only
+# graph.nodes has the real order, and the CSR beside it has the real edges, so
+# the rebuild was both unnecessary and wrong.
+#
+# Validated on every `selected` row of a slot: node count equals the
+# `order_count` column, row_offsets is nodes+1 long, uuid/slot/index/reward
+# match their columns, tx and bundle counts match theirs, every edge points
+# forward, `depth` reproduces as the remaining-path height, and the payload is
+# consumed to the last byte with nothing left over.
+
+
+class _Wire:
+    """Little-endian cursor. wincode writes a Vec as a u64 count then items."""
+
+    def __init__(self, buf):
+        self.b, self.o = buf, 0
+
+    def u8(self):
+        v = self.b[self.o]
+        self.o += 1
+        return v
+
+    def u32(self):
+        v = struct.unpack_from("<I", self.b, self.o)[0]
+        self.o += 4
+        return v
+
+    def u64(self):
+        v = struct.unpack_from("<Q", self.b, self.o)[0]
+        self.o += 8
+        return v
+
+    def take(self, n):
+        v = self.b[self.o:self.o + n]
+        if len(v) != n:
+            raise ValueError("payload ended early")
+        self.o += n
+        return v
+
+    def opt_u64(self):
+        return self.u64() if self.u8() else None
+
+
+def decode_selected(payload):
+    r = _Wire(payload)
+    out = {"reward": r.opt_u64(), "execution_cost": r.opt_u64(),
+           "slot": r.u64(), "index_in_slot": r.u32(), "uuid": r.take(16).hex()}
+    out["row_offsets"] = [r.u32() for _ in range(r.u64())]
+    out["col_indices"] = [r.u32() for _ in range(r.u64())]
+    nodes = []
+    for _ in range(r.u64()):
+        tag = r.u32()
+        size = {0: 16, 1: 32}.get(tag)
+        if size is None:
+            raise ValueError(f"unknown CsrNode tag {tag}")
+        ref = r.take(size)
+        nodes.append({"kind": "tx" if tag == 0 else "bundle", "ref": ref,
+                      "depth": r.u32()})
+    out["nodes"] = nodes
+    out["txs"] = [r.take(r.u64()) for _ in range(r.u64())]
+    bundles = []
+    for _ in range(r.u64()):
+        bid = r.take(32)
+        bundles.append({"id": bid, "txs": [r.take(r.u64()) for _ in range(r.u64())]})
+    out["bundles"] = bundles
+    out["left"] = len(payload) - r.o
+    return out
+
+
+def _tx_ident(raw):
+    """A transaction's full signature and its 16-byte SigPrefix, from the wire
+    bytes. The first signature follows a one-byte shortvec count, and every
+    transaction we record has fewer than 128 signatures."""
+    sig = raw[1:65]
+    return b58encode(sig), raw[1:17]
+
+
+def measured_dag(slot, rnd, data):
+    """Our offer's graph exactly as the builder recorded it.
+
+    Returns the same shape dag_schedule() wants, so the dispatch model is
+    shared with the rebuilt path: the connector pops ready nodes off a
+    BinaryHeap<(depth, index)> -- deepest critical path first -- which is the
+    rule dag_schedule already implements."""
+    entry = next((r for r in data["rounds"] if r["round"] == rnd), None)
+    offers = (entry or {}).get("offers") or []
+    if not offers:
+        return None, {"err": "we made no offer in this round"}
+    best = max(offers, key=lambda o: o["orders"])
+    _, rows = clickhouse(
+        "SELECT hex(payload), payload_version FROM bifrost_miniblocks "
+        f"WHERE slot = {int(slot)} AND uuid = '{best['uuid']}' "
+        "AND kind = 'selected' LIMIT 1")
+    if not rows or not rows[0][0]:
+        return None, {"err": "our offer row has no payload stored"}
+    if ch_int(rows[0][1]) != 0:
+        # The layout below was established and checked against version 0 only.
+        # Guessing at a version that changed would produce a confident graph
+        # made of nonsense, which is worse than no graph.
+        return None, {"err": f"this offer is payload_version "
+                             f"{ch_int(rows[0][1])}; the graph layout is only "
+                             "known for version 0"}
+    try:
+        g = decode_selected(bytes.fromhex(rows[0][0]))
+    except Exception as exc:
+        return None, {"err": f"could not decode our offer's graph: {exc}"}
+
+    nodes, ro, ci = g["nodes"], g["row_offsets"], g["col_indices"]
+    if len(ro) != len(nodes) + 1:
+        return None, {"err": f"graph is malformed: {len(ro)} row offsets for "
+                             f"{len(nodes)} nodes"}
+
+    # identity, so a node can be labelled and joined to its executed event
+    by_prefix, votes = {}, set()
+    vote_id = bytes.fromhex(VOTE_ID_HEX)
+    for raw in g["txs"]:
+        sig, prefix = _tx_ident(raw)
+        by_prefix[prefix] = sig
+        if vote_id in raw:
+            votes.add(prefix)
+    bundle_txs = {}
+    for b in g["bundles"]:
+        members = []
+        for raw in b["txs"]:
+            sig, prefix = _tx_ident(raw)
+            by_prefix[prefix] = sig
+            if vote_id in raw:
+                votes.add(prefix)
+            members.append(prefix)
+        bundle_txs[b["id"]] = members
+
+    n_votes = 0
+    meta = []
+    for nd in nodes:
+        if nd["kind"] == "tx":
+            is_vote = nd["ref"] in votes
+            n_votes += 1 if is_vote else 0
+            meta.append({"key": b58encode(nd["ref"]),
+                         "label": by_prefix.get(nd["ref"]) or nd["ref"].hex(),
+                         "bundle": False, "vote": is_vote, "txs": 1})
+        else:
+            members = bundle_txs.get(nd["ref"], [])
+            all_votes = bool(members) and all(m in votes for m in members)
+            n_votes += 1 if all_votes else 0
+            meta.append({"key": nd["ref"].hex(), "label": nd["ref"].hex(),
+                         "bundle": True, "vote": all_votes,
+                         "txs": max(1, len(members))})
+
+    cdeps = [list(ci[ro[i]:ro[i + 1]]) for i in range(len(nodes))]
+    cblocked = [0] * len(nodes)
+    for succ in cdeps:
+        for s in succ:
+            if 0 <= s < len(nodes):
+                cblocked[s] += 1
+    # `depth` is 1 for a sink; height counts edges, so it is one less
+    height = [max(0, nd["depth"] - 1) for nd in nodes]
+    stream = {"chains": [[i] for i in range(len(nodes))],
+              "chain_of": list(range(len(nodes))),
+              "cdeps": cdeps, "cblocked": cblocked, "height": height,
+              "critical_path": max((nd["depth"] for nd in nodes), default=0),
+              "initial_width": sum(1 for b in cblocked if b == 0)}
+    stats = {"refs": len(nodes), "votes": n_votes, "unresolved": 0,
+             "bundles": len(g["bundles"]), "opaque": 0, "ungrouped": 0,
+             "edges": len(ci), "left": g["left"],
+             "backward": sum(1 for i in range(len(nodes))
+                             for s in cdeps[i] if s <= i)}
+    return {"stream": stream, "meta": meta, "orders": len(nodes)}, stats
+
 def dag_payload(slot, rnd, source, data):
     """Everything the browser needs to draw one round's dispatch DAG."""
     rounds = data["rounds"]
     stamps = [i["ts"] for r in rounds
               for i in r["offers"] + ([r["winner"]] if r["winner"] else [])]
-    orders, stats = dag_orders(slot, rnd, source, rounds, stamps)
-    if orders is None:
-        return {"err": stats["err"]}
-    if not orders:
-        return {"err": "no order in this round could be resolved to its "
-                       "account set" + (" -- every ref was a bundle we never "
-                                        "received" if stats.get("opaque") else "")}
-    # The extend path runs singleton chains; winner replay merges linear runs.
-    merge = source == "winner"
-    stream = dag_stream(orders, merge_chains=merge)
+    # Our own offer carries the builder's graph, so it is READ, not rebuilt.
+    # The winner's payload has only a flat list of order refs -- no CSR -- so
+    # that one still has to be reconstructed, which is where the sim-commit
+    # comparison earns its place.
+    measured = source != "winner"
+    if measured:
+        got, stats = measured_dag(slot, rnd, data)
+        if got is None:
+            return {"err": stats["err"]}
+        stream, meta = got["stream"], got["meta"]
+        merge = False
+    else:
+        orders, stats = dag_orders(slot, rnd, source, rounds, stamps)
+        if orders is None:
+            return {"err": stats["err"]}
+        if not orders:
+            return {"err": "no order in this round could be resolved to its "
+                           "account set" + (" -- every ref was a bundle we "
+                                            "never received"
+                                            if stats.get("opaque") else "")}
+        merge = True
+        stream = dag_stream(orders, merge_chains=merge)
+        meta = [{"key": o["ref"], "label": o.get("label", o["ref"]),
+                 "bundle": o["is_bundle"], "vote": False, "txs": len(o["txs"])}
+                for o in orders]
     outcomes = order_outcomes(slot, stamps)
     weights, resolved_cu = {}, 0
-    for i, order in enumerate(orders):
-        hit = outcomes.get(order["ref"])
+    for i, m in enumerate(meta):
+        hit = outcomes.get(m["key"])
         if hit and hit["cu"]:
             weights[i] = hit["cu"]
             resolved_cu += 1
@@ -1619,28 +1830,29 @@ def dag_payload(slot, rnd, source, data):
     nodes = []
     for cid, members in enumerate(stream["chains"]):
         slotted = placed[cid] or {"w": 0, "t0": 0, "t1": 0}
-        head = orders[members[0]]
-        outs = [outcomes.get(orders[i]["ref"]) for i in members]
-        known = [o for o in outs if o]
+        head = meta[members[0]]
+        known = [o for o in (outcomes.get(meta[i]["key"]) for i in members) if o]
         state = ("unknown" if not known
                  else "included" if all(o["included"] for o in known)
                  else "excluded")
         nodes.append({
             "i": cid, "w": slotted["w"], "t0": slotted["t0"], "t1": slotted["t1"],
-            "b": 1 if head["is_bundle"] else 0,
+            "b": 1 if head["bundle"] else 0,
             "n": len(members), "s": state, "c": 1 if cid in crit else 0,
             "h": stream["height"][cid], "d": stream["cblocked"][cid],
+            "v": 1 if head["vote"] else 0,
             "cu": sum(weights[i] for i in members),
-            "r": head.get("label", head["ref"]),
+            "r": head["label"],
         })
     edges = [[a, b, 1] if (a, b) in crit_edges else [a, b]
              for a, deps in enumerate(stream["cdeps"]) for b in deps]
     return {
         "nodes": nodes, "edges": edges, "pool": pool, "span": span,
-        "chains": len(stream["chains"]), "orders": len(orders),
+        "chains": len(stream["chains"]), "orders": len(meta),
         "critical_path": stream["critical_path"],
         "initial_width": stream["initial_width"],
-        "merged": merge, "stats": stats, "cu_known": resolved_cu,
+        "merged": merge, "measured": measured, "stats": stats,
+        "cu_known": resolved_cu,
     }
 
 
@@ -1673,12 +1885,41 @@ def dag_html(slot, rnd, source, data):
         return head + f'<div class="none">{html.escape(payload["err"])}</div></div>'
 
     st = payload["stats"]
+    if payload.get("measured"):
+        prov = ('<div class="dagread">This graph is <b>read, not rebuilt</b>. '
+                "Our own <code>selected</code> payload carries the builder's "
+                f"dependency graph in CSR form &mdash; {st.get('edges', 0):,} "
+                "edges over "
+                f"{payload['orders']:,} nodes, with each node's remaining-path "
+                "depth &mdash; so nothing here is inferred. Order comes from "
+                "<code>graph.nodes</code>, which is the only place the wire "
+                "order exists."
+                + (f' <span class="warn">{st["backward"]:,} edges point '
+                   "backward, which should be impossible in a topological "
+                   'order</span>' if st.get("backward") else "")
+                + (f' <span class="warn">{st["left"]:,} bytes of the payload '
+                   "were not consumed</span>" if st.get("left") else "")
+                + "</div>")
+    else:
+        prov = ('<div class="dagread">This graph is <b>rebuilt</b>. A winning '
+                "miniblock's payload carries a flat list of order refs and no "
+                "graph, so the edges here are recomputed with the simulator's "
+                "own rule from <code>replay.rs</code> and then scored against "
+                "what <code>sim-commit</code> measured.</div>")
     recorded = _dag_recorded(rnd, source, data)
     fid = _dag_fidelity(payload, recorded)
     unres = st["unresolved"]
     votes = ""
     if st["votes"]:
-        why = ("The simulator drops them too on this path: "
+        why = ("They are NODES in this graph, not removed: it is the "
+               "builder's own recorded graph and dropping a node would "
+               "renumber the CSR. They are counted here so the width is not "
+               "read as useful parallelism -- a vote touches only its own vote "
+               "account, so every one of them starts unblocked and none of "
+               "them has an edge. <b>Only orders with a dependency</b> above "
+               "hides them."
+               if payload.get("measured") else
+               "The simulator drops them too on this path: "
                "<code>replayed</code> counts the winner's orders MINUS the "
                "votes billed to <code>votes_cu</code>, which is how the two "
                "figures reconcile."
@@ -1687,8 +1928,10 @@ def dag_html(slot, rnd, source, data):
                "vote account, so it adds width to the graph and no depth. "
                "Whether the extend path is handed votes at all is not on "
                "record either way.")
+        inout = ("are vote transactions" if payload.get("measured")
+                 else "are vote transactions and are not in the graph")
         votes = (f'<div class="dagnote">{st["votes"]:,} of {st["refs"]:,} refs '
-                 f"are vote transactions and are not in the graph. {why}</div>")
+                 f"{inout}. {why}</div>")
     warn = ""
     if unres:
         warn = (f'<div class="dagwarn">{unres:,} of {st["refs"]:,} order refs '
@@ -1717,19 +1960,27 @@ def dag_html(slot, rnd, source, data):
                    "Their bars are the wrong width; the edges are not affected."
                    "</div>")
 
-    summary = (
-        '<table class="dagsum"><tr>'
-        f"<td><b>{payload['orders']:,}</b><span>orders in the graph</span></td>"
-        f"<td><b>{payload['chains']:,}</b><span>chains"
-        + (" (linear runs merged)" if payload["merged"] else " (one per order)")
-        + "</span></td>"
-        f"<td><b>{payload['critical_path']:,}</b><span>critical path"
-        f"{fid['cp']}</span></td>"
-        f"<td><b>{payload['initial_width']:,}</b><span>start with no blocker"
-        f"{fid['iw']}</span></td>"
-        f"<td><b>{payload['pool']}</b><span>worker lanes</span></td>"
-        f"<td><b>{payload['span']/1e6:.2f}M</b><span>CU on the longest lane</span></td>"
-        "</tr></table>")
+    def tile(value, label):
+        return f"<td><b>{value}</b><span>{label}</span></td>"
+
+    cells = [tile(f"{payload['orders']:,}", "orders in the graph")]
+    if payload.get("measured"):
+        # The builder's graph is per order, so a chain count would just repeat
+        # the order count; what it does have that a rebuild does not is edges.
+        cells.append(tile(f"{payload['stats'].get('edges', 0):,}",
+                          "dependency edges"))
+    else:
+        cells.append(tile(f"{payload['chains']:,}", "chains"
+                          + (" (linear runs merged)" if payload["merged"]
+                             else " (one per order)")))
+    cells += [
+        tile(f"{payload['critical_path']:,}", "critical path" + fid["cp"]),
+        tile(f"{payload['initial_width']:,}",
+             "start with no blocker" + fid["iw"]),
+        tile(payload["pool"], "worker lanes"),
+        tile(f"{payload['span']/1e6:.2f}M", "CU on the longest lane"),
+    ]
+    summary = '<table class="dagsum"><tr>' + "".join(cells) + "</tr></table>"
 
     legend = (
         '<div class="daglegend">'
@@ -1758,7 +2009,7 @@ def dag_html(slot, rnd, source, data):
     blob = json.dumps({"nodes": payload["nodes"], "edges": payload["edges"],
                        "pool": payload["pool"], "span": payload["span"]},
                       separators=(",", ":"))
-    return (head + votes + warn + cu_note + summary + controls
+    return (head + prov + votes + warn + cu_note + summary + controls
             + '<div class="dagwrap"><svg id="dagsvg"></svg></div>' + legend
             + _dag_extends(rnd, data)
             + _dag_basis(payload, recorded, source)
@@ -1862,6 +2113,20 @@ def _dag_extends(rnd, data):
 
 
 def _dag_basis(payload, recorded, source):
+    if payload.get("measured"):
+        return ('<div class="dagbasis"><b>How this is built.</b> It is not: the '
+                "edges, the order and each node\'s depth are read straight out "
+                "of our own <code>selected</code> payload, which is a wincode "
+                "<code>WireMiniblock</code> carrying the builder\'s graph in "
+                "CSR form. The lanes then run the connector\'s own dispatch "
+                "rule &mdash; it pops ready nodes off a "
+                "<code>BinaryHeap&lt;(depth, index)&gt;</code>, deepest "
+                "critical path first &mdash; and the x axis is <b>model time "
+                "in compute units</b>, not wall time: a node costs its measured "
+                "CU. Wall time per extend is measured, and lives in the rounds "
+                "tab. Switch to <b>the winner</b> to see a graph that has to be "
+                "reconstructed, and how well that reconstruction scores."
+                "</div>")
     merged = ("Linear runs are merged into one chain, capped at 64 "
               "transactions, exactly as the winner-replay path does."
               if payload["merged"] else
@@ -3714,6 +3979,11 @@ tr.bstage td:first-child{color:#8fa3ba}
 .dagsum span{display:block;color:#61748b;font-size:10.5px;margin-top:1px}
 .dagsum .ok{display:inline;font-size:10.5px;color:#5eead4;font-family:inherit}
 .dagsum .off{color:#fbbf24}
+.dagread{background:#0d1a16;border:1px solid #1b3b32;border-radius:4px;
+  color:#8fc4b4;font-size:11.5px;padding:6px 10px;margin:0 0 9px;line-height:1.6}
+.dagread b{color:#bfe6d8}
+.dagread code{font-family:ui-monospace,Menlo,monospace;color:#a9d8c6}
+.dagread .warn{color:#fbbf24}
 .dagnote{background:#0e1721;border:1px solid #1d2b3a;border-radius:4px;
   color:#8fa3ba;font-size:11.5px;padding:6px 10px;margin:0 0 9px}
 .dagnote code{font-family:ui-monospace,Menlo,monospace;color:#a9bed4}
