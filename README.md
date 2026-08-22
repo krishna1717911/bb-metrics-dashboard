@@ -477,6 +477,50 @@ above and these rows are NOT comparable: one is the round's whole order list at
 once, the other is the same work cut into batches. Refused extends are missing
 entirely — a throttled call never reaches the worker and emits no point.
 
+## Range analysis — `/analysis`
+
+The slot explorer answers "what happened in this slot". This answers "what has
+been happening", over a date range, for one connector identity. It is a port of
+`bcj_report.py`, which wanted its own credentials and printed to a terminal.
+
+Inputs: a range (`-24h`, `-7d`, `2026-08-21`, or a full timestamp), a reward-gap
+threshold, and a connector — the dropdown lists the identities that actually
+appear in the range, and `ANALYSIS_IDENTITY` sets which one it opens on.
+
+1. **Winner landed it, we never offered it.** Winner refs minus every ref we
+   offered in that round, at any rung — the union over the whole ladder, since a
+   later rung can drop an order an earlier one carried. Expand a slot for its
+   rounds, expand a round for the actual signatures and bundle ids.
+2. **Commit-time replay in the simulator.** Percentiles for every stage of the
+   commit, plus the shape of the replayed batch. Each **max** links to the slot
+   and round it came from.
+3. **Rounds at least N% below the winner**, with the whole-range gap
+   distribution beside the flagged rows.
+4. **Leader Sequencing → simulator context install**, raw and clock-corrected.
+
+**The two stores are on different clocks**, so report 4 corrects for it. The
+skew is bounded per leader window as the minimum of `round_committed` minus
+`sim-commit` across that window's rounds: that difference is return latency plus
+skew, latency is never negative, and some round always returns fast, so the
+minimum bounds the skew tightly from above. Per window and not once for the
+range — the hosts drift tens of milliseconds over a day and get pulled back by
+NTP.
+
+Two things about cost, because this page reads a lot more than a slot page does:
+
+- The range is capped at 7 days, and every query is bounded by it.
+- A run is cached for 15 minutes, keyed on the range and the connector but
+  **not** the threshold — only report 3 depends on that, and it costs half a
+  second against ten for the rest, so moving the threshold re-runs only what it
+  affects. An open-ended range is quantised to the minute, or the key would
+  never repeat.
+
+Report 1's vote classification is the expensive part and is bounded per leader
+window rather than across the range: a winner tx ref carries no bytes, so a vote
+is only identifiable by having reached our own ingest with `route=vote`, and
+asking that of a whole day scans every receive in it. Per window it is about a
+second, and the windows go out together — measured 12s down to about 4s.
+
 ## Metrics reference — `/reference`
 
 A page documenting every metric: what it measures, its source field, the amber

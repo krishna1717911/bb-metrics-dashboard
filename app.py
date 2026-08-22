@@ -1574,15 +1574,30 @@ def dag_orders(slot, rnd, source, rounds, stamps):
 
 
 def _decode_refs(payload):
-    """Winner payload: a 55-byte header, then [u32 tag][body] order refs, then
-    16 bytes of zero padding. tag 0 is a 16-byte SigPrefix, tag 1 a raw 32-byte
-    bundle id."""
+    """A winner payload's order refs: wincode WireChosenMiniblock.
+
+    uuid 16B, Option<reward>, Option<execution_cost>, slot u64, index u32,
+    is_tail bool -- 47 bytes -- then the ref vector as a u64 count and that
+    many [u32 tag][body]: tag 0 is a 16-byte SigPrefix, tag 1 a 32-byte bundle
+    id. `orders` follows.
+
+    The count is READ and honoured rather than the buffer being consumed until
+    it runs out. The winning builder attaches order bytes only for orders it
+    originated, so `orders` is usually empty -- two zero u64 lengths, the "16
+    bytes of zero padding" this once looked like -- but when it is NOT empty,
+    walking to the end of the buffer parses those bytes as further refs. That
+    silently inflated the ref count, which then disagreed with the order_count
+    column and got the whole round discarded: measured over one 12-hour range
+    it lost 21 of 95 rounds and a third of the winner refs."""
+    count = struct.unpack("<Q", payload[47:55])[0]
     off, refs = 55, []
-    while off + 4 <= len(payload):
+    for _ in range(count):
         tag = struct.unpack("<I", payload[off:off + 4])[0]
         size = {0: 16, 1: 32}.get(tag)
-        if size is None or off + 4 + size > len(payload):
-            break
+        if size is None:
+            raise ValueError(f"unknown order ref tag {tag} at byte {off}")
+        if off + 4 + size > len(payload):
+            raise ValueError("payload ended inside the ref vector")
         refs.append(("tx" if tag == 0 else "bundle", payload[off + 4:off + 4 + size]))
         off += 4 + size
     return refs
@@ -3960,6 +3975,71 @@ details.errdrop li{margin:2px 0}
 tr.bstage td{background:#0d1620}
 tr.bstage td:first-child{color:#8fa3ba}
 #view.loading{opacity:.45;transition:opacity .12s ease-in 80ms}
+/* /analysis */
+.aform{display:flex;flex-wrap:wrap;gap:14px;align-items:flex-end;
+  padding:14px 28px;border-bottom:1px solid #1e2937}
+.aform label{display:flex;flex-direction:column;gap:4px;color:#61748b;
+  font-size:10.5px;text-transform:uppercase;letter-spacing:.06em}
+.aform input,.aform select{background:#0c141b;border:1px solid #22303f;
+  border-radius:5px;color:#cfe0f0;padding:5px 8px;font-size:12px;
+  font-family:ui-monospace,Menlo,monospace;min-width:170px}
+.aform input.thin{min-width:64px}
+.aform input:focus,.aform select:focus{outline:none;border-color:#2c6b86}
+.aform button{background:#0f766e;border:1px solid #14b8a6;color:#eafffb;
+  border-radius:5px;padding:6px 18px;font-size:12px;cursor:pointer}
+.aform button:hover{background:#14b8a6}
+.awrap{padding:0 28px 40px}
+.ahead{display:flex;flex-wrap:wrap;gap:16px;align-items:baseline;
+  padding:14px 0 4px;font-size:12px;color:#cfe0f0}
+.ahead code{font-family:ui-monospace,Menlo,monospace;font-size:11.5px}
+.asec{margin:22px 0 0;border-top:1px solid #1e2937;padding-top:14px}
+.asec h2{font-size:13px;font-weight:600;color:#cfe0f0;margin:0 0 10px}
+.asum{color:#8fa3ba;font-size:12px;line-height:1.7;margin:0 0 10px}
+.asum b{color:#dbe7f3}
+.asubh{color:#61748b;font-size:10.5px;text-transform:uppercase;
+  letter-spacing:.06em;margin:16px 0 6px}
+.atab{width:100%;border-collapse:collapse;font-size:11.5px;margin-bottom:4px}
+.atab th{color:#61748b;font-weight:500;text-align:left;padding:4px 9px;
+  border-bottom:1px solid #1e2937;white-space:nowrap}
+.atab td{padding:3px 9px;border-bottom:1px solid #141d27;color:#a9bed4}
+.atab th.n,.atab td.n{text-align:right}
+.atab .m{font-family:ui-monospace,Menlo,monospace}
+.atab .dim{color:#4d5c70}
+.atab .abad{color:#f87171}
+.atab .awarn{color:#fbbf24}
+.amax{white-space:nowrap}
+.atwhere{margin-left:10px;padding-left:10px;border-left:1px solid #22303f}
+.alink{color:#7fd8f0;text-decoration:none;border-bottom:1px dotted #2c6b86}
+.alink:hover{color:#a9e8f7;border-bottom-style:solid}
+.anote{color:#61748b;font-size:11px;line-height:1.6;margin:8px 0 0;
+  max-width:1100px}
+.anote b{color:#8fa3ba}
+.anote code{font-family:ui-monospace,Menlo,monospace;color:#8fa3ba}
+.anote .warn{color:#fbbf24}
+details.aslot{border:1px solid #1a2430;border-radius:5px;margin:5px 0;
+  background:#0c141b}
+details.aslot>summary{cursor:pointer;padding:7px 11px;display:flex;
+  flex-wrap:wrap;gap:12px;align-items:baseline;font-size:12px;color:#a9bed4}
+details.aslot>summary:hover{background:#111c26}
+details.aslot[open]>summary{border-bottom:1px solid #1a2430}
+.aslotn{font-family:ui-monospace,Menlo,monospace;color:#cfe0f0;font-weight:600}
+details.around{border-top:1px solid #141d27;margin:0 0 0 16px}
+details.around>summary{cursor:pointer;padding:5px 11px;display:flex;
+  flex-wrap:wrap;gap:11px;align-items:baseline;font-size:11.5px;color:#8fa3ba}
+details.around>summary:hover{background:#111c26}
+.arnd{font-family:ui-monospace,Menlo,monospace;color:#a9bed4}
+.amiss{color:#e3c07a;font-family:ui-monospace,Menlo,monospace}
+.agoto{margin-left:auto}
+.tailpill{border:1px solid #2c6b86;border-radius:9px;padding:0 7px;
+  font-size:9.5px;color:#7fd8f0;text-transform:uppercase;letter-spacing:.05em}
+.alist{padding:7px 11px 10px 27px;border-top:1px solid #101820}
+.alist b{display:block;color:#8fa3ba;font-size:10.5px;font-weight:500;
+  text-transform:uppercase;letter-spacing:.06em;margin-bottom:5px}
+.alist code{display:inline-block;font-family:ui-monospace,Menlo,monospace;
+  font-size:10.5px;color:#7e93aa;background:#0a1118;border:1px solid #16212c;
+  border-radius:3px;padding:1px 5px;margin:0 4px 4px 0;word-break:break-all}
+.alist code.bid{color:#8fa3ba;border-color:#1e3245}
+.alist .dim{color:#4d5c70;font-size:10.5px}
 /* dispatch DAG */
 .dagbar{display:flex;align-items:center;flex-wrap:wrap;gap:5px;
   padding:8px 0 10px;border-bottom:1px solid #141d27;margin-bottom:10px}
@@ -4973,6 +5053,7 @@ def page(sel_win=None, sel_slot=None, sel_round=None, tab="rounds",
     <input name="slot" inputmode="numeric" pattern="[0-9]*" placeholder="go to slot"
            aria-label="go to slot" />
   </form>
+  <a class="navlink" href="/analysis">range analysis</a>
   <a class="navlink" href="/reference">metrics reference &mdash; what is bad?</a>
 </header>
 {health_html()}
@@ -4983,9 +5064,847 @@ def page(sel_win=None, sel_slot=None, sel_round=None, tab="rounds",
 </body></html>"""
 
 
+# ============================================================== /analysis
+#
+# A port of bcj_report.py, which was a standalone script wanting its own
+# credentials. The four reports are unchanged in substance; what differs is
+# that the range is resolved to concrete timestamps up front and both stores
+# are bounded by it, rather than the script's habit of bounding InfluxDB by
+# slot alone and letting it walk the retention.
+
+ANALYSIS_IDENTITY = os.environ.get("ANALYSIS_IDENTITY", "")
+ANALYSIS_MAX_DAYS = 7
+PCTS = (50, 90, 95, 99)
+# One round's missing-order list can run to hundreds of signatures and a day's
+# worth to five figures, which is megabytes of HTML nobody reads. Each round
+# renders this many and says how many it withheld.
+SIG_CAP = 100
+
+_analysis_cache = {}
+_analysis_lock = threading.Lock()
+
+
+def pct(values, p):
+    """Linear interpolation between order statistics, as numpy does it."""
+    ordered = sorted(values)
+    if not ordered:
+        return float("nan")
+    k = (len(ordered) - 1) * p / 100.0
+    lo = int(k)
+    if lo >= len(ordered) - 1:
+        return float(ordered[-1])
+    return ordered[lo] + (ordered[lo + 1] - ordered[lo]) * (k - lo)
+
+
+def resolve_range(start, end):
+    """-24h / -30m / -7d, or an absolute date or datetime, to real timestamps.
+
+    Resolved here rather than handed to ClickHouse as `now() - INTERVAL ...`
+    because the same window has to bound InfluxDB, and the two stores must be
+    asked about the same wall-clock span for the cross-store joins below to
+    mean anything."""
+    # Quantised to the minute. An open-ended range means "up to now", and an
+    # unrounded now() moves between one request and the next, so the cache key
+    # never repeated and every reload paid the full ten seconds again.
+    now = dt.datetime.now(dt.UTC).replace(tzinfo=None, second=0, microsecond=0)
+    rel = re.fullmatch(r"-(\d+)([hdm])", (start or "").strip())
+    if rel:
+        n, unit = int(rel.group(1)), rel.group(2)
+        lo = now - dt.timedelta(**{{"h": "hours", "d": "days",
+                                    "m": "minutes"}[unit]: n})
+    else:
+        text = (start or "").strip()
+        if len(text) == 10:
+            text += " 00:00:00"
+        try:
+            lo = dt.datetime.fromisoformat(text)
+        except ValueError:
+            raise ValueError(f"could not read a start time from {start!r}")
+    if (end or "").strip():
+        text = end.strip()
+        if len(text) == 10:
+            text += " 00:00:00"
+        try:
+            hi = dt.datetime.fromisoformat(text)
+        except ValueError:
+            raise ValueError(f"could not read an end time from {end!r}")
+    else:
+        hi = now
+    if hi <= lo:
+        raise ValueError("the end of the range is not after its start")
+    if hi - lo > dt.timedelta(days=ANALYSIS_MAX_DAYS):
+        raise ValueError(f"range is {(hi - lo).days} days; the cap is "
+                         f"{ANALYSIS_MAX_DAYS}. Every query here is bounded by "
+                         "it, so a wide range is a slow page, not a rich one.")
+    return lo, hi
+
+
+def _ch_ts(t):
+    return t.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _ix_ts(t):
+    return t.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def analysis_connectors(lo, hi):
+    _, rows = clickhouse(
+        "SELECT connector_identity, uniqExact(slot) AS slots "
+        f"FROM bifrost_miniblocks WHERE ts >= '{_ch_ts(lo)}' AND ts <= '{_ch_ts(hi)}' "
+        f"AND instance_id = '{CH_INSTANCE}' AND connector_identity != '' "
+        "GROUP BY connector_identity ORDER BY slots DESC")
+    return [(r[0], ch_int(r[1])) for r in rows]
+
+
+def analysis_slots(lo, hi, identity):
+    _, rows = clickhouse(
+        f"SELECT DISTINCT slot FROM bifrost_miniblocks "
+        f"WHERE ts >= '{_ch_ts(lo)}' AND ts <= '{_ch_ts(hi)}' "
+        f"AND connector_identity = '{identity}' AND instance_id = '{CH_INSTANCE}' "
+        "ORDER BY slot")
+    return [int(r[0]) for r in rows]
+
+
+def analysis_missing(slots):
+    """Winner refs that we never offered in that round, at any rung.
+
+    The union over the whole ladder, not just the best rung: the question is
+    what we never had at all, and a later rung can drop an order an earlier one
+    carried."""
+    slot_list = ",".join(str(s) for s in slots)
+    winners, bad = {}, []
+    _, rows = clickhouse(
+        "SELECT slot, index_in_slot, is_last, order_count, hex(payload) "
+        f"FROM bifrost_miniblocks WHERE slot IN ({slot_list}) AND kind = 'winner' "
+        f"AND instance_id = '{CH_INSTANCE}'")
+    for slot, idx, is_last, order_count, hexpay in rows:
+        try:
+            refs = _decode_refs(bytes.fromhex(hexpay))
+        except Exception as exc:
+            bad.append(f"slot {slot} round {idx}: {exc}")
+            continue
+        # order_count is written as chosen.order_refs.len(), so it is an
+        # independent check on the decode rather than a restatement of it.
+        if len(refs) != ch_int(order_count):
+            bad.append(f"slot {slot} round {idx}: decoded {len(refs)} refs, "
+                       f"the column says {order_count}")
+            continue
+        winners[(int(slot), int(idx))] = {
+            "txs": {b58encode(r) for k, r in refs if k == "tx"},
+            "bundles": {r.hex() for k, r in refs if k == "bundle"},
+            "is_tail": is_last in TRUEISH, "refs": len(refs)}
+
+    ours_tx, ours_bundle = {}, {}
+    _, rows = clickhouse(
+        "SELECT slot, index_in_slot, arrayStringConcat(sig_prefixes, ','), "
+        "       arrayStringConcat(bundle_ids, ',') "
+        f"FROM bifrost_miniblocks WHERE slot IN ({slot_list}) AND kind = 'selected' "
+        f"AND instance_id = '{CH_INSTANCE}'")
+    for slot, idx, pfx, bids in rows:
+        key = (int(slot), int(idx))
+        ours_tx.setdefault(key, set()).update(p for p in pfx.split(",") if p)
+        ours_bundle.setdefault(key, set()).update(b for b in bids.split(",") if b)
+
+    missing, every_sig = {}, set()
+    for key, w in winners.items():
+        gap_tx = sorted(w["txs"] - ours_tx.get(key, set()))
+        gap_bundle = sorted(w["bundles"] - ours_bundle.get(key, set()))
+        if gap_tx or gap_bundle:
+            missing[key] = {"txs": gap_tx, "bundles": gap_bundle,
+                            "is_tail": w["is_tail"], "refs": w["refs"]}
+            every_sig |= set(gap_tx)
+
+    votes = _vote_sigs(missing)
+
+    per_slot, totals = {}, {"tx": 0, "bundle": 0, "vote": 0, "refs": 0,
+                            "rounds": 0, "winner_rounds": len(winners)}
+    for (slot, idx), gap in sorted(missing.items()):
+        non_vote = [s for s in gap["txs"] if s not in votes]
+        gap["non_vote"] = non_vote
+        gap["votes"] = len(gap["txs"]) - len(non_vote)
+        totals["tx"] += len(non_vote)
+        totals["bundle"] += len(gap["bundles"])
+        totals["vote"] += gap["votes"]
+        if non_vote or gap["bundles"]:
+            totals["rounds"] += 1
+            bucket = per_slot.setdefault(slot, {"rounds": [], "tx": 0,
+                                                "bundle": 0, "vote": 0, "refs": 0})
+            bucket["rounds"].append({"round": idx, "non_vote": non_vote,
+                                     "bundles": gap["bundles"],
+                                     "votes": gap["votes"], "refs": gap["refs"],
+                                     "is_tail": gap["is_tail"]})
+            bucket["tx"] += len(non_vote)
+            bucket["bundle"] += len(gap["bundles"])
+            bucket["vote"] += gap["votes"]
+            bucket["refs"] += gap["refs"]
+    totals["refs"] = sum(w["refs"] for w in winners.values())
+    return {"per_slot": per_slot, "totals": totals, "bad": bad}
+
+
+def _vote_sigs(missing):
+    """Which of the missing winner refs are votes.
+
+    A winner tx ref carries no bytes, so a vote is only identifiable by having
+    reached our own ingest with route=vote. That is an IN list against
+    bifrost_events, and the cost is entirely in how much of the table it has to
+    look at: asked once for a whole day it scans every receive in the range,
+    which is millions of rows. Asked per leader window, bounded to that
+    window's own couple of seconds, the same answer costs about a second --
+    measured 12s down to ~2s over 8 windows. Windows are independent, so they
+    go out together."""
+    import concurrent.futures as cf
+
+    by_window = {}
+    for (slot, _), gap in missing.items():
+        by_window.setdefault(slot // WINDOW, set()).update(gap["txs"])
+    if not by_window:
+        return set()
+
+    _, bounds = clickhouse(
+        "SELECT intDiv(slot, %d) AS win, toString(min(ts)), toString(max(ts)) "
+        "FROM bifrost_miniblocks WHERE slot IN (%s) GROUP BY win"
+        % (WINDOW, ",".join(str(s) for s, _ in missing)))
+    span = {int(w): (lo, hi) for w, lo, hi in bounds}
+
+    def one(win):
+        sigs = [x for x in sorted(by_window[win])
+                if re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{1,44}", x)]
+        if not sigs or win not in span:
+            return set()
+        lo, hi = span[win]
+        found = set()
+        # Still chunked: ClickHouse rejects a query much past a megabyte, and
+        # a busy window can carry several thousand refs.
+        for i in range(0, len(sigs), 4000):
+            chunk = ",".join("'" + x + "'" for x in sigs[i:i + 4000])
+            _, rows = clickhouse(
+                "SELECT DISTINCT entity FROM bifrost_events "
+                f"WHERE ts >= '{lo[:19]}' - INTERVAL 120 SECOND "
+                f"AND ts <= '{hi[:19]}' + INTERVAL 30 SECOND "
+                "AND event = 'received' AND attrs['route'] = 'vote' "
+                f"AND entity_kind = 'tx' AND entity IN ({chunk})")
+            found |= {r[0] for r in rows}
+        return found
+
+    out = set()
+    with cf.ThreadPoolExecutor(max_workers=4) as pool:
+        for found in pool.map(one, sorted(by_window)):
+            out |= found
+    return out
+
+
+def _commit_rows(lo, hi, slots):
+    """sim-commit for the range, kept to the slots we care about."""
+    cols, rows = influx(
+        f'SELECT * FROM "sim-commit" WHERE time >= \'{_ix_ts(lo)}\' '
+        f"AND time <= '{_ix_ts(hi)}' "
+        + "".join(f"AND \"host_id\" != '{h}' " for h in OFF_CHAIN)
+        + (f"AND \"host_id\" = '{SIM}'" if SIM else ""))
+    at = {name: i for i, name in enumerate(cols)}
+    keep = set(slots)
+    out = []
+    for r in rows:
+        try:
+            slot = int(r[at["slot"]])
+        except (TypeError, ValueError, KeyError):
+            continue
+        if slot in keep:
+            out.append(r)
+    return at, out
+
+
+REPLAY_FIELDS = [
+    ("body_us", "total commit"),
+    ("queue_us", "wait to start"),
+    ("sanitize_us", ""),
+    ("check_us", ""),
+    ("exec_wall_us", "wall in the pool"),
+    ("execute_us", "summed lane work"),
+    ("load_us", "account loads"),
+    ("program_cache_us", ""),
+    ("account_cache_clone_us", ""),
+]
+REPLAY_SHAPE = [
+    ("replayed", "orders"),
+    ("critical_path", "longest chain"),
+    ("initial_width", "start unblocked"),
+    ("exec_pool", "lanes used"),
+]
+
+
+def analysis_replay(commits):
+    at, rows = commits
+    if not rows:
+        return {"n": 0}
+
+    def series(name):
+        """Values with the (slot, round) they came from, so a maximum can be
+        pointed at rather than merely printed."""
+        i = at.get(name)
+        if i is None:
+            return []
+        out = []
+        for r in rows:
+            v = r[i]
+            if v is None:
+                continue
+            try:
+                out.append((float(v), int(r[at["slot"]]), int(r[at["index"]])))
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    def summarise(fields, scale):
+        table = []
+        for name, note in fields:
+            vals = series(name)
+            if not vals:
+                table.append({"name": name, "note": note, "n": 0})
+                continue
+            nums = [v / scale for v, _, _ in vals]
+            top = max(vals, key=lambda x: x[0])
+            table.append({"name": name, "note": note, "n": len(nums),
+                          "mean": sum(nums) / len(nums),
+                          "pcts": [pct(nums, p) for p in PCTS],
+                          "max": top[0] / scale,
+                          "at": (top[1], top[2])})
+        return table
+
+    promoted = sum(1 for r in rows
+                   if at.get("promoted_len") is not None
+                   and r[at["promoted_len"]] is not None
+                   and float(r[at["promoted_len"]]) >= 0)
+    wall = [v for v, _, _ in series("exec_wall_us")]
+    work = [v for v, _, _ in series("execute_us")]
+    replayed = [v for v, _, _ in series("replayed")]
+    body = [v for v, _, _ in series("body_us")]
+    return {
+        "n": len(rows), "promoted": promoted, "replays": len(rows) - promoted,
+        "timing": summarise(REPLAY_FIELDS, 1000.0),
+        "shape": summarise(REPLAY_SHAPE, 1.0),
+        "parallelism": (sum(work) / sum(wall)) if wall and sum(wall) else None,
+        "per_order": (sum(body) / sum(replayed)) if replayed and sum(replayed) else None,
+    }
+
+
+def analysis_gap(slots, threshold):
+    slot_list = ",".join(str(s) for s in slots)
+    _, rows = clickhouse(
+        "SELECT slot, index_in_slot, kind, max(reward), max(order_count), "
+        "       max(is_last) "
+        f"FROM bifrost_miniblocks WHERE slot IN ({slot_list}) "
+        f"AND instance_id = '{CH_INSTANCE}' GROUP BY slot, index_in_slot, kind")
+    best, win = {}, {}
+    for slot, idx, kind, reward, orders, is_last in rows:
+        key = (int(slot), int(idx))
+        (best if kind == "selected" else win)[key] = (
+            ch_int(reward), ch_int(orders), is_last in TRUEISH)
+
+    flagged, gaps = [], []
+    for key in sorted(win):
+        w_reward, w_orders, is_tail = win[key]
+        o_reward, o_orders, _ = best.get(key, (0, 0, False))
+        if w_reward <= 0:
+            continue
+        gap = 100.0 * (w_reward - o_reward) / w_reward
+        gaps.append(gap)
+        if gap >= threshold:
+            flagged.append({"slot": key[0], "round": key[1], "tail": is_tail,
+                            "ours": o_reward, "theirs": w_reward,
+                            "our_orders": o_orders, "their_refs": w_orders,
+                            "gap": gap})
+    return {"flagged": flagged, "rounds": len(gaps),
+            "slots": len({f["slot"] for f in flagged}),
+            "slots_total": len({s for s, _ in win}),
+            "mean": (sum(gaps) / len(gaps)) if gaps else None,
+            "pcts": [pct(gaps, p) for p in PCTS] if gaps else None,
+            "threshold": threshold}
+
+
+def analysis_skew(lo, hi, slots, commits):
+    """ClickHouse-minus-InfluxDB skew, bounded per leader window.
+
+    round_committed is logged when the builder receives the commit response
+    and sim-commit is written when the commit body finishes, so for one round
+
+        observed(ch) - observed(ix) = return_latency + skew,  latency >= 0
+
+    and the minimum over a window's rounds bounds the skew from above, tightly,
+    because some round in a window always returns fast. Per window and not once
+    for the range: the two hosts drift tens of milliseconds apart over a day and
+    get pulled back by NTP, so a single figure for a range would be a fiction."""
+    slot_list = ",".join(str(s) for s in slots)
+    _, rows = clickhouse(
+        "SELECT toUnixTimestamp64Nano(ts), nums['slot'], nums['index'] "
+        f"FROM bifrost_events WHERE ts >= '{_ch_ts(lo)}' AND ts <= '{_ch_ts(hi)}' "
+        f"AND event = 'round_committed' AND instance_id = '{CH_INSTANCE}' "
+        f"AND nums['slot'] IN ({slot_list})")
+    ch_ts = {(int(s), int(i)): int(t) for t, s, i in rows}
+    at, crows = commits
+    per_window = {}
+    for r in crows:
+        key = (int(r[at["slot"]]), int(r[at["index"]]))
+        if key in ch_ts:
+            delta = (ch_ts[key] - _rfc3339_ns(r[0])) / 1e6
+            per_window.setdefault(key[0] // WINDOW, []).append(delta)
+    return {w: (min(d), len(d)) for w, d in per_window.items()}
+
+
+def analysis_install(lo, hi, slots, identity, commits):
+    slot_list = ",".join(str(s) for s in slots)
+    _, rows = clickhouse(
+        "SELECT toUnixTimestamp64Nano(ts), nums['slot'] FROM bifrost_events "
+        f"WHERE ts >= '{_ch_ts(lo)}' AND ts <= '{_ch_ts(hi)}' AND event = 'progress' "
+        f"AND instance_id = '{CH_INSTANCE}' AND attrs['identity'] = '{identity}' "
+        f"AND attrs['leader_state'] = 'Sequencing' AND nums['slot'] IN ({slot_list})")
+    seq = {}
+    for t, slot in rows:
+        slot = int(slot)
+        seq[slot] = min(int(t), seq.get(slot, 1 << 62))
+
+    cols, vals = influx(
+        f'SELECT "slot","event" FROM "sim-context" WHERE time >= \'{_ix_ts(lo)}\' '
+        f"AND time <= '{_ix_ts(hi)}' "
+        + "".join(f"AND \"host_id\" != '{h}' " for h in OFF_CHAIN)
+        + (f"AND \"host_id\" = '{SIM}'" if SIM else ""))
+    at = {n: i for i, n in enumerate(cols)}
+    install = {}
+    for v in vals:
+        if at.get("event") is None or v[at["event"]] != "install":
+            continue
+        try:
+            slot = int(v[at["slot"]])
+        except (TypeError, ValueError):
+            continue
+        install[slot] = min(_rfc3339_ns(v[0]), install.get(slot, 1 << 62))
+
+    skew = analysis_skew(lo, hi, slots, commits)
+    raw, corrected, per_slot = [], [], []
+    for slot in sorted(seq):
+        if slot not in install:
+            per_slot.append({"slot": slot, "note": "no install row"})
+            continue
+        d = (install[slot] - seq[slot]) / 1e6
+        raw.append(d)
+        s_ms, pairs = skew.get(slot // WINDOW, (None, 0))
+        if s_ms is None:
+            per_slot.append({"slot": slot, "raw": d,
+                             "note": "no commit pair in this window"})
+            continue
+        corrected.append(d + s_ms)
+        per_slot.append({"slot": slot, "raw": d, "skew": s_ms,
+                         "corrected": d + s_ms, "pairs": pairs})
+    def block(vals):
+        if not vals:
+            return None
+        return {"n": len(vals), "mean": sum(vals) / len(vals),
+                "pcts": [pct(vals, p) for p in PCTS], "max": max(vals)}
+    return {"per_slot": per_slot, "raw": block(raw), "corrected": block(corrected)}
+
+
+def analysis_run(start, end, threshold, identity):
+    """All four reports for one range, cached: the page is several seconds of
+    querying and people re-read it while changing one field."""
+    lo, hi = resolve_range(start, end)
+    # Resolve the connector BEFORE the cache is consulted: the key has to be
+    # the identity actually used, or a request that left it blank stores under
+    # one key and looks up under another, and never hits.
+    connectors = analysis_connectors(lo, hi)
+    picked = (identity or ANALYSIS_IDENTITY
+              or (connectors[0][0] if connectors else ""))
+    # The threshold is deliberately NOT part of the key. Only report 3 depends
+    # on it and that one costs half a second, while the rest of the run costs
+    # ten; keying on it would re-query everything to move a slider.
+    key = (_ch_ts(lo), _ch_ts(hi), picked)
+    stamp = time.monotonic()
+    with _analysis_lock:
+        hit = _analysis_cache.get(key)
+    out = hit[1] if hit and stamp - hit[0] < 900 else None
+    if out is None:
+        slots = analysis_slots(lo, hi, picked) if picked else []
+        out = {"lo": lo, "hi": hi, "identity": picked, "slots": slots,
+               "connectors": connectors,
+               "windows": sorted({s // WINDOW for s in slots}),
+               "cached_at": dt.datetime.now(dt.UTC).replace(microsecond=0)}
+        if slots:
+            out["missing"] = analysis_missing(slots)
+            # One sim-commit fetch feeds both the replay percentiles and the
+            # per-window clock skew; they used to ask for it separately.
+            commits = _commit_rows(lo, hi, slots)
+            out["replay"] = analysis_replay(commits)
+            out["install"] = analysis_install(lo, hi, slots, picked, commits)
+        with _analysis_lock:
+            if len(_analysis_cache) > 6:
+                _analysis_cache.clear()
+            _analysis_cache[key] = (stamp, out)
+    out = dict(out, threshold=threshold, connectors=connectors)
+    if out["slots"]:
+        out["gap"] = analysis_gap(out["slots"], threshold)
+    return out
+
+
+def _slot_link(slot, rnd=None, tab=None):
+    href = f"/?win={window_of(slot)}&slot={slot}"
+    if tab:
+        href += f"&tab={tab}"
+    if rnd is not None:
+        href += f"&round={rnd}"
+    label = f"{slot}" + (f" r{rnd}" if rnd is not None else "")
+    return f'<a class="alink" href="{href}">{label}</a>'
+
+
+def _pct_row(entry, unit):
+    if not entry.get("n"):
+        return ("<tr><td class=m>" + html.escape(entry["name"])
+                + '</td><td class="n dim">0</td>'
+                + '<td class="n dim">&mdash;</td>' * (len(PCTS) + 2) + "</tr>")
+    fmt = (lambda v: f"{v:,.2f}") if unit == "ms" else (lambda v: f"{v:,.1f}")
+    note = (f' <span class="dim">{html.escape(entry["note"])}</span>'
+            if entry["note"] else "")
+    slot, rnd = entry["at"]
+    return ("<tr><td class=m>" + html.escape(entry["name"]) + note + "</td>"
+            f'<td class="n m">{entry["n"]:,}</td>'
+            f'<td class="n m">{fmt(entry["mean"])}</td>'
+            + "".join(f'<td class="n m">{fmt(v)}</td>' for v in entry["pcts"])
+            + f'<td class="n m amax">{fmt(entry["max"])}'
+            f'<span class="atwhere">{_slot_link(slot, rnd)}</span></td></tr>')
+
+
+def _pct_table(entries, unit, head):
+    return ('<table class="atab"><tr><th>field</th><th class=n>n</th>'
+            f"<th class=n>mean {head}</th>"
+            + "".join(f'<th class=n>p{p}</th>' for p in PCTS)
+            + '<th class=n>max &rarr; where</th></tr>'
+            + "".join(_pct_row(e, unit) for e in entries) + "</table>")
+
+
+def analysis_missing_html(rep, qs=""):
+    per_slot, tot = rep["per_slot"], rep["totals"]
+    if not per_slot:
+        return ('<div class="none">no round had a winner ref we never '
+                "offered</div>")
+    body = []
+    for slot in sorted(per_slot):
+        b = per_slot[slot]
+        rounds = []
+        for r in b["rounds"]:
+            # The lists themselves are fetched when the round is opened. A day
+            # of these is tens of thousands of signatures, which inlined came
+            # to a four megabyte page nobody reads to the end of.
+            items = [f'<div class="alist lazy" data-slot="{slot}" '
+                     f'data-round="{r["round"]}">loading&hellip;</div>']
+            rounds.append(
+                '<details class="around"><summary>'
+                f'<span class="arnd">round {r["round"]}</span>'
+                + ('<span class="tailpill">tail</span>' if r["is_tail"] else "")
+                + f'<span class="amiss">{len(r["non_vote"]):,} tx</span>'
+                + f'<span class="amiss">{len(r["bundles"]):,} bundles</span>'
+                + f'<span class="dim">of {r["refs"]:,} winner refs</span>'
+                + (f'<span class="dim">{r["votes"]:,} votes skipped</span>'
+                   if r["votes"] else "")
+                + f'<span class="agoto">{_slot_link(slot, r["round"])}</span>'
+                + "</summary>" + "".join(items) + "</details>")
+        body.append(
+            '<details class="aslot"><summary>'
+            f'<span class="aslotn">{slot}</span>'
+            f'<span class="dim">{len(b["rounds"])} round'
+            f'{"" if len(b["rounds"]) == 1 else "s"}</span>'
+            f'<span class="amiss">{b["tx"]:,} non-vote tx</span>'
+            f'<span class="amiss">{b["bundle"]:,} bundles</span>'
+            f'<span class="dim">of {b["refs"]:,} winner refs in those rounds</span>'
+            "</summary>" + "".join(rounds) + "</details>")
+    share = (100.0 * (tot["tx"] + tot["bundle"]) / tot["refs"]) if tot["refs"] else 0
+    return (f'<div class="amiss-root" data-qs="{html.escape(qs)}"></div>'
+            f'<div class="asum"><b>{tot["tx"]:,}</b> non-vote signatures and '
+            f'<b>{tot["bundle"]:,}</b> bundle ids across '
+            f'<b>{tot["rounds"]:,}</b> rounds &mdash; {share:.1f}% of all '
+            f'{tot["refs"]:,} winner refs over {tot["winner_rounds"]:,} rounds. '
+            f'{tot["vote"]:,} vote signatures excluded.</div>'
+            + "".join(body)
+            + '<div class="anote">Signatures inside a winner bundle are '
+              "invisible here: a bundle ref is a bare 32-byte id and the "
+              "winning builder attaches no member bytes, so a bundle counts as "
+              "one missing thing however many transactions it held. Votes are "
+              "identified by having reached our own ingest with "
+              "<code>route=vote</code> &mdash; a winner tx ref carries no bytes, "
+              "so one we never saw cannot be classified and is counted as "
+              "non-vote."
+            + (f' <span class="warn">{len(rep["bad"])} winner payloads failed '
+               "to decode and are absent: "
+               + html.escape("; ".join(rep["bad"][:3])) + "</span>"
+               if rep["bad"] else "") + "</div>")
+
+
+def analysis_replay_html(rep):
+    if not rep.get("n"):
+        return '<div class="none">no sim-commit rows in this range</div>'
+    extra = []
+    if rep["parallelism"]:
+        extra.append("parallelism <b>"
+                     f"{rep['parallelism']:.2f}&times;</b> "
+                     '<span class="dim">sum(execute_us) / sum(exec_wall_us)</span>')
+    if rep["per_order"]:
+        extra.append(f"per order <b>{rep['per_order']:.1f} &micro;s</b> "
+                     '<span class="dim">sum(body_us) / sum(replayed)</span>')
+    return (f'<div class="asum"><b>{rep["n"]:,}</b> commits &mdash; '
+            f'{rep["promoted"]:,} promoted, {rep["replays"]:,} full replays. '
+            + " &middot; ".join(extra) + "</div>"
+            + _pct_table(rep["timing"], "ms", "ms")
+            + '<div class="asubh">shape of the replayed batch '
+              "&mdash; counts, not milliseconds</div>"
+            + _pct_table(rep["shape"], "count", "count")
+            + '<div class="anote">Every <b>max</b> links to the slot and round '
+              "it came from. A promoted commit is one where our own block won "
+              "and was adopted rather than replayed, so it does no execution "
+              "work and drags the low percentiles down &mdash; the split is "
+              "given above.</div>")
+
+
+def analysis_gap_html(rep):
+    if not rep["flagged"]:
+        return (f'<div class="none">no round was {rep["threshold"]:g}% or more '
+                f'below the winner, out of {rep["rounds"]:,} rounds</div>')
+    rows = "".join(
+        "<tr>"
+        f'<td class=m>{_slot_link(f["slot"], f["round"])}</td>'
+        + ('<td><span class="tailpill">tail</span></td>' if f["tail"]
+           else "<td></td>")
+        + f'<td class="n m">{f["ours"]:,}</td>'
+        f'<td class="n m">{f["theirs"]:,}</td>'
+        f'<td class="n m">{f["our_orders"]:,}</td>'
+        f'<td class="n m">{f["their_refs"]:,}</td>'
+        f'<td class="n m {"abad" if f["gap"] >= 50 else "awarn"}">'
+        f'{f["gap"]:.2f}%</td></tr>'
+        for f in rep["flagged"])
+    share = 100.0 * len(rep["flagged"]) / rep["rounds"] if rep["rounds"] else 0
+    pcts = ("  ".join(f"p{p} {v:.2f}%" for p, v in zip(PCTS, rep["pcts"]))
+            if rep["pcts"] else "")
+    return (f'<div class="asum"><b>{len(rep["flagged"]):,}</b> of '
+            f'{rep["rounds"]:,} rounds ({share:.1f}%) across '
+            f'<b>{rep["slots"]:,}</b> of {rep["slots_total"]:,} slots were at '
+            f'least {rep["threshold"]:g}% below the winner. Gap over every '
+            f'round: mean {rep["mean"]:.2f}% &middot; {pcts}</div>'
+            '<table class="atab"><tr><th>slot &middot; round</th><th></th>'
+            "<th class=n>our best reward</th><th class=n>winner</th>"
+            "<th class=n>our orders</th><th class=n>winner refs</th>"
+            "<th class=n>gap</th></tr>" + rows + "</table>"
+            '<div class="anote">A gap of 100% is a round we did not offer into '
+            "at all, not a round we lost narrowly. A <b>negative</b> gap would "
+            "mean our offer carried the higher reward and still lost, which is "
+            "worth chasing separately.</div>")
+
+
+def analysis_install_html(rep):
+    if not rep["per_slot"]:
+        return '<div class="none">no Sequencing/install pair in this range</div>'
+    rows = "".join(
+        "<tr>"
+        f'<td class=m>{_slot_link(e["slot"], tab="timeline")}</td>'
+        + (f'<td class="n m">{e["raw"]:.2f}</td>' if "raw" in e
+           else '<td class="n dim">&mdash;</td>')
+        + (f'<td class="n m">{e["skew"]:+.2f}</td>' if "skew" in e
+           else '<td class="n dim">&mdash;</td>')
+        + (f'<td class="n m">{e["corrected"]:.2f}</td>' if "corrected" in e
+           else '<td class="n dim">&mdash;</td>')
+        + f'<td class="dim">{html.escape(e.get("note") or str(e.get("pairs", "")) + " pairs")}</td>'
+        "</tr>" for e in rep["per_slot"])
+    summary = []
+    for label, block in (("raw", rep["raw"]), ("corrected", rep["corrected"])):
+        if not block:
+            continue
+        summary.append(
+            f'<tr><td class=m>{label}</td><td class="n m">{block["n"]:,}</td>'
+            f'<td class="n m">{block["mean"]:.2f}</td>'
+            + "".join(f'<td class="n m">{v:.2f}</td>' for v in block["pcts"])
+            + f'<td class="n m">{block["max"]:.2f}</td></tr>')
+    return ('<table class="atab"><tr><th>series</th><th class=n>n</th>'
+            "<th class=n>mean ms</th>"
+            + "".join(f"<th class=n>p{p}</th>" for p in PCTS)
+            + "<th class=n>max</th></tr>" + "".join(summary) + "</table>"
+            '<div class="anote">Sequencing is a builder event in ClickHouse and '
+            "the install is a simulator row in InfluxDB, so every pair is "
+            "cross-clock. The skew column is that leader window's own bound, "
+            "taken as the minimum of "
+            "<code>round_committed</code> minus <code>sim-commit</code> over "
+            "the window's rounds &mdash; that difference is the return latency "
+            "plus the skew, and some round always returns fast, so the minimum "
+            "bounds the skew tightly from above. <b>corrected = raw + skew.</b> "
+            "It is estimated per window and not once for the range because the "
+            "two hosts drift tens of milliseconds apart over a day and get "
+            "pulled back by NTP. A negative corrected value means the simulator "
+            "had the context installed before the builder entered Sequencing "
+            "for that slot.</div>"
+            '<details class="aslot"><summary><span class="aslotn">per slot</span>'
+            f'<span class="dim">{len(rep["per_slot"])} slots</span></summary>'
+            '<table class="atab"><tr><th>slot</th><th class=n>raw ms</th>'
+            "<th class=n>skew ms</th><th class=n>corrected ms</th><th>basis</th>"
+            "</tr>" + rows + "</table></details>")
+
+
+# A round's missing-order list is fetched when the round is opened, against the
+# already-cached run, so the page ships the summary and nothing else.
+ANALYSIS_JS = r"""
+(function(){
+  var root = document.querySelector('.amiss-root');
+  if(!root) return;
+  var qs = root.dataset.qs || '';
+  // `toggle` does not bubble, hence the capture phase.
+  document.addEventListener('toggle', function(ev){
+    var d = ev.target;
+    if(!d.open || !d.classList || !d.classList.contains('around')) return;
+    var box = d.querySelector('.alist.lazy');
+    if(!box || box.dataset.done) return;
+    box.dataset.done = '1';
+    fetch('/analysis/orders?' + qs + '&slot=' + box.dataset.slot
+          + '&round=' + box.dataset.round)
+      .then(function(r){ if(!r.ok) throw 0; return r.text(); })
+      .then(function(h){ box.innerHTML = h; })
+      .catch(function(){
+        box.textContent = 'could not load this round';
+        box.dataset.done = '';
+      });
+  }, true);
+})();
+"""
+
+
+def analysis_orders_html(start, end, threshold, identity, slot, rnd):
+    """One round's missing refs, for the lazy expansion.
+
+    Reads the cached run rather than recomputing: the page has just built it,
+    and rebuilding for every expansion would re-query ClickHouse for each
+    click."""
+    rep = analysis_run(start, end, threshold, identity)
+    bucket = ((rep.get("missing") or {}).get("per_slot") or {}).get(slot)
+    entry = next((r for r in (bucket or {}).get("rounds", [])
+                  if r["round"] == rnd), None)
+    if entry is None:
+        return '<span class="dim">this round is no longer in the result</span>'
+    out = []
+    for label, vals, cls in (("non-vote signatures", entry["non_vote"], "sig"),
+                             ("bundle ids", entry["bundles"], "bid")):
+        if not vals:
+            continue
+        shown = vals[:SIG_CAP]
+        more = len(vals) - len(shown)
+        out.append(f"<b>{len(vals):,} {label}</b>"
+                   + "".join(f'<code class="{cls}">{html.escape(v)}</code>'
+                             for v in shown)
+                   + (f'<span class="dim">&hellip; and {more:,} more, withheld '
+                      f"so one round cannot flood the page</span>"
+                      if more else ""))
+    return "".join(out) or '<span class="dim">nothing missing here</span>'
+
+
+def analysis_page(start, end, threshold, identity):
+    try:
+        rep = analysis_run(start, end, threshold, identity)
+    except ValueError as exc:
+        rep = {"err": str(exc)}
+    except Exception as exc:
+        rep = {"err": f"{type(exc).__name__}: {exc}"}
+
+    picked = rep.get("identity", identity)
+    options = "".join(
+        f'<option value="{html.escape(i)}"'
+        + (" selected" if i == picked else "")
+        + f">{html.escape(short_id(i))} &middot; {n} slots</option>"
+        for i, n in rep.get("connectors", []))
+    if picked and picked not in {i for i, _ in rep.get("connectors", [])}:
+        options = (f'<option value="{html.escape(picked)}" selected>'
+                   f"{html.escape(short_id(picked))}</option>") + options
+    form = (
+        '<form class="aform" method="get" action="/analysis">'
+        '<label>from<input name="start" value="' + html.escape(start) + '" '
+        'placeholder="-24h or 2026-08-21"></label>'
+        '<label>to<input name="end" value="' + html.escape(end or "") + '" '
+        'placeholder="now"></label>'
+        '<label>reward gap<input name="threshold" class="thin" value="'
+        + html.escape(f"{threshold:g}") + '">%</label>'
+        '<label>connector<select name="identity">' + options + "</select></label>"
+        '<button type="submit">run</button></form>')
+
+    if rep.get("err"):
+        body = f'<div class="err">{html.escape(rep["err"])}</div>'
+    elif not rep.get("slots"):
+        body = (f'<div class="empty"><b>No slots for that connector in that '
+                "range.</b><br>Pick another connector or widen the range.</div>")
+    else:
+        qs = urllib.parse.urlencode(
+            {"start": start, "end": end or "", "threshold": f"{threshold:g}",
+             "identity": rep["identity"]})
+        head = (f'<div class="ahead">'
+                f'<span class="hascp"><code>{html.escape(rep["identity"])}</code>'
+                f'{copy_btn(rep["identity"])}</span>'
+                f'<span class="dim">{len(rep["slots"]):,} slots across '
+                f'{len(rep["windows"]):,} leader windows &middot; '
+                f'{rep["slots"][0]}&ndash;{rep["slots"][-1]} &middot; '
+                f'{_ch_ts(rep["lo"])} to {_ch_ts(rep["hi"])} UTC</span></div>')
+        body = head + "".join(
+            f'<section class="asec"><h2>{n}. {title}</h2>{inner}</section>'
+            for n, title, inner in (
+                (1, "Winner landed it, we never offered it",
+                 analysis_missing_html(rep["missing"], qs)),
+                (2, "Commit-time replay in the simulator",
+                 analysis_replay_html(rep["replay"])),
+                (3, f"Rounds at least {threshold:g}% below the winner",
+                 analysis_gap_html(rep["gap"])),
+                (4, "Leader Sequencing &rarr; simulator context install",
+                 analysis_install_html(rep["install"]))))
+    return f"""<!doctype html><html><head><meta charset="utf-8">
+<title>simbench &middot; analysis</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>{CSS}</style></head><body>
+<header>
+  <h1>sim<span>bench</span></h1>
+  <div class="sub">range analysis</div>
+  <a class="navlink" href="/">back to the slot explorer</a>
+  <a class="navlink" href="/reference">metrics reference</a>
+</header>
+{form}
+<main class="awrap">{body}</main>
+<script>{ANALYSIS_JS}</script>
+<script>{TICK_JS.replace("__SERVER_NOW__", f"{dt.datetime.now(dt.UTC).timestamp():.3f}")}</script>
+</body></html>"""
+
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/analysis/orders":
+            qs = urllib.parse.parse_qs(parsed.query)
+            one = lambda k, d: (qs.get(k, [d])[0] or d)
+            try:
+                out = analysis_orders_html(
+                    one("start", "-24h"), one("end", ""),
+                    float(one("threshold", "5")), one("identity", ""),
+                    int(one("slot", "0")), int(one("round", "0")))
+            except Exception as exc:
+                out = f'<span class="dim">{html.escape(str(exc)[:160])}</span>'
+            body = out.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if parsed.path == "/analysis":
+            qs = urllib.parse.parse_qs(parsed.query)
+            one = lambda k, d: (qs.get(k, [d])[0] or d)
+            try:
+                thr = float(one("threshold", "5"))
+            except ValueError:
+                thr = 5.0
+            try:
+                body = analysis_page(one("start", "-24h"), one("end", ""),
+                                     thr, one("identity", "")).encode()
+            except Exception as exc:
+                body = f"<pre>{html.escape(str(exc))}</pre>".encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if parsed.path == "/reference":
             try:
                 body = reference_page().encode()
