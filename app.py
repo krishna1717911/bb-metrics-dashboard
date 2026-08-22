@@ -600,7 +600,11 @@ def slot_rounds(slot):
         "SELECT index_in_slot, kind, toString(ts) AS ts, order_count, transaction_count, "
         "       bundle_count, reward, execution_cost, selected_cu, is_last, "
         "       won_by_us, uuid, connector_identity, run_id, instance_id, seq_id, "
-        f"       countSubstrings(payload, unhex('{VOTE_ID_HEX}')) AS votes "
+        f"       countSubstrings(payload, unhex('{VOTE_ID_HEX}')) AS votes, "
+        # Only the winner's payload comes back. A `selected` payload embeds
+        # whole transactions and runs to a hundred kilobytes, so pulling every
+        # one of them to count refs would cost megabytes a slot.
+        "       if(kind = 'winner', hex(payload), '') AS wire "
         f"FROM bifrost_miniblocks WHERE slot = {int(slot)} ORDER BY index_in_slot, kind, ts")
     rounds = {}
     for r in rows:
@@ -614,6 +618,26 @@ def slot_rounds(slot):
                 "votes": ch_int(r[16], -1)}
         slot_round = rounds.setdefault(idx, {"round": idx, "offers": [], "winner": None})
         if r[1] == "winner":
+            # transaction_count and bundle_count are written from
+            # BuilderOriginatedOrders, which holds only the orders the sending
+            # builder ORIGINATED. A foreign winner attaches none, so both
+            # columns read 0 -- or, when it attaches some, a number that has
+            # nothing to do with the block it won. The refs are the truth, so
+            # they are counted here and the columns ignored.
+            #
+            # Votes cannot come from the payload on this side: a winner tx ref
+            # is a bare SigPrefix with no bytes, so there is nothing to find the
+            # vote program id in. -1 means unknown; the comparison tab
+            # classifies them against the block instead.
+            item["votes"] = -1
+            try:
+                refs = _decode_refs(bytes.fromhex(r[17]))
+            except Exception:
+                item["wire_ok"] = False
+            else:
+                item["txs"] = sum(1 for k, _ in refs if k == "tx")
+                item["bundles"] = sum(1 for k, _ in refs if k == "bundle")
+                item["wire_ok"] = len(refs) == item["orders"]
             slot_round["winner"] = item
         else:
             slot_round["offers"].append(item)
@@ -816,20 +840,14 @@ def slot_winner_refs(slot):
             idx, want, b = ch_int(r[0]), ch_int(r[1]), bytes.fromhex(r[2])
         except (ValueError, TypeError):
             continue
-        off, txs, bundles = 55, [], 0
-        while off + 4 <= len(b):
-            tag = int.from_bytes(b[off:off + 4], "little")
-            size = {0: 16, 1: 32}.get(tag)
-            if size is None or off + 4 + size > len(b):
-                break
-            if tag == 0:
-                txs.append(b[off + 4:off + 20])
-            else:
-                bundles += 1
-            off += 4 + size
-        if len(txs) + bundles != want:      # layout did not hold; do not guess
+        try:
+            refs = _decode_refs(b)
+        except ValueError:                  # layout did not hold; do not guess
             continue
-        out[idx] = {"txs": txs, "bundles": bundles}
+        if len(refs) != want:
+            continue
+        out[idx] = {"txs": [r for k, r in refs if k == "tx"],
+                    "bundles": sum(1 for k, _ in refs if k == "bundle")}
     return out
 
 
@@ -2895,8 +2913,9 @@ def detail_table(title, items, show_won=False, winner_name=None,
         them, including transactions that never landed -- a chain lookup can
         only classify the ones that did, and used to leave the rest as "?".
 
-        A foreign winner's payload holds only refs, not transactions, so it has
-        no count and reads as a dash."""
+        A winner's payload holds only refs, not transactions, so there is
+        nothing to count the vote program id in and it reads as a dash. The
+        comparison tab classifies those refs against the block instead."""
         v = i.get("votes", -1)
         if v is None or v < 0:
             return "&mdash;", "&mdash;"
@@ -4040,6 +4059,32 @@ details.around>summary:hover{background:#111c26}
   border-radius:3px;padding:1px 5px;margin:0 4px 4px 0;word-break:break-all}
 .alist code.bid{color:#8fa3ba;border-color:#1e3245}
 .alist .dim{color:#4d5c70;font-size:10.5px}
+/* reward chart */
+.chartlegend{display:flex;flex-wrap:wrap;gap:18px;margin:0 0 8px;color:#8fa3ba;
+  font-size:11px}
+.chartlegend span{display:flex;align-items:center;gap:6px}
+.chartlegend i{width:11px;height:3px;border-radius:2px;display:inline-block}
+.chartlegend i.nooffer{width:1px;height:9px;border-radius:0;background:#4d5c70}
+.chartwrap{background:#0c141b;border:1px solid #1a2430;border-radius:5px;
+  padding:4px 0}
+#rwchart{width:100%;display:block}
+.cgrid{stroke:#16212c;stroke-width:1}
+.cgridv{stroke:#111b24;stroke-width:1}
+.caxis{stroke:#22303f;stroke-width:1}
+.ctick{fill:#5b6b80;font-size:9.5px;font-family:ui-monospace,Menlo,monospace}
+.cband{fill:#1e2a36;opacity:.55}
+.cline{fill:none;stroke-width:2;stroke-linejoin:round;stroke-linecap:round}
+.cnone{stroke:#4d5c70;stroke-width:1}
+.clabel{font-size:10.5px;font-weight:600}
+.chair{stroke:#7fd8f0;stroke-width:1;opacity:.7}
+.ctip{position:fixed;z-index:60;background:#0f1a24;border:1px solid #2b3a4b;
+  border-radius:5px;padding:7px 10px;font-size:11px;color:#cfe0f0;
+  pointer-events:none;box-shadow:0 6px 20px #0008;line-height:1.6}
+.ctip b{display:block;font-family:ui-monospace,Menlo,monospace;margin-bottom:3px}
+.ctip span{display:flex;align-items:center;gap:6px;
+  font-family:ui-monospace,Menlo,monospace}
+.ctip i{width:9px;height:3px;border-radius:2px;display:inline-block}
+.ctip .g{color:#8fa3ba;margin-top:2px}
 /* dispatch DAG */
 .dagbar{display:flex;align-items:center;flex-wrap:wrap;gap:5px;
   padding:8px 0 10px;border-bottom:1px solid #141d27;margin-bottom:10px}
@@ -5400,7 +5445,7 @@ def analysis_gap(slots, threshold):
         (best if kind == "selected" else win)[key] = (
             ch_int(reward), ch_int(orders), is_last in TRUEISH)
 
-    flagged, gaps = [], []
+    flagged, gaps, series = [], [], []
     for key in sorted(win):
         w_reward, w_orders, is_tail = win[key]
         o_reward, o_orders, _ = best.get(key, (0, 0, False))
@@ -5408,12 +5453,13 @@ def analysis_gap(slots, threshold):
             continue
         gap = 100.0 * (w_reward - o_reward) / w_reward
         gaps.append(gap)
+        series.append([key[0], key[1], o_reward, w_reward])
         if gap >= threshold:
             flagged.append({"slot": key[0], "round": key[1], "tail": is_tail,
                             "ours": o_reward, "theirs": w_reward,
                             "our_orders": o_orders, "their_refs": w_orders,
                             "gap": gap})
-    return {"flagged": flagged, "rounds": len(gaps),
+    return {"flagged": flagged, "rounds": len(gaps), "series": series,
             "slots": len({f["slot"] for f in flagged}),
             "slots_total": len({s for s, _ in win}),
             "mean": (sum(gaps) / len(gaps)) if gaps else None,
@@ -5796,6 +5842,198 @@ def analysis_orders_html(start, end, threshold, identity, slot, rnd):
     return "".join(out) or '<span class="dim">nothing missing here</span>'
 
 
+# Two series over an ordered sequence, so: multi-line, categorical colour.
+# Slots 1 and 2 of the validated dark categorical order -- blue then orange --
+# checked against this page's own surface rather than assumed:
+#   validate_palette.js "#3987e5,#d95926" --mode dark --surface #0c141b --pairs all
+#   lightness band PASS, chroma PASS, CVD dE 26.8 (protan) PASS,
+#   normal-vision dE 31.8 PASS, contrast >= 3:1 PASS
+OURS_HUE = "#3987e5"
+WINNER_HUE = "#d95926"
+
+
+def analysis_chart_html(rep):
+    """Best offer against the winning bid, one point per miniblock.
+
+    A log y axis, because the rewards run from tens of thousands of lamports to
+    tens of millions and a linear axis would press nine rounds in ten flat
+    against the floor.
+
+    A round we did not offer into is a GAP in our line, not a zero plotted on
+    the floor: nothing was bid, and drawing that as a very small bid would
+    invite reading it as a near miss. Those rounds get a tick along the bottom
+    instead, and the count is stated."""
+    pts = rep.get("series") or []
+    if len(pts) < 2:
+        return '<div class="none">not enough rounds in this range to plot</div>'
+    live = [v for _, _, ours, theirs in pts for v in (ours, theirs) if v > 0]
+    if not live:
+        return '<div class="none">no round in this range carried a reward</div>'
+    silent = sum(1 for _, _, ours, _ in pts if ours <= 0)
+    blob = json.dumps({"pts": pts, "lo": min(live), "hi": max(live),
+                       "ours": OURS_HUE, "win": WINNER_HUE},
+                      separators=(",", ":"))
+    rows = "".join(
+        f'<tr><td class=m>{_slot_link(s, r)}</td>'
+        f'<td class="n m">{o:,}</td><td class="n m">{t:,}</td>'
+        f'<td class="n m">{100.0 * (t - o) / t:.2f}%</td></tr>'
+        for s, r, o, t in pts)
+    return (
+        '<div class="chartlegend">'
+        f'<span><i style="background:{OURS_HUE}"></i>our best offer</span>'
+        f'<span><i style="background:{WINNER_HUE}"></i>the winning bid</span>'
+        + (f'<span><i class="nooffer"></i>no offer from us '
+           f"({silent:,} of {len(pts):,})</span>" if silent else "")
+        + "</div>"
+        '<div class="chartwrap"><svg id="rwchart" role="img" '
+        'aria-label="best offer against the winning bid, per miniblock">'
+        "</svg></div>"
+        f'<script id="rwdata" type="application/json">{blob}</script>'
+        f"<script>{CHART_JS}</script>"
+        '<div class="anote">One point per miniblock, in slot then round order. '
+        "The y axis is <b>logarithmic</b>: rewards here span four orders of "
+        "magnitude and a linear axis would flatten almost every round against "
+        "the floor. A round we never offered into breaks our line rather than "
+        "plotting a zero &mdash; nothing was bid, and a dot on the floor would "
+        "read as a near miss."
+        + (f" There are {silent:,} of those." if silent else "")
+        + " Only rounds the relay echoed a winner for are plotted.</div>"
+        '<details class="aslot"><summary><span class="aslotn">the same data as '
+        f'a table</span><span class="dim">{len(pts):,} miniblocks</span>'
+        "</summary>"
+        '<table class="atab"><tr><th>slot &middot; round</th>'
+        "<th class=n>our best</th><th class=n>winner</th><th class=n>gap</th>"
+        "</tr>" + rows + "</table></details>")
+
+
+CHART_JS = r"""
+(function(){
+  var el = document.getElementById('rwdata');
+  if(!el) return;
+  var D = JSON.parse(el.textContent);
+  var svg = document.getElementById('rwchart');
+  var NS = 'http://www.w3.org/2000/svg';
+  var PADL = 62, PADR = 74, PADT = 14, PADB = 34, H = 300;
+  var tip = null;
+
+  // one decade below the smallest real bid, so the floor is never a data point
+  var lo = Math.pow(10, Math.floor(Math.log10(D.lo)) ),
+      hi = Math.pow(10, Math.ceil(Math.log10(D.hi)));
+  var l0 = Math.log10(lo), l1 = Math.log10(hi);
+
+  function mk(n, attrs, parent){
+    var e = document.createElementNS(NS, n);
+    for(var k in attrs) e.setAttribute(k, attrs[k]);
+    (parent || svg).appendChild(e);
+    return e;
+  }
+  function x(i){ return PADL + (W - PADL - PADR) * (D.pts.length < 2 ? 0 : i / (D.pts.length - 1)); }
+  function y(v){ return PADT + (H - PADT - PADB) * (1 - (Math.log10(v) - l0) / (l1 - l0)); }
+  function sol(v){
+    if(v >= 1e9) return (v / 1e9).toFixed(2) + ' SOL';
+    if(v >= 1e6) return (v / 1e6).toFixed(2) + 'M';
+    if(v >= 1e3) return (v / 1e3).toFixed(0) + 'k';
+    return String(v);
+  }
+
+  var W = 900;
+  function draw(){
+    while(svg.firstChild) svg.removeChild(svg.firstChild);
+    W = Math.max(svg.clientWidth || 900, 360);
+    svg.setAttribute('viewBox', '0 0 ' + W + ' ' + H);
+    svg.setAttribute('height', H);
+
+    // y gridlines, one per decade
+    for(var d = Math.ceil(l0); d <= l1; d++){
+      var v = Math.pow(10, d), yy = y(v);
+      mk('line', {x1: PADL, x2: W - PADR, y1: yy, y2: yy, class: 'cgrid'});
+      mk('text', {x: PADL - 8, y: yy + 3, class: 'ctick', 'text-anchor': 'end'})
+        .textContent = sol(v);
+    }
+    // x ticks at slot boundaries, thinned to fit
+    var bounds = [], last = null;
+    D.pts.forEach(function(p, i){ if(p[0] !== last){ bounds.push([i, p[0]]); last = p[0]; } });
+    var step = Math.ceil(bounds.length / Math.max(2, Math.floor(W / 130)));
+    bounds.forEach(function(b, n){
+      if(n % step) return;
+      mk('line', {x1: x(b[0]), x2: x(b[0]), y1: PADT, y2: H - PADB, class: 'cgridv'});
+      mk('text', {x: x(b[0]), y: H - PADB + 14, class: 'ctick', 'text-anchor': 'middle'})
+        .textContent = b[1];
+    });
+
+    // the gap between the two, so the story reads without tracing two lines
+    var band = [], back = [];
+    D.pts.forEach(function(p, i){
+      if(p[2] > 0 && p[3] > 0){ band.push(x(i) + ',' + y(p[3])); back.unshift(x(i) + ',' + y(p[2])); }
+    });
+    if(band.length > 1)
+      mk('polygon', {points: band.concat(back).join(' '), class: 'cband'});
+
+    // a run of consecutive rounds we bid in; a break means we bid nothing
+    // a point is [slot, round, ours, winner]; winner drawn first so ours sits
+    // on top where the two coincide
+    [[3, D.win, 'cwin'], [2, D.ours, 'cours']].forEach(function(s){
+      var run = [];
+      function flush(){
+        if(run.length > 1) mk('polyline', {points: run.join(' '), class: 'cline ' + s[2], stroke: s[1]});
+        else if(run.length === 1) mk('circle', {cx: +run[0].split(',')[0], cy: +run[0].split(',')[1], r: 1.6, fill: s[1]});
+        run = [];
+      }
+      D.pts.forEach(function(p, i){
+        var v = p[s[0]];
+        if(v > 0) run.push(x(i) + ',' + y(v)); else flush();
+      });
+      flush();
+    });
+
+    // rounds with no offer of ours, marked on the axis rather than the floor
+    D.pts.forEach(function(p, i){
+      if(p[2] > 0) return;
+      mk('line', {x1: x(i), x2: x(i), y1: H - PADB, y2: H - PADB + 5, class: 'cnone'});
+    });
+
+    // direct labels, so identity is never colour alone
+    var lastPt = D.pts[D.pts.length - 1];
+    if(lastPt[3] > 0) mk('text', {x: W - PADR + 6, y: y(lastPt[3]) + 3, class: 'clabel', fill: D.win}).textContent = 'winner';
+    var lastOurs = null;
+    for(var i = D.pts.length - 1; i >= 0; i--) if(D.pts[i][2] > 0){ lastOurs = D.pts[i]; break; }
+    if(lastOurs) mk('text', {x: W - PADR + 6, y: y(lastOurs[2]) + 3, class: 'clabel', fill: D.ours}).textContent = 'ours';
+
+    mk('line', {x1: PADL, x2: PADL, y1: PADT, y2: H - PADB, class: 'caxis'});
+    mk('line', {x1: PADL, x2: W - PADR, y1: H - PADB, y2: H - PADB, class: 'caxis'});
+    hair = mk('line', {x1: 0, x2: 0, y1: PADT, y2: H - PADB, class: 'chair', opacity: 0});
+  }
+
+  var hair = null;
+  function nearest(px){
+    var i = Math.round((px - PADL) / Math.max(1, (W - PADL - PADR)) * (D.pts.length - 1));
+    return Math.max(0, Math.min(D.pts.length - 1, i));
+  }
+  svg.addEventListener('mousemove', function(ev){
+    var r = svg.getBoundingClientRect();
+    var px = (ev.clientX - r.left) * (W / r.width);
+    if(px < PADL || px > W - PADR) return;
+    var i = nearest(px), p = D.pts[i];
+    if(hair){ hair.setAttribute('x1', x(i)); hair.setAttribute('x2', x(i)); hair.setAttribute('opacity', 1); }
+    if(!tip){ tip = document.createElement('div'); tip.className = 'ctip'; document.body.appendChild(tip); }
+    var gap = p[3] > 0 ? (100 * (p[3] - p[2]) / p[3]).toFixed(2) + '%' : '-';
+    tip.innerHTML = '<b>' + p[0] + ' round ' + p[1] + '</b>'
+      + '<span><i style="background:' + D.ours + '"></i>ours '
+      + (p[2] > 0 ? p[2].toLocaleString() : 'no offer') + '</span>'
+      + '<span><i style="background:' + D.win + '"></i>winner ' + p[3].toLocaleString() + '</span>'
+      + '<span class="g">gap ' + gap + '</span>';
+    tip.style.left = Math.min(ev.clientX + 14, window.innerWidth - tip.offsetWidth - 10) + 'px';
+    tip.style.top = (ev.clientY + 16) + 'px';
+  });
+  svg.addEventListener('mouseleave', function(){
+    if(hair) hair.setAttribute('opacity', 0);
+    if(tip){ tip.remove(); tip = null; }
+  });
+  window.addEventListener('resize', draw);
+  draw();
+})();
+"""
+
 def analysis_page(start, end, threshold, identity):
     try:
         rep = analysis_run(start, end, threshold, identity)
@@ -5850,7 +6088,10 @@ def analysis_page(start, end, threshold, identity):
                 (3, f"Rounds at least {threshold:g}% below the winner",
                  analysis_gap_html(rep["gap"])),
                 (4, "Leader Sequencing &rarr; simulator context install",
-                 analysis_install_html(rep["install"]))))
+                 analysis_install_html(rep["install"])),
+                (5, "Reward per miniblock &mdash; our best offer against the "
+                    "winning bid",
+                 analysis_chart_html(rep["gap"]))))
     return f"""<!doctype html><html><head><meta charset="utf-8">
 <title>simbench &middot; analysis</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">

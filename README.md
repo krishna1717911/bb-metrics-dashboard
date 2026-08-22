@@ -415,6 +415,22 @@ counted above the graph, and since a vote touches only its own vote account
 every one of them starts unblocked with no edges — **only orders with a
 dependency** hides them (372 of 453 on that round).
 
+### A winner row's own counts are not usable
+
+`transaction_count` and `bundle_count` are written from `BuilderOriginatedOrders`,
+which holds only the orders the **sending** builder originated. A foreign winner
+attaches none, so both columns read 0 — or, when it attaches some, a number with
+no relation to the block it won. Measured on one slot the columns said 3 txs and
+2 bundles for a round whose payload carries 228 and 33, and 0/0 for the five
+rounds after it.
+
+So for winner rows the columns are ignored and the counts come from the payload's
+order refs, which sum to `order_count` exactly. Votes cannot come from a winner
+payload at all — a tx ref is a bare SigPrefix with no bytes, so there is nothing
+to find the vote program id in — and are classified against the block instead,
+which is why a winner's vote split reads as a dash in the offers table and is
+resolved in the comparison tab.
+
 ### The winner's graph is rebuilt
 
 A `WireChosenMiniblock` carries a flat `Vec<NodeOrderRef>` and no CSR, so the
@@ -497,6 +513,22 @@ appear in the range, and `ANALYSIS_IDENTITY` sets which one it opens on.
 3. **Rounds at least N% below the winner**, with the whole-range gap
    distribution beside the flagged rows.
 4. **Leader Sequencing → simulator context install**, raw and clock-corrected.
+5. **Reward per miniblock** — our best offer against the winning bid, one point
+   per round across every slot in the range.
+
+The chart's y axis is **logarithmic**: rewards span four orders of magnitude in a
+day and a linear axis flattens nine rounds in ten against the floor. A round we
+never offered into **breaks** our line rather than plotting a zero — nothing was
+bid, and a dot on the floor reads as a near miss; those rounds get a tick on the
+axis and a count instead. The band between the lines is the gap. Hovering gives
+the slot, round, both rewards and the gap, and the same numbers are in a table
+below the chart, so no value is reachable only by hover.
+
+The two hues are slots 1 and 2 of the categorical order, validated against this
+page's own surface rather than eyeballed:
+`validate_palette.js "#3987e5,#d95926" --mode dark --surface #0c141b --pairs all`
+— lightness band, chroma, CVD ΔE 26.8, normal-vision ΔE 31.8 and contrast all
+pass.
 
 **The two stores are on different clocks**, so report 4 corrects for it. The
 skew is bounded per leader window as the minimum of `round_committed` minus
