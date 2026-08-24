@@ -4767,9 +4767,17 @@ def connector_eligibility():
     out = {}
     for c, subs, bad, won in rows:
         subs, bad, won = ch_int(subs), ch_int(bad), ch_int(won)
+        share = (bad / subs) if subs else 1.0
         out[c] = {"submitted": subs, "ineligible": bad, "won": won,
-                  # graded if anything we sent was allowed to compete
-                  "graded": subs > 0 and bad < subs}
+                  "share": share,
+                  # NOT "at least one got through". Measured on a live range,
+                  # one connector had 16,211 of 16,212 rejected as ineligible
+                  # -- a single stray row, which a bad < subs test reads as
+                  # "grades us" and reports beside a connector with zero
+                  # rejections and real wins. A blanket rejection is the thing
+                  # being detected, so the test is whether MOST of what we send
+                  # is refused outright.
+                  "graded": subs > 0 and share < 0.5}
     with _elig_lock:
         if len(_elig_cache) > 6:
             _elig_cache.clear()
@@ -4823,9 +4831,10 @@ def _leader_grade(leader):
     if e is None or e["graded"]:
         return ""
     return ('<span class="warnpill" tabindex="0" data-tip="Over the last '
-            f'{ELIG_HOURS}h the relay rejected all {e["submitted"]:,} of our '
-            "offers to this connector with builder_not_eligible. Nothing we "
-            'sent was ever considered.">not grading us</span>')
+            f'{ELIG_HOURS}h the relay rejected {e["ineligible"]:,} of our '
+            f'{e["submitted"]:,} offers to this connector '
+            f'({100 * e["share"]:.2f}%) with builder_not_eligible. Nothing we '
+            'send here is being considered.">not grading us</span>')
 
 
 def strip_html(windows, sel_win, sel_slot, grade='all'):
