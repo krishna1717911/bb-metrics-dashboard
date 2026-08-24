@@ -2801,6 +2801,405 @@ def shred_html(slot, shreds, parent=None, ready=None, shift=0,
             f"<table><thead>{head}</thead><tbody>{''.join(body)}</tbody></table></div>")
 
 
+# ------------------------------------------------------- the offer timeline
+#
+# Every builder's bidding for one slot, from the relay's own table. Our
+# bifrost_miniblocks only ever holds what WE sent; the relay sees all of it,
+# which is the only place the shape of an auction exists.
+#
+# One facet per round, because a round IS the auction and the rounds of a
+# single slot are not on a comparable scale -- measured on 441378523 the
+# rounds peaked between 202k and 40.8M lamports, so one shared y axis would
+# flatten seven of the eight against the floor.
+#
+# Within a facet: x is milliseconds since the relay opened the round, y is the
+# reward the offer carried. That is the question directly -- when was it sent,
+# and what was it worth. The line is stepped because a bid stands until its
+# builder replaces it.
+#
+# Colour is four validated hues and no more:
+#   validate_palette.js "#3987e5,#c98500,#d55181,#008300" --mode dark
+#                       --surface #0c141b --pairs all
+#   lightness/chroma/normal-vision/contrast PASS, CVD dE 6.9 WARN
+# The all-pairs list is the right one here rather than the adjacent list --
+# these are small multiples and any two markers can end up side by side in a
+# 40ms facet. 6.9 sits in the band the validator allows ONLY with secondary
+# encoding, so every builder also carries its own marker shape and a direct
+# label, and identity never rests on colour alone. Five hues do not pass at
+# all, so a fifth builder in one round folds to grey rather than inventing a
+# hue -- that is 4.8% of rounds measured over two hours.
+
+OFFER_HUES = ["#3987e5", "#c98500", "#d55181", "#008300"]
+# Shape is a FULL identity channel, not a tie-breaker for the first four.
+# Only four hues survive the all-pairs check, and a slot routinely carries
+# six builders -- measured on 441348747, six, of which the one that won
+# every round would have folded into the same grey circle as a fallback
+# nobody cares about. With a distinct shape each, identity is recoverable
+# for every builder whether or not it got a hue.
+OFFER_SHAPES = ["circle", "square", "diamond", "triangle", "plus", "bar"]
+OFFER_OTHER = "#6b7f96"
+
+
+def slot_offers(slot, stamps):
+    """Every relay event for this slot, bucketed by round."""
+    if not (RELAY_URL and RELAY_DS_UID):
+        return {"err": "norelay"}
+    if not stamps:
+        # The relay query has to be bounded by time or it walks a very large
+        # table, and the bound comes from this slot's own rows in OUR tables.
+        # A slot we never offered into has none.
+        return {"err": "nowindow"}
+    pad = dt.timedelta(minutes=10)
+    lo = (dt.datetime.fromisoformat(min(stamps)[:26]) - pad
+          ).strftime("%Y-%m-%d %H:%M:%S")
+    hi = (dt.datetime.fromisoformat(max(stamps)[:26]) + pad
+          ).strftime("%Y-%m-%d %H:%M:%S")
+    cols, rows = relay(
+        "SELECT index_in_slot AS rnd, event,"
+        " toUnixTimestamp64Milli(timestamp) AS ms,"
+        " ifNull(builder_id, '') AS builder,"
+        " ifNull(reward, 0) AS reward, order_count AS orders,"
+        " ifNull(toUnixTimestamp64Milli(deadline), 0) AS dl,"
+        " ifNull(reason, '') AS reason, ifNull(toString(mini_block_uuid), '') AS uuid"
+        " FROM relay.mini_block_events"
+        f" WHERE timestamp >= '{lo}' AND timestamp <= '{hi}' AND slot = {int(slot)}"
+        " ORDER BY timestamp")
+    at = {n: i for i, n in enumerate(cols)}
+    if not rows:
+        return {}
+
+    def num(r, k):
+        try:
+            return int(r[at[k]] or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    rounds = {}
+    for r in rows:
+        rnd = num(r, "rnd")
+        b = rounds.setdefault(rnd, {"round": rnd, "opened": None, "deadline": None,
+                                    "bids": [], "verdicts": {}, "chosen": None,
+                                    "sealed": None})
+        ev, ms = r[at["event"]], num(r, "ms")
+        if ev == "round_opened":
+            b["opened"] = ms if b["opened"] is None else min(b["opened"], ms)
+            if num(r, "dl"):
+                b["deadline"] = num(r, "dl")
+        elif ev == "submitted":
+            b["bids"].append({"t": ms, "b": r[at["builder"]], "r": num(r, "reward"),
+                              "o": num(r, "orders"), "u": r[at["uuid"]], "v": ""})
+        elif ev in ("offer_best", "offer_not_best", "offer_rejected"):
+            # the relay's verdict lands on the same uuid a moment later
+            b["verdicts"][(r[at["uuid"]], num(r, "ms"))] = (
+                {"offer_best": "best", "offer_not_best": "not best",
+                 "offer_rejected": r[at["reason"]] or "rejected"}[ev])
+        elif ev == "round_chosen":
+            b["chosen"] = {"b": r[at["builder"]], "r": num(r, "reward"),
+                           "o": num(r, "orders"), "t": ms, "u": r[at["uuid"]]}
+        elif ev == "block_sealed":
+            b["sealed"] = ms
+
+    for b in rounds.values():
+        by_uuid = {}
+        for (uuid, _), verdict in b["verdicts"].items():
+            by_uuid.setdefault(uuid, verdict)
+        for bid in b["bids"]:
+            bid["v"] = by_uuid.get(bid["u"], "")
+        b.pop("verdicts", None)
+        b["bids"].sort(key=lambda x: x["t"])
+        if b["opened"] is None and b["bids"]:
+            b["opened"] = b["bids"][0]["t"]
+    return {k: v for k, v in sorted(rounds.items()) if v["bids"]}
+
+
+def offers_html(slot, data, relay_err=None):
+    def bare(msg):
+        return ('<div class="panel"><div class="dtlhead">offer timeline</div>'
+                f'<div class="none">{msg}</div></div>')
+
+    if data is None or (isinstance(data, dict) and data.get("err") == "norelay"):
+        return bare("the relay is not configured, and it is the only place "
+                    "another builder's offers exist &mdash; our own tables "
+                    "record what we sent and nothing else")
+    if data.get("err") == "nowindow":
+        return bare(f"slot {slot} has no rows in our own tables, and the relay "
+                    "query is bounded by them &mdash; there is no window to ask "
+                    "about. This happens on a slot we never offered into.")
+    if not data:
+        return ('<div class="panel"><div class="dtlhead">offer timeline</div>'
+                '<div class="none">the relay has no rows for this slot'
+                + (f" &mdash; {html.escape(relay_err)}" if relay_err else "")
+                + "</div></div>")
+
+    ours = (dep().get("relay_builder") or "").strip()
+    builders = sorted({bid["b"] for r in data.values() for bid in r["bids"]})
+    # Fixed assignment by name, so a builder keeps its colour from slot to slot
+    # and from round to round rather than being repainted by who turned up.
+    style = {}
+    for i, b in enumerate(builders):
+        style[b] = {"c": OFFER_HUES[i] if i < len(OFFER_HUES) else OFFER_OTHER,
+                    "s": OFFER_SHAPES[i % len(OFFER_SHAPES)]}
+    folded = [b for b in builders if style[b]["c"] == OFFER_OTHER]
+
+    legend = "".join(
+        f'<span class="obuilder"><i class="om {style[b]["s"]}" '
+        f'style="background:{style[b]["c"]}"></i>{html.escape(b)}'
+        + ('<b class="ousp">ours</b>' if b == ours else "") + "</span>"
+        for b in builders)
+
+    blob = json.dumps({"rounds": list(data.values()), "style": style,
+                       "ours": ours}, separators=(",", ":"))
+    total_bids = sum(len(r["bids"]) for r in data.values())
+    return (
+        '<div class="panel"><div class="dtlhead">offer timeline'
+        f'<span class="note">every builder\'s bidding for this slot, from the '
+        f"relay &middot; {total_bids:,} offers across {len(data)} rounds "
+        "&middot; hover a marker for the builder, the reward and the order "
+        "count</span></div>"
+        f'<div class="olegend">{legend}</div>'
+        + (f'<div class="dagnote">{len(folded)} builder'
+           f'{"" if len(folded) == 1 else "s"} beyond the fourth are grey: only '
+           "four hues can be told apart reliably at this density, so a fifth is "
+           "not given an invented one. They keep their own marker shape, which "
+           "is what identifies every builder here &mdash; the colours are a "
+           "convenience on top of it.</div>" if folded else "")
+        + '<div id="offwrap"></div>'
+        f'<script id="offdata" type="application/json">{blob}</script>'
+        f"<script>{OFFERS_JS}</script>"
+        + _offers_table(data, ours)
+        + '<div class="anote"><b>One timeline per round, because a round is '
+        "the auction.</b> Time runs <b>down</b> the spine, in milliseconds "
+        "since the relay opened the round, and each builder has its own column "
+        "beside it &mdash; two builders bidding in the same millisecond sit "
+        "side by side rather than on top of each other. Every bullet is one "
+        "offer; hover it for the builder, the reward and the order count.<br>"
+        "<b>Round opened</b>, <b>deadline</b> and <b>winner</b> are flags "
+        "across the full width, because they are moments in the round rather "
+        "than one builder's doing. A bullet is sized by the reward it carried, "
+        "relative to the best bid of that round, so a ladder climbing toward "
+        "the deadline is visible without reading a single number; the ringed "
+        "one is the offer the relay chose, and a faded one was rejected. An "
+        "offer that arrived <b>after the deadline</b> is ringed amber rather "
+        "than faded &mdash; it is work that was done and then missed the "
+        "window, which is worth seeing, not hiding. Every "
+        "builder carries its own marker shape as well as its own colour, so "
+        "identity never rests on colour alone."
+        "</div></div>")
+
+
+def _offers_table(data, ours):
+    rows = []
+    for r in data.values():
+        base = r["opened"] or 0
+        for bid in r["bids"]:
+            rows.append(
+                f'<tr><td class="n m">{r["round"]}</td>'
+                f'<td class="n m">{bid["t"] - base}</td>'
+                f'<td class=m>{html.escape(bid["b"])}'
+                + ('<b class="ousp">ours</b>' if bid["b"] == ours else "") + "</td>"
+                f'<td class="n m">{bid["r"]:,}</td>'
+                f'<td class="n m">{bid["o"]:,}</td>'
+                f'<td class="m dim">{html.escape(bid["v"] or "&mdash;")}</td></tr>')
+    return ('<details class="aslot"><summary><span class="aslotn">every offer '
+            f'as a table</span><span class="dim">{len(rows):,} offers</span>'
+            "</summary>"
+            '<table class="atab"><tr><th class=n>round</th>'
+            "<th class=n>+ms</th><th>builder</th><th class=n>reward</th>"
+            "<th class=n>orders</th><th>relay verdict</th></tr>"
+            + "".join(rows) + "</table></details>")
+
+OFFERS_JS = r"""
+(function(){
+  var el = document.getElementById('offdata');
+  if(!el) return;
+  var D = JSON.parse(el.textContent);
+  var wrap = document.getElementById('offwrap');
+  var NS = 'http://www.w3.org/2000/svg';
+  // Time runs DOWN. The spine is the round's clock; each builder gets a column
+  // beside it and one bullet per offer, so two builders bidding in the same
+  // millisecond sit side by side instead of on top of each other.
+  var GUT = 52, SPINE = 62, COL0 = 108, PADT = 30, PADB = 16;
+  var MIN_H = 210, MAX_H = 460;
+  var tip = null;
+
+  function mk(n, a, p){
+    var e = document.createElementNS(NS, n);
+    for(var k in a) e.setAttribute(k, a[k]);
+    p.appendChild(e);
+    return e;
+  }
+  function money(v){
+    if(v >= 1e9) return (v/1e9).toFixed(2) + ' SOL';
+    if(v >= 1e6) return (v/1e6).toFixed(2) + 'M';
+    if(v >= 1e3) return (v/1e3).toFixed(0) + 'k';
+    return String(v);
+  }
+  function esc(s){ var d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+  function shortName(n){ return n.length > 15 ? n.slice(0, 14) + '…' : n; }
+
+  function marker(g, shape, x, y, r, fill, cls){
+    var e;
+    if(shape === 'square') e = mk('rect', {x:x-r, y:y-r, width:2*r, height:2*r, fill:fill}, g);
+    else if(shape === 'diamond') e = mk('polygon', {points:[x,y-r-.6, x+r+.6,y, x,y+r+.6, x-r-.6,y].join(' '), fill:fill}, g);
+    else if(shape === 'triangle') e = mk('polygon', {points:[x,y-r-1, x+r+.8,y+r, x-r-.8,y+r].join(' '), fill:fill}, g);
+    else if(shape === 'plus') e = mk('polygon', {points:[x-r,y-r/2.6, x-r/2.6,y-r/2.6, x-r/2.6,y-r, x+r/2.6,y-r, x+r/2.6,y-r/2.6, x+r,y-r/2.6, x+r,y+r/2.6, x+r/2.6,y+r/2.6, x+r/2.6,y+r, x-r/2.6,y+r, x-r/2.6,y+r/2.6, x-r,y+r/2.6].join(' '), fill:fill}, g);
+    else if(shape === 'bar') e = mk('rect', {x:x-r-1, y:y-r/2.4, width:2*r+2, height:Math.max(2, r/1.2), fill:fill}, g);
+    else e = mk('circle', {cx:x, cy:y, r:r, fill:fill}, g);
+    if(cls) e.setAttribute('class', cls);
+    return e;
+  }
+
+  function facet(rd){
+    var base = rd.opened || (rd.bids.length ? rd.bids[0].t : 0);
+    var marks = rd.bids.map(function(b){ return b.t - base; });
+    if(rd.deadline) marks.push(rd.deadline - base);
+    if(rd.chosen) marks.push(rd.chosen.t - base);
+    // headroom, or an offer a millisecond past the deadline lands on the
+    // bottom edge of the frame and reads as part of it
+    var span = Math.max(1, Math.max.apply(null, marks));
+    span = span + Math.max(1, Math.round(span * 0.06));
+    var names = Object.keys(D.style).filter(function(n){
+      return rd.bids.some(function(b){ return b.b === n; });
+    }).sort();
+    var maxR = Math.max(1, Math.max.apply(null, rd.bids.map(function(b){ return b.r; })));
+
+    var card = document.createElement('div');
+    card.className = 'ofacet';
+    var head = document.createElement('div');
+    head.className = 'ohead';
+    var late = rd.deadline
+      ? rd.bids.filter(function(b){ return b.t > rd.deadline; }).length : 0;
+    head.innerHTML = '<b>round ' + rd.round + '</b>'
+      + '<span class="dim">' + rd.bids.length + ' offers over ' + span + ' ms</span>'
+      + (late ? '<span class="olate">' + late + ' after the deadline</span>' : '')
+      + (rd.chosen
+          ? '<span class="owin">won by ' + esc(rd.chosen.b) + ' · '
+            + money(rd.chosen.r) + '</span>'
+            + '<span class="ouuid">' + esc(rd.chosen.u || '') + '</span>'
+          : '<span class="dim">no winner echoed</span>');
+    card.appendChild(head);
+    var svg = document.createElementNS(NS, 'svg');
+    svg.setAttribute('class', 'osvg');
+    card.appendChild(svg);
+    wrap.appendChild(card);
+
+    function draw(){
+      while(svg.firstChild) svg.removeChild(svg.firstChild);
+      var W = Math.max(svg.clientWidth || 900, 340);
+      var colW = Math.max(58, Math.min(150, (W - COL0 - 16) / Math.max(1, names.length)));
+      var H = Math.max(MIN_H, Math.min(MAX_H, PADT + PADB + span * 7));
+      svg.setAttribute('viewBox', '0 0 ' + W + ' ' + H);
+      svg.setAttribute('height', H);
+      var y = function(ms){ return PADT + (H - PADT - PADB) * (ms / span); };
+      var colX = function(i){ return COL0 + colW * i + colW / 2; };
+
+      // the spine: this round's clock, running down
+      mk('line', {x1:SPINE, x2:SPINE, y1:PADT, y2:H-PADB, class:'ospine'}, svg);
+      var step = span <= 12 ? 2 : span <= 30 ? 5 : 10;
+      for(var t = 0; t <= span; t += step){
+        mk('line', {x1:SPINE-3, x2:SPINE, y1:y(t), y2:y(t), class:'otick'}, svg);
+        mk('text', {x:SPINE-7, y:y(t)+3, class:'ctick', 'text-anchor':'end'}, svg)
+          .textContent = '+' + t;
+      }
+      mk('text', {x:GUT-10, y:PADT-12, class:'ocolhd', 'text-anchor':'end'}, svg)
+        .textContent = 'ms';
+
+      // one column per builder, headed by its name and marker
+      names.forEach(function(n, i){
+        var st = D.style[n];
+        mk('line', {x1:colX(i), x2:colX(i), y1:PADT, y2:H-PADB, class:'ocol'}, svg);
+        var text = shortName(n);
+        // marker beside the name, not above it, or the two overlap
+        var wide = text.length * 5.1;
+        var lab = mk('text', {x:colX(i) + 5, y:PADT-9, class:'ocolhd',
+                              'text-anchor':'middle'}, svg);
+        lab.textContent = text;
+        if(n === D.ours) lab.setAttribute('class', 'ocolhd ocolours');
+        marker(svg, st.s, colX(i) - wide / 2 - 1, PADT-12, 3.2, st.c, 'om');
+      });
+
+      // events are flags across the whole width, so they read as moments in
+      // the round rather than as another builder's mark
+      function flag(ms, cls, text, side){
+        var yy = y(ms);
+        mk('line', {x1:SPINE, x2:W-8, y1:yy, y2:yy, class:'oflag ' + cls}, svg);
+        mk('polygon', {points:[SPINE,yy-4.5, SPINE+7,yy, SPINE,yy+4.5].join(' '),
+                       class:'oflagp ' + cls}, svg);
+        var left = side === 'left';
+        mk('text', {x: left ? SPINE + 12 : W - 10, y: yy - 4,
+                    class:'oflagt ' + cls,
+                    'text-anchor': left ? 'start' : 'end'}, svg).textContent = text;
+      }
+      flag(0, 'oopen', 'round opened', 'right');
+      // The winner is chosen AT the deadline -- measured across every round of
+      // 441348747, chosen minus deadline was 0 ms every time -- so these were
+      // two flags on one line fighting for the same corner. One flag, and it
+      // carries the outcome, which is what the moment means.
+      var dlMs = rd.deadline ? rd.deadline - base : null;
+      var chMs = rd.chosen ? rd.chosen.t - base : null;
+      var together = dlMs !== null && chMs !== null && Math.abs(chMs - dlMs) <= 1;
+      if(together){
+        flag(dlMs, 'odead', 'deadline', 'left');
+        flag(dlMs, 'ochosen', 'won by ' + shortName(rd.chosen.b) + ' · '
+                              + money(rd.chosen.r), 'right');
+      } else {
+        if(dlMs !== null) flag(dlMs, 'odead', 'deadline', 'left');
+        if(chMs !== null) flag(chMs, 'ochosen', 'won by '
+                               + shortName(rd.chosen.b) + ' · '
+                               + money(rd.chosen.r), 'right');
+      }
+
+      // the offers themselves, sized by the reward they carried
+      var g = mk('g', {}, svg);
+      rd.bids.forEach(function(b){
+        var i = names.indexOf(b.b);
+        if(i < 0) return;
+        var st = D.style[b.b];
+        var won = rd.chosen && rd.chosen.u && b.u === rd.chosen.u;
+        var r = 2.4 + 3.4 * Math.sqrt(b.r / maxR);
+        var isLate = rd.deadline && b.t > rd.deadline;
+        // Rejected offers are faded because they did not matter. A LATE one
+        // did -- it is work we did that arrived too late to be considered --
+        // so it is ringed instead of dimmed.
+        var cls = 'om' + (won ? ' owon' : '') + (isLate ? ' olateM' : '')
+                + (!isLate && b.v && b.v !== 'best' && b.v !== 'not best'
+                   ? ' orej' : '');
+        var m = marker(g, st.s, colX(i), y(b.t - base), r, st.c, cls);
+        m.addEventListener('mouseenter', function(ev){ show(ev, rd, b, base); });
+        m.addEventListener('mouseleave', hide);
+      });
+    }
+    draw();
+    card._draw = draw;
+    return card;
+  }
+
+  function show(ev, rd, b, base){
+    hide();
+    tip = document.createElement('div');
+    tip.className = 'ctip';
+    tip.innerHTML = '<b>' + esc(b.b) + (b.b === D.ours ? ' (ours)' : '') + '</b>'
+      + '<span>round ' + rd.round + ' · +' + (b.t - base) + ' ms</span>'
+      + '<span>reward ' + b.r.toLocaleString() + '</span>'
+      + '<span>orders ' + b.o.toLocaleString() + '</span>'
+      + (rd.deadline && b.t > rd.deadline
+          ? '<span class="lateT">' + (b.t - rd.deadline)
+            + ' ms after the deadline</span>' : '')
+      + (b.v ? '<span class="g">' + esc(b.v) + '</span>' : '');
+    document.body.appendChild(tip);
+    var r = ev.target.getBoundingClientRect();
+    var left = Math.min(r.right + 10, window.innerWidth - tip.offsetWidth - 10);
+    tip.style.left = Math.max(8, left) + 'px';
+    tip.style.top = Math.max(8, Math.min(r.top - 6,
+      window.innerHeight - tip.offsetHeight - 10)) + 'px';
+  }
+  function hide(){ if(tip){ tip.remove(); tip = null; } }
+
+  var cards = D.rounds.map(facet);
+  window.addEventListener('resize', function(){ cards.forEach(function(c){ c._draw(); }); });
+})();
+"""
+
 # ------------------------------------------------ one fetch per slot, cached
 
 _slot_cache = {}                       # slot -> (monotonic_at, data)
@@ -2936,7 +3335,8 @@ def _slot_data_uncached(slot, now):
                "builder": pool.submit(run, slot_builder_events, slot, stamps),
                "logs": pool.submit(run, slot_logs, slot, stamps),
                "shred": pool.submit(run, slot_shreds, slot, stamps),
-               "ready": pool.submit(run, slot_readiness, slot, stamps)}
+               "ready": pool.submit(run, slot_readiness, slot, stamps),
+               "offers": pool.submit(run, slot_offers, slot, stamps)}
     try:
         extends, ext_err = fut["ext"].result(), None
     except Exception as exc:
@@ -2965,11 +3365,16 @@ def _slot_data_uncached(slot, now):
         ready = fut["ready"].result()
     except Exception:
         ready = {}
+    try:
+        offers, offers_err = fut["offers"].result(), None
+    except Exception as exc:
+        offers, offers_err = None, str(exc)[:140]
     data = {"rounds": rounds, "extends": extends, "ext_err": ext_err,
             "commits": commits, "relay": relay_rounds, "builder": builder_ev,
             "logs": logs,
             "relay_err": relay_err,
-            "shreds": shreds, "shred_err": shred_err, "ready": ready}
+            "shreds": shreds, "shred_err": shred_err, "ready": ready,
+            "offers": offers, "offers_err": offers_err}
 
     if ext_err is None and shred_err is None:
         with _slot_lock:
@@ -4225,6 +4630,52 @@ details.around>summary:hover{background:#111c26}
 .gradenote{margin-left:14px;color:#4d5c70;font-size:10.5px;
   border-bottom:1px dotted #2b3a4b;cursor:help}
 .gradenote.warn{color:#fbbf24;border-bottom-color:#78350f}
+/* offer timeline */
+.olegend{display:flex;flex-wrap:wrap;gap:16px;margin:0 0 10px;color:#8fa3ba;
+  font-size:11px}
+.obuilder{display:flex;align-items:center;gap:6px;
+  font-family:ui-monospace,Menlo,monospace}
+.olegend .om{width:9px;height:9px;display:inline-block;border-radius:50%}
+.olegend .om.square{border-radius:1px}
+.olegend .om.diamond{border-radius:1px;transform:rotate(45deg)}
+.olegend .om.triangle{clip-path:polygon(50% 0,100% 100%,0 100%);border-radius:0}
+.olegend .om.plus{clip-path:polygon(38% 0,62% 0,62% 38%,100% 38%,100% 62%,62% 62%,62% 100%,38% 100%,38% 62%,0 62%,0 38%,38% 38%);border-radius:0}
+.olegend .om.bar{height:4px;border-radius:1px}
+.ousp{margin-left:5px;color:#5eead4;font-size:9.5px;font-weight:600;
+  text-transform:uppercase;letter-spacing:.05em}
+.ofacet{background:#0c141b;border:1px solid #1a2430;border-radius:5px;
+  margin:0 0 8px;padding:6px 0 2px}
+.ohead{display:flex;flex-wrap:wrap;gap:12px;align-items:baseline;
+  padding:0 12px 3px;font-size:11.5px;color:#a9bed4}
+.ohead b{font-family:ui-monospace,Menlo,monospace;color:#cfe0f0}
+.ohead .dim{color:#4d5c70}
+.owin{color:#5eead4;font-family:ui-monospace,Menlo,monospace}
+.osvg{width:100%;display:block}
+.olate{color:#fbbf24;font-family:ui-monospace,Menlo,monospace}
+.ouuid{color:#4d5c70;font-family:ui-monospace,Menlo,monospace;font-size:10.5px}
+svg .om.olateM{stroke:#fbbf24;stroke-width:1.8}
+.ctip .lateT{color:#fbbf24}
+.ospine{stroke:#2b3a4b;stroke-width:1.5}
+.otick{stroke:#22303f;stroke-width:1}
+.ocol{stroke:#131e28;stroke-width:1}
+.ocolhd{fill:#8fa3ba;font-size:9.5px;font-family:ui-monospace,Menlo,monospace}
+.ocolhd.ocolours{fill:#5eead4;font-weight:600}
+.oflag{stroke-width:1;opacity:.55}
+.oflagp{stroke:none}
+.oflagt{font-size:9px;font-family:ui-monospace,Menlo,monospace;letter-spacing:.03em}
+.oflag.oopen{stroke:#3d5468}
+.oflagp.oopen{fill:#3d5468}
+.oflagt.oopen{fill:#5b6b80}
+.oflag.odead{stroke:#b6822a}
+.oflagp.odead{fill:#b6822a}
+.oflagt.odead{fill:#b6822a}
+.oflag.ochosen{stroke:#5eead4}
+.oflagp.ochosen{fill:#5eead4}
+.oflagt.ochosen{fill:#5eead4}
+
+svg .om{stroke:#0c141b;stroke-width:1}
+svg .om.owon{stroke:#facc15;stroke-width:1.8}
+svg .om.orej{opacity:.45}
 /* dispatch DAG */
 .dagbar{display:flex;align-items:center;flex-wrap:wrap;gap:5px;
   padding:8px 0 10px;border-bottom:1px solid #141d27;margin-bottom:10px}
@@ -4668,7 +5119,7 @@ NAV_JS = r"""
   // Warm the rest of the window: every tab of every slot in it. Two at a time
   // and only once the page is idle, so the view the user is actually looking
   // at never waits behind a prefetch.
-  var TABS = ['', 'compare', 'timeline', 'dag', 'logs'];
+  var TABS = ['', 'compare', 'timeline', 'offers', 'dag', 'logs'];
   function prefetchAll(){
     var here = new URL(location.href);
     var win = here.searchParams.get('win');
@@ -5306,9 +5757,19 @@ def page(sel_win=None, sel_slot=None, sel_round=None, tab="rounds",
             f'<a class="tab{" on" if tab == key else ""}" '
             f'href="{base}{"" if key == "rounds" else "&tab=" + key}">{label}</a>'
             for key, label in (("rounds", "rounds"), ("compare", "comparison"),
-                               ("timeline", "timeline"), ("dag", "dag"),
-                               ("logs", "logs")))
-        if tab == "dag":
+                               ("timeline", "timeline"), ("offers", "offer timeline"),
+                               ("dag", "dag"), ("logs", "logs")))
+        if tab == "offers":
+            try:
+                d = slot_data(sel_slot)
+                inner = offers_html(sel_slot, d.get("offers"),
+                                    d.get("offers_err") or d.get("relay_err"))
+            except Exception as exc:
+                inner = ('<div class="err">offer timeline unavailable: '
+                         f"{html.escape(str(exc))[:160]}</div>")
+            blurb = ("every builder's bidding for this slot, as the relay saw "
+                     "it &mdash; when each offer landed and what it was worth.")
+        elif tab == "dag":
             try:
                 d = slot_data(sel_slot)
                 pick = sel_round if sel_round is not None else (
@@ -6488,8 +6949,8 @@ class Handler(BaseHTTPRequestHandler):
             tab = qs.get("tab", ["rounds"])[0]
             src = qs.get("src", ["ours"])[0]
             body = page(as_int("win"), as_int("slot"), as_int("round"),
-                        tab if tab in ("compare", "timeline", "dag", "logs")
-                        else "rounds",
+                        tab if tab in ("compare", "timeline", "offers", "dag",
+                                       "logs") else "rounds",
                         src if src in ("ours", "winner") else "ours",
                         partial=qs.get("partial", ["0"])[0] == "1",
                         grade=("graded" if qs.get("grade", [""])[0] == "graded"

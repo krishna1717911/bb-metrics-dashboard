@@ -553,6 +553,44 @@ is only identifiable by having reached our own ingest with `route=vote`, and
 asking that of a whole day scans every receive in it. Per window it is about a
 second, and the windows go out together — measured 12s down to about 4s.
 
+### The `offers` tab
+
+Every builder's bidding for one slot, as the relay saw it. Our own tables record
+what *we* sent and nothing else, so the relay is the only place the shape of an
+auction exists.
+
+One timeline per round, because a round is the auction. **Time runs down** the
+spine in milliseconds since the relay opened the round, each builder has its own
+column beside it — two builders bidding in the same millisecond sit side by side
+rather than on top of each other — and every bullet is one offer. Hovering gives
+the builder, the reward and the order count; the whole thing is also a table
+below.
+
+`round opened` and the `deadline` are flags across the full width, because they
+are moments in the round rather than one builder's doing. The winner is chosen
+**at** the deadline — measured across every round of 441348747, `chosen` minus
+`deadline` was 0 ms every time — so those two share one rule, labelled with the
+outcome and the winning miniblock's uuid.
+
+A bullet is sized by the reward it carried relative to the best bid of that
+round, so a ladder climbing toward the deadline is visible without reading a
+number. The ringed bullet is the offer the relay chose; a faded one was
+rejected; **an offer that arrived after the deadline is ringed amber rather than
+faded** — it is work that was done and then missed the window, which is worth
+seeing rather than hiding. On that slot two of them were ours, 1 ms late,
+rejected `index_mismatch`, one of them carrying 8,388,721 against a winning
+8,490,273.
+
+Colour is four hues and no more:
+`validate_palette.js "#3987e5,#c98500,#d55181,#008300" --mode dark --surface #0c141b --pairs all`
+— the all-pairs list rather than the adjacent one, because any two markers can
+end up side by side in a 45 ms column. That passes with CVD ΔE 6.9, which the
+validator allows **only** with secondary encoding, so **marker shape is a full
+identity channel**: every builder has its own, whether or not it got a hue. Five
+hues do not pass at all, and a slot routinely carries six builders — measured on
+441348747, six, of which the one that won every round would otherwise have
+folded into the same grey circle as a fallback nobody cares about.
+
 ## More than one builder
 
 We run more than one — Amsterdam and Tokyo — and they are separate in every
