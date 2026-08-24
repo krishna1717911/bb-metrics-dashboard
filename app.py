@@ -2963,6 +2963,11 @@ def offers_html(slot, data, relay_err=None):
            "not given an invented one. They keep their own marker shape, which "
            "is what identifies every builder here &mdash; the colours are a "
            "convenience on top of it.</div>" if folded else "")
+        + '<div class="ozoomall"><span>zoom every round</span>'
+          '<span id="offzoomall"></span>'
+          '<span class="dim">stretches time only &mdash; an offer that missed '
+          'the deadline by a millisecond is 7 pixels from it until you do'
+          '</span></div>'
         + '<div id="offwrap"></div>'
         f'<script id="offdata" type="application/json">{blob}</script>'
         f"<script>{OFFERS_JS}</script>"
@@ -3019,8 +3024,13 @@ OFFERS_JS = r"""
   // beside it and one bullet per offer, so two builders bidding in the same
   // millisecond sit side by side instead of on top of each other.
   var GUT = 52, SPINE = 62, COL0 = 108, PADT = 30, PADB = 16;
-  var MIN_H = 210, MAX_H = 460;
+  var MIN_H = 210, FIT_H = 460;
   var tip = null;
+  // Everything interesting happens in the last few milliseconds -- an offer
+  // that missed the deadline by 1 ms is 7 pixels from it at the fitted
+  // height. Zoom stretches the TIME axis only, so those separate without the
+  // columns moving.
+  var ZOOMS = [['fit', 0], ['2\u00d7', 2], ['4\u00d7', 4], ['8\u00d7', 8]];
 
   function mk(n, a, p){
     var e = document.createElementNS(NS, n);
@@ -3078,16 +3088,40 @@ OFFERS_JS = r"""
             + '<span class="ouuid">' + esc(rd.chosen.u || '') + '</span>'
           : '<span class="dim">no winner echoed</span>');
     card.appendChild(head);
+    var ctl = document.createElement('span');
+    ctl.className = 'ozoom';
+    ctl.innerHTML = '<span>zoom</span>';
+    ZOOMS.forEach(function(z){
+      var b = document.createElement('button');
+      b.type = 'button';
+      b.textContent = z[0];
+      b.className = z[1] === 0 ? 'on' : '';
+      b.addEventListener('click', function(){ setZoom(z[1]); });
+      ctl._buttons = (ctl._buttons || []).concat([[b, z[1]]]);
+      ctl.appendChild(b);
+    });
+    head.appendChild(ctl);
     var svg = document.createElementNS(NS, 'svg');
     svg.setAttribute('class', 'osvg');
     card.appendChild(svg);
     wrap.appendChild(card);
 
+    var zoom = 0;
+    function setZoom(z){
+      zoom = z;
+      ctl._buttons.forEach(function(pair){
+        pair[0].classList.toggle('on', pair[1] === z);
+      });
+      draw();
+    }
+    card._setZoom = setZoom;
+
     function draw(){
       while(svg.firstChild) svg.removeChild(svg.firstChild);
       var W = Math.max(svg.clientWidth || 900, 340);
       var colW = Math.max(58, Math.min(150, (W - COL0 - 16) / Math.max(1, names.length)));
-      var H = Math.max(MIN_H, Math.min(MAX_H, PADT + PADB + span * 7));
+      var fitted = Math.max(MIN_H, Math.min(FIT_H, PADT + PADB + span * 7));
+      var H = zoom ? Math.max(fitted, PADT + PADB + span * 7 * zoom) : fitted;
       svg.setAttribute('viewBox', '0 0 ' + W + ' ' + H);
       svg.setAttribute('height', H);
       var y = function(ms){ return PADT + (H - PADT - PADB) * (ms / span); };
@@ -3095,7 +3129,9 @@ OFFERS_JS = r"""
 
       // the spine: this round's clock, running down
       mk('line', {x1:SPINE, x2:SPINE, y1:PADT, y2:H-PADB, class:'ospine'}, svg);
-      var step = span <= 12 ? 2 : span <= 30 ? 5 : 10;
+      // roughly one label per 34px, snapped to something a person reads
+      var want = Math.max(1, span / Math.max(1, (H - PADT - PADB) / 34));
+      var step = [1, 2, 5, 10, 20, 50].find(function(v){ return v >= want; }) || 100;
       for(var t = 0; t <= span; t += step){
         mk('line', {x1:SPINE-3, x2:SPINE, y1:y(t), y2:y(t), class:'otick'}, svg);
         mk('text', {x:SPINE-7, y:y(t)+3, class:'ctick', 'text-anchor':'end'}, svg)
@@ -3196,6 +3232,22 @@ OFFERS_JS = r"""
   function hide(){ if(tip){ tip.remove(); tip = null; } }
 
   var cards = D.rounds.map(facet);
+  // one control for the lot, because chasing the same button down eight
+  // rounds is the whole reason this is annoying
+  var all = document.getElementById('offzoomall');
+  if(all) ZOOMS.forEach(function(z){
+    var b = document.createElement('button');
+    b.type = 'button';
+    b.textContent = z[0];
+    b.className = z[1] === 0 ? 'on' : '';
+    b.addEventListener('click', function(){
+      [].forEach.call(all.querySelectorAll('button'), function(o){
+        o.classList.toggle('on', o === b);
+      });
+      cards.forEach(function(c){ c._setZoom(z[1]); });
+    });
+    all.appendChild(b);
+  });
   window.addEventListener('resize', function(){ cards.forEach(function(c){ c._draw(); }); });
 })();
 """
@@ -4655,6 +4707,17 @@ details.around>summary:hover{background:#111c26}
 .ouuid{color:#4d5c70;font-family:ui-monospace,Menlo,monospace;font-size:10.5px}
 svg .om.olateM{stroke:#fbbf24;stroke-width:1.8}
 .ctip .lateT{color:#fbbf24}
+.ozoom{display:inline-flex;align-items:center;gap:3px;margin-left:auto}
+.ozoom>span,.ozoomall>span:first-child{color:#4d5c70;font-size:9.5px;
+  text-transform:uppercase;letter-spacing:.06em;margin-right:3px}
+.ozoom button,.ozoomall button{background:#131e29;border:1px solid #223142;
+  color:#8fa3ba;border-radius:4px;font-size:10px;padding:1px 7px;cursor:pointer;
+  font-family:ui-monospace,Menlo,monospace}
+.ozoom button:hover,.ozoomall button:hover{border-color:#2f4459;color:#dbe7f3}
+.ozoom button.on,.ozoomall button.on{background:#16303f;border-color:#2c6b86;
+  color:#7fd8f0}
+.ozoomall{display:flex;align-items:center;gap:4px;margin:0 0 9px}
+.ozoomall .dim{color:#4d5c70;font-size:10.5px;margin-left:8px}
 .ospine{stroke:#2b3a4b;stroke-width:1.5}
 .otick{stroke:#22303f;stroke-width:1}
 .ocol{stroke:#131e28;stroke-width:1}

@@ -572,6 +572,13 @@ are moments in the round rather than one builder's doing. The winner is chosen
 `deadline` was 0 ms every time — so those two share one rule, labelled with the
 outcome and the winning miniblock's uuid.
 
+**The timelines zoom.** At the fitted height a round is about 7 px per
+millisecond, so an offer that missed the deadline by 1 ms sits 7 px from it —
+visible, but not readable. `fit / 2× / 4× / 8×` stretches the *time* axis only,
+leaving the builder columns where they are; at 8× that same gap is 56 px. There
+is a control per round and one at the top that drives all of them, because
+chasing the same button down eight rounds is the annoying part.
+
 A bullet is sized by the reward it carried relative to the best bid of that
 round, so a ladder climbing toward the deadline is visible without reading a
 number. The ringed bullet is the offer the relay chose; a faded one was
