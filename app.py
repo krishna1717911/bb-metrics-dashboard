@@ -64,8 +64,8 @@ RELAY_URL = os.environ.get("RELAY_URL", "")
 RELAY_USER = os.environ.get("RELAY_USER", "")
 RELAY_PASS = os.environ.get("RELAY_PASS", "")
 RELAY_DS_UID = os.environ.get("RELAY_DS_UID", "")
-# our builder_id as the relay knows it; usually the same as CH_BUILDER
-RELAY_OUR_BUILDER = os.environ.get("RELAY_OUR_BUILDER", "") or CH_BUILDER
+# our builder_id as the relay knows it; usually the same as dep()["builder"]
+RELAY_OUR_BUILDER = os.environ.get("RELAY_OUR_BUILDER", "")
 
 _auth = base64.b64encode(f"{INFLUX_USER}:{INFLUX_PASS}".encode()).decode()
 _good_host = None
@@ -190,8 +190,9 @@ def health_probe():
     """Six independent checks. Every one degrades on its own -- a dead otel
     cluster must not blank the InfluxDB rows, and vice versa."""
     now = time.monotonic()
-    if _health_cache["data"] is not None and now - _health_cache["at"] < HEALTH_TTL:
-        return _health_cache["data"]
+    hit = _health_cache.get(dkey())
+    if hit and now - hit["at"] < HEALTH_TTL:
+        return hit["data"]
     out = {}
 
     def run(name, fn):
@@ -206,7 +207,7 @@ def health_probe():
                             ("sim-context", "parent_slot"), ("sim-probe", "body_us")):
             series = influx_series(
                 f'SELECT count("{field}") FROM "{meas}" '
-                f"WHERE \"host_id\" = '{SIM}' AND time > now() - {WORK_WINDOW_MIN}m")
+                f"WHERE \"host_id\" = '{dep()["sim"]}' AND time > now() - {WORK_WINDOW_MIN}m")
             got[meas] = int(series[0]["values"][0][1]) if series else 0
         return got
 
@@ -223,7 +224,7 @@ def health_probe():
         _, rows = clickhouse(
             "SELECT toString(ts) AS at, attrs['peer_addr'] AS peer "
             "FROM bifrost_events WHERE ts > now() - INTERVAL 48 HOUR "
-            f"  AND instance_id = '{CH_INSTANCE}' AND event = 'connected' "
+            f"  AND instance_id = '{dep()["instance"]}' AND event = 'connected' "
             "  AND attrs['peer_addr'] LIKE '127.0.0.1%' ORDER BY ts DESC LIMIT 1")
         return {"at": rows[0][0], "peer": rows[0][1]} if rows else None
 
@@ -371,7 +372,7 @@ def health_html():
 
     g = h["ingest"]
     if g["ok"] and g["v"]:
-        mine = next((x for x in g["v"] if x["instance"] == CH_INSTANCE), None)
+        mine = next((x for x in g["v"] if x["instance"] == dep()["instance"]), None)
         best = g["v"][0]["lag"]
         if mine:
             state = "good" if mine["lag"] <= 60 else "warn" if mine["lag"] <= 300 else "dead"
@@ -380,7 +381,7 @@ def health_html():
                  f'({len(g["v"])} instances)')
         else:
             cell("event ingest", "absent", "dead",
-                 f"{CH_INSTANCE} wrote nothing in 15m")
+                 f"{dep()["instance"]} wrote nothing in 15m")
     else:
         cell("event ingest", "n/a", "off",
              html.escape(g.get("err", "no rows")))
@@ -400,7 +401,7 @@ def health_html():
 
 # ------------------------------------------------------------ produced slots
 
-_cache = {"windows": None, "at": 0.0}
+_cache = {}          # deployment -> {"windows": [...], "at": t}
 
 WINDOW = 4  # a Solana leader window is four consecutive slots
 
@@ -433,8 +434,9 @@ def produced_windows(days=30):
     import time as _time
 
     now = _time.time()
-    if _cache["windows"] is not None and now - _cache["at"] < 300:
-        return _cache["windows"]
+    hit = _cache.get(dkey())
+    if hit and now - hit["at"] < 300:
+        return hit["windows"]
     _, rows = clickhouse(
         "SELECT slot, toString(min(ts)) AS first_ts, any(connector_identity) AS leader, "
         "       max(won_by_us) AS won, countIf(kind = 'selected') AS offers, "
@@ -447,7 +449,7 @@ def produced_windows(days=30):
         "       countIf(kind = 'winner' AND won_by_us) AS won_rounds "
         "FROM bifrost_miniblocks "
         f"WHERE ts > now() - INTERVAL {int(days)} DAY "
-        f"  AND local_builder_id = '{CH_BUILDER}' "
+        f"  AND local_builder_id = '{dep()["builder"]}' "
         "GROUP BY slot HAVING offers > 0 OR won ORDER BY slot DESC")
     windows = {}
     for r in rows:
@@ -493,7 +495,7 @@ def produced_windows(days=30):
             _, rrows = clickhouse(
                 "SELECT run_id, toString(min(ts)) AS started, uniqExact(slot) AS slots "
                 f"FROM bifrost_miniblocks WHERE run_id IN ({quoted}) "
-                f"  AND local_builder_id = '{CH_BUILDER}' GROUP BY run_id")
+                f"  AND local_builder_id = '{dep()["builder"]}' GROUP BY run_id")
             starts = {r[0]: (r[1], ch_int(r[2])) for r in rrows}
         except Exception:
             starts = {}
@@ -790,7 +792,7 @@ def slot_offer_sigs(slot):
             "SELECT uuid, arrayStringConcat(arrayMap("
             "  s -> hex(substring(base58Decode(s), 1, 16)), signatures), ',') AS pfx "
             f"FROM bifrost_miniblocks WHERE slot = {int(slot)} "
-            f"  AND kind = 'selected' AND local_builder_id = '{CH_BUILDER}'")
+            f"  AND kind = 'selected' AND local_builder_id = '{dep()["builder"]}'")
     except Exception:
         return out
     for r in rows:
@@ -809,7 +811,7 @@ def slot_our_sigs(slot):
             "SELECT index_in_slot, arrayDistinct(arrayFlatten(groupArray(signatures))) "
             "  AS sigs FROM bifrost_miniblocks "
             f"WHERE slot = {int(slot)} AND kind = 'selected' "
-            f"  AND local_builder_id = '{CH_BUILDER}' GROUP BY index_in_slot")
+            f"  AND local_builder_id = '{dep()["builder"]}' GROUP BY index_in_slot")
     except Exception:
         return out
     for r in rows:
@@ -832,7 +834,7 @@ def slot_winner_refs(slot):
         _, rows = clickhouse(
             "SELECT index_in_slot, order_count, hex(payload) AS payload "
             f"FROM bifrost_miniblocks WHERE slot = {int(slot)} AND kind = 'winner' "
-            f"  AND local_builder_id = '{CH_BUILDER}' AND length(payload) > 55")
+            f"  AND local_builder_id = '{dep()["builder"]}' AND length(payload) > 55")
     except Exception:
         return out
     for r in rows:
@@ -929,7 +931,7 @@ def slot_builder_events(slot, stamps):
             "  toInt64OrZero(toString(nums['chosen_refs'])) AS chosen_refs, "
             "  toInt64OrZero(toString(nums['expected_refs'])) AS expected_refs "
             f"FROM bifrost_events WHERE ts >= '{lo}' AND ts <= '{hi}' "
-            f"  AND instance_id = '{CH_INSTANCE}' AND nums['slot'] = {int(slot)} "
+            f"  AND instance_id = '{dep()["instance"]}' AND nums['slot'] = {int(slot)} "
             "  AND event IN ('progress','bank_ready','round_winner',"
             "                'promote_mismatch','round_committed','dispatched') "
             "ORDER BY ts")
@@ -983,7 +985,7 @@ def slot_relay(slot, stamps):
           ).strftime("%Y-%m-%d %H:%M:%S")
     hi = (dt.datetime.fromisoformat(max(stamps)[:26]) + pad
           ).strftime("%Y-%m-%d %H:%M:%S")
-    ours = RELAY_OUR_BUILDER.replace("'", "")
+    ours = dep()["relay_builder"].replace("'", "")
     cols, rows = relay(
         "SELECT index_in_slot AS rnd,"
         " argMaxIf(assumeNotNull(builder_id), assumeNotNull(reward),"
@@ -2382,13 +2384,118 @@ DAG_JS = r"""
 # contested slots but none of the ones we won, while the other covers only the
 # ~800-slot stretches around our own leader windows. Whichever has data for a
 # given slot is the leader for that slot.
-LEADERS = [h.strip() for h in os.environ.get("SHRED_LEADER_ID", "").split(",")
-           if h.strip()]
-LEADER = LEADERS[0] if LEADERS else ""
-SIM = os.environ.get("SHRED_SIM_ID", "")
 OFF_CHAIN = [h.strip() for h in os.environ.get("SHRED_EXCLUDE_IDS", "").split(",")
              if h.strip()]
-HOST_NAME = dict({h: "leader" for h in LEADERS}, **{SIM: "our simulator"})
+
+# ------------------------------------------------------------- deployments
+#
+# We run more than one builder -- AMS and Tokyo -- and they are separate in
+# every store: different local_builder_id in bifrost_miniblocks, different
+# instance_id in bifrost_events, different simulator host_id in InfluxDB, and
+# they never serve the same validator, so they never compete for a slot. The
+# dashboard used to be pinned to whichever one the environment named.
+#
+# A deployment is that whole set of identifiers under one name, and the active
+# one is per REQUEST rather than per process: the server is threaded, so a
+# module-level "current builder" would be read by one request while another
+# was writing it. It lives in a threading.local and is set once, at the top of
+# the handler.
+#
+# Configure as:
+#     DEPLOYMENTS=ams,jp
+#     DEPLOY_AMS_LABEL=Amsterdam
+#     DEPLOY_AMS_BUILDER=...      local_builder_id in bifrost_miniblocks
+#     DEPLOY_AMS_INSTANCE=...     instance_id in bifrost_events / otel
+#     DEPLOY_AMS_SIM=...          simulator host_id in InfluxDB
+#     DEPLOY_AMS_LEADERS=...      comma-separated, preference order
+#     DEPLOY_AMS_RELAY_BUILDER=...  builder_id as the relay names us
+#
+# With DEPLOYMENTS unset the old single-deployment variables are used as one
+# unnamed deployment, so an environment written before this still works and
+# the selector simply does not appear.
+
+_active = threading.local()
+
+
+def _build_deployments():
+    names = [n.strip() for n in os.environ.get("DEPLOYMENTS", "").split(",")
+             if n.strip()]
+    if not names:
+        return [{"name": "", "label": CH_BUILDER or "builder",
+                 "builder": CH_BUILDER, "instance": CH_INSTANCE,
+                 "sim": os.environ.get("SHRED_SIM_ID", ""),
+                 "leaders": [h.strip() for h in
+                             os.environ.get("SHRED_LEADER_ID", "").split(",")
+                             if h.strip()],
+                 "leader0": (os.environ.get("SHRED_LEADER_ID", "").split(",")
+                             + [""])[0].strip(),
+                 "relay_builder": os.environ.get("RELAY_OUR_BUILDER", ""),
+                 "analysis_identity": os.environ.get("ANALYSIS_IDENTITY", "")}]
+    out = []
+    for name in names:
+        key = f"DEPLOY_{name.upper()}_"
+        out.append({
+            "name": name,
+            "label": os.environ.get(key + "LABEL") or name,
+            "builder": os.environ.get(key + "BUILDER", ""),
+            "instance": os.environ.get(key + "INSTANCE", ""),
+            "sim": os.environ.get(key + "SIM", ""),
+            "leaders": [h.strip() for h in
+                        os.environ.get(key + "LEADERS", "").split(",") if h.strip()],
+            "leader0": (os.environ.get(key + "LEADERS", "").split(",") + [""])[0].strip(),
+            "relay_builder": os.environ.get(key + "RELAY_BUILDER", ""),
+            "analysis_identity": os.environ.get(key + "ANALYSIS_IDENTITY", ""),
+        })
+    return out
+
+
+DEPLOYMENTS = _build_deployments()
+DEPLOY_BY_NAME = {d["name"]: d for d in DEPLOYMENTS}
+
+
+def dep():
+    """The deployment this request is about."""
+    return getattr(_active, "d", None) or DEPLOYMENTS[0]
+
+
+def set_dep(name):
+    _active.d = DEPLOY_BY_NAME.get(name or "") or DEPLOYMENTS[0]
+    return _active.d
+
+
+def dkey():
+    """Cache-key fragment. Every per-slot and per-range cache holds rows for
+    ONE deployment; without this in the key, switching would serve Tokyo's
+    slots under Amsterdam's name."""
+    return dep()["name"]
+
+
+def host_name(host):
+    d = dep()
+    if host and host == d["sim"]:
+        return "our simulator"
+    return "leader" if host in d["leaders"] else (host or "")
+
+
+def deploy_selector(path, params):
+    """The switch itself. Only rendered when there is more than one."""
+    if len(DEPLOYMENTS) < 2:
+        return ""
+    here = dep()["name"]
+    out = []
+    for d in DEPLOYMENTS:
+        q = dict(params)
+        q["dep"] = d["name"]
+        # A slot belongs to one deployment, so carrying it across would land
+        # on an empty page; the switch goes to that deployment's own strip.
+        q.pop("slot", None)
+        q.pop("win", None)
+        q.pop("round", None)
+        href = path + "?" + urllib.parse.urlencode(
+            {k: v for k, v in q.items() if v})
+        out.append(f'<a class="depchip{" on" if d["name"] == here else ""}" '
+                   f'href="{html.escape(href)}">{html.escape(d["label"])}</a>')
+    return '<div class="depsel"><span>builder</span>' + "".join(out) + "</div>"
 # measurement -> (row label, sort key). The timestamp IS the datum for all four.
 SHRED_STAGES = [("shred_insert_is_full", "slot complete"),
                 ("bank_frozen", "bank frozen")]
@@ -2452,7 +2559,7 @@ def slot_shreds(slot, stamps):
     out = {}
     for ser in series:
         host = ser["tags"]["host_id"]
-        if host in OFF_CHAIN or (host not in LEADERS and host != SIM):
+        if host in OFF_CHAIN or (host not in dep()["leaders"] and host != dep()["sim"]):
             continue
         col = {name: i for i, name in enumerate(ser["columns"])}
         for row in ser["values"]:
@@ -2508,7 +2615,7 @@ def slot_readiness(slot, stamps):
             "  toInt64OrZero(toString(nums['window_end'])) AS window_end, "
             "  attrs['leader_state'] AS state, attrs['identity'] AS identity "
             f"FROM bifrost_events WHERE ts >= '{lo}' AND ts <= '{hi}' "
-            f"  AND instance_id = '{CH_INSTANCE}' "
+            f"  AND instance_id = '{dep()["instance"]}' "
             f"  AND nums['slot'] IN {want} "
             "  AND (event = 'bank_ready' "
             "       OR (event = 'progress' AND attrs['leader_state'] != 'Inactive')) "
@@ -2575,10 +2682,10 @@ def shred_html(slot, shreds, parent=None, ready=None, shift=0,
     # configured order.
     present = {h for n, _ in groups for v in (per_slot.get(n) or {}).values()
                for h in v}
-    leader = next((h for h in LEADERS if h in present), LEADER)
-    hosts = [h for h in (leader, SIM) if h]
+    leader = next((h for h in dep()["leaders"] if h in present), dep()["leader0"])
+    hosts = [h for h in (leader, dep()["sim"]) if h]
     head = ("<tr><th>stage</th>"
-            + "".join(f"<th class=n>{html.escape(HOST_NAME[h])}</th>" for h in hosts)
+            + "".join(f"<th class=n>{html.escape(host_name(h))}</th>" for h in hosts)
             + "<th class=n>sim &minus; leader</th><th>detail</th></tr>")
     body = []
     for which, why in groups:
@@ -2601,14 +2708,14 @@ def shred_html(slot, shreds, parent=None, ready=None, shift=0,
                 cells.append(
                     f"<td class='n m'>{dt.datetime.fromtimestamp(e['t']/1e9, dt.UTC).strftime('%H:%M:%S.%f')[:-3]}</td>"
                     if e else "<td class='n m dim'>&mdash;</td>")
-            if leader in seen and SIM in seen:
-                d = (seen[SIM]["t"] - seen[leader]["t"]) / 1e6
+            if leader in seen and dep()["sim"] in seen:
+                d = (seen[dep()["sim"]]["t"] - seen[leader]["t"]) / 1e6
                 delta = (f"<td class='n m {'bad' if d > 0 else 'good'}'>"
                          f"{d:+.1f} ms</td>")
             else:
                 delta = "<td class='n m dim'>&mdash;</td>"
             note = "; ".join(
-                f"{HOST_NAME[h]}: {e['total_time_ms']} ms"
+                f"{host_name(h)}: {e['total_time_ms']} ms"
                 + (f", {e['num_recovered']:,} recovered"
                    if e.get("num_recovered") else "")
                 + (f", {e['num_repaired']:,} repaired"
@@ -2617,7 +2724,7 @@ def shred_html(slot, shreds, parent=None, ready=None, shift=0,
                 if (e := seen.get(h)) and e.get("total_time_ms") is not None)
             # sort on the leader's stamp when it exists, so the ordering does
             # not flip about with our own host's reception jitter
-            key = (seen.get(leader) or seen.get(SIM) or
+            key = (seen.get(leader) or seen.get(dep()["sim"]) or
                    next(iter(seen.values())))["t"]
             staged.append((key,
                            f"<tr><td class=m>{label}</td>{''.join(cells)}{delta}"
@@ -2636,7 +2743,7 @@ def shred_html(slot, shreds, parent=None, ready=None, shift=0,
             for h in hosts:
                 cells.append(
                     f"<td class='n m'>{dt.datetime.fromtimestamp(at/1e9, dt.UTC).strftime('%H:%M:%S.%f')[:-3]}</td>"
-                    if h == SIM else "<td class='n m dim'>&mdash;</td>")
+                    if h == dep()["sim"] else "<td class='n m dim'>&mdash;</td>")
             staged.append((at,
                            f"<tr class='bstage'><td class=m>{label}</td>"
                            f"{''.join(cells)}<td class='n m dim'>&mdash;</td>"
@@ -2682,7 +2789,7 @@ def shred_html(slot, shreds, parent=None, ready=None, shift=0,
         missing = ('<span class="warn">the leader wrote no shred metrics for this slot '
                    "&mdash; its submission is intermittent, so this is a gap in "
                    "reporting rather than a slow node</span>")
-    elif not wrote(SIM):
+    elif not wrote(dep()["sim"]):
         missing = '<span class="note">our simulator host wrote nothing here</span>'
     return ('<div class="panel"><div class="dtlhead">shred path &mdash; leader vs our '
             'simulator, parent slot'
@@ -2741,14 +2848,19 @@ def warm_window(win, skip=None):
         if slot == skip:
             continue
         with _slot_lock:
-            hit = _slot_cache.get(slot)
+            hit = _slot_cache.get((dkey(), slot))
             if hit and now - hit[0] < SLOT_CACHE_TTL:
                 continue
         with _prefetch_lock:
-            if slot in _inflight:
+            if (dkey(), slot) in _inflight:
                 continue
 
-        def task(target=slot):
+        # The deployment lives in a threading.local, and a pool thread has its
+        # own. Captured here and re-set inside the worker, or the prefetch
+        # would fetch Tokyo's slots against Amsterdam's builder id and cache
+        # the empty result under Tokyo's key.
+        def task(target=slot, which=dep()["name"]):
+            set_dep(which)
             try:
                 slot_data(target)      # takes the single-flight lease itself
             except Exception:
@@ -2773,7 +2885,7 @@ def slot_data(slot):
     not pinned for five minutes."""
     now = time.monotonic()
     with _slot_lock:
-        hit = _slot_cache.get(slot)
+        hit = _slot_cache.get((dkey(), slot))
         if hit and now - hit[0] < SLOT_CACHE_TTL:
             return hit[1]
 
@@ -2782,14 +2894,14 @@ def slot_data(slot):
     # second fetch for the same slot. The first caller does the work; the rest
     # wait on it and then read the cache.
     with _prefetch_lock:
-        leader = slot not in _inflight
+        leader = (dkey(), slot) not in _inflight
         if leader:
-            _inflight[slot] = threading.Event()
-        done = _inflight[slot]
+            _inflight[(dkey(), slot)] = threading.Event()
+        done = _inflight[(dkey(), slot)]
     if not leader:
         done.wait(timeout=180)
         with _slot_lock:
-            hit = _slot_cache.get(slot)
+            hit = _slot_cache.get((dkey(), slot))
         if hit:
             return hit[1]
         return _slot_data_uncached(slot, time.monotonic())
@@ -2797,7 +2909,7 @@ def slot_data(slot):
         return _slot_data_uncached(slot, now)
     finally:
         with _prefetch_lock:
-            _inflight.pop(slot, None)
+            _inflight.pop((dkey(), slot), None)
         done.set()
 
 
@@ -2809,14 +2921,22 @@ def _slot_data_uncached(slot, now):
     # 300s window, so run them together rather than back to back.
     import concurrent.futures as cf
 
+    which = dep()["name"]
+
+    def run(fn, *a):
+        """Same reason as warm_window: these run on pool threads, which do not
+        inherit the request's deployment."""
+        set_dep(which)
+        return fn(*a)
+
     with cf.ThreadPoolExecutor(max_workers=6) as pool:
-        fut = {"ext": pool.submit(slot_extends, slot, stamps),
-               "commit": pool.submit(slot_commits, slot, stamps),
-               "relay": pool.submit(slot_relay, slot, stamps),
-               "builder": pool.submit(slot_builder_events, slot, stamps),
-               "logs": pool.submit(slot_logs, slot, stamps),
-               "shred": pool.submit(slot_shreds, slot, stamps),
-               "ready": pool.submit(slot_readiness, slot, stamps)}
+        fut = {"ext": pool.submit(run, slot_extends, slot, stamps),
+               "commit": pool.submit(run, slot_commits, slot, stamps),
+               "relay": pool.submit(run, slot_relay, slot, stamps),
+               "builder": pool.submit(run, slot_builder_events, slot, stamps),
+               "logs": pool.submit(run, slot_logs, slot, stamps),
+               "shred": pool.submit(run, slot_shreds, slot, stamps),
+               "ready": pool.submit(run, slot_readiness, slot, stamps)}
     try:
         extends, ext_err = fut["ext"].result(), None
     except Exception as exc:
@@ -2856,7 +2976,7 @@ def _slot_data_uncached(slot, now):
             if len(_slot_cache) >= SLOT_CACHE_MAX:
                 _slot_cache.pop(min(_slot_cache, key=lambda k: _slot_cache[k][0]),
                                 None)
-            _slot_cache[slot] = (now, data)
+            _slot_cache[(dkey(), slot)] = (now, data)
     return data
 
 
@@ -3051,7 +3171,7 @@ def timeline_html(slot, extends, commits, shreds, rounds, builder=None):
                 ("shred_insert_is_full", "slot complete",
                  "every shred in the blockstore"),
                 ("bank_frozen", "bank frozen", "state final, replay done")):
-            e = bucket.get(meas, {}).get(SIM)
+            e = bucket.get(meas, {}).get(dep()["sim"])
             if not e:
                 continue
             extra = (f'insert took {e["total_time_ms"]:,} ms'
@@ -3298,7 +3418,7 @@ def compare_extras(slot):
     """Bundle and non-vote inputs for the comparison tab only, so the rounds
     view never pays for the block fetch."""
     with _slot_lock:
-        hit = _extra_cache.get(slot)
+        hit = _extra_cache.get((dkey(), slot))
     if hit is not None:
         return hit
     extras = {"theirs": slot_winner_refs(slot), "ours": slot_our_sigs(slot),
@@ -3306,7 +3426,7 @@ def compare_extras(slot):
     with _slot_lock:
         if len(_extra_cache) > 32:
             _extra_cache.clear()
-        _extra_cache[slot] = extras
+        _extra_cache[(dkey(), slot)] = extras
     return extras
 
 
@@ -3356,7 +3476,7 @@ def compare_html(slot, rounds, extends, commits, relay_rounds=None,
     ctx = (commits or {}).get("_context")
     parent = (ctx or {}).get("parent") or (slot - 1)
     pbucket = (shreds or {}).get(parent) or {}
-    at = lambda meas: ((pbucket.get(meas) or {}).get(SIM) or {}).get("t")
+    at = lambda meas: ((pbucket.get(meas) or {}).get(dep()["sim"]) or {}).get("t")
     p_full, p_froze = at("shred_insert_is_full"), at("bank_frozen")
     clock = lambda t: (dt.datetime.fromtimestamp(t / 1e9, dt.UTC)
                        .strftime("%H:%M:%S.%f")[:-3] if t else "&mdash;")
@@ -4085,6 +4205,26 @@ details.around>summary:hover{background:#111c26}
   font-family:ui-monospace,Menlo,monospace}
 .ctip i{width:9px;height:3px;border-radius:2px;display:inline-block}
 .ctip .g{color:#8fa3ba;margin-top:2px}
+/* deployment selector */
+.depsel{display:flex;align-items:center;gap:5px;margin-left:auto;
+  padding-right:14px}
+.depsel span{color:#4d5c70;font-size:10px;text-transform:uppercase;
+  letter-spacing:.06em;margin-right:3px}
+.depchip{display:inline-block;padding:3px 11px;border:1px solid #22303f;
+  border-radius:11px;color:#8fa3ba;font-size:11.5px;text-decoration:none}
+.depchip:hover{border-color:#2f4459;color:#cfe0f0}
+.depchip.on{background:#0f766e;border-color:#5eead4;color:#eafffb;
+  font-weight:600}
+/* connector grading */
+.gradesel{display:inline-flex;align-items:center;gap:5px;margin-left:14px}
+.gradechip{display:inline-block;padding:1px 9px;border:1px solid #22303f;
+  border-radius:10px;color:#8fa3ba;font-size:10.5px;text-decoration:none}
+.gradechip:hover{border-color:#2f4459;color:#cfe0f0}
+.gradechip.on{background:#16303f;border-color:#2c6b86;color:#7fd8f0}
+.gradesel .dim{color:#4d5c70;font-size:10.5px;margin-left:4px}
+.gradenote{margin-left:14px;color:#4d5c70;font-size:10.5px;
+  border-bottom:1px dotted #2b3a4b;cursor:help}
+.gradenote.warn{color:#fbbf24;border-bottom-color:#78350f}
 /* dispatch DAG */
 .dagbar{display:flex;align-items:center;flex-wrap:wrap;gap:5px;
   padding:8px 0 10px;border-bottom:1px solid #141d27;margin-bottom:10px}
@@ -4578,8 +4718,129 @@ def rounds_tag(entry):
     return '<span class="%s">%d/%d rounds</span>' % (cls, won, total)
 
 
-def strip_html(windows, sel_win, sel_slot):
-    """One chip per leader window, newest at the left."""
+# ----------------------------------------------------- who actually grades us
+#
+# A validator either considers our offers or rejects every one of them with
+# `builder_not_eligible`. That verdict exists ONLY in the relay's own table --
+# bifrost_miniblocks records what we sent, never what was made of it -- so a
+# slot on an ineligible connector looks completely normal in our data right up
+# to the point where it is never won.
+#
+# This is what people mean by "mock": a connector that never grades us. It is
+# NOT the same thing as a mock BUILDER. A shadow builder id submits alongside
+# ours on every validator and is rejected on all of them, so it cannot be used
+# to tell mock validators from real ones, and it writes nothing to our own
+# tables at all -- there is no dashboard view "of" it to switch to.
+
+ELIG_HOURS = int(os.environ.get("ELIGIBILITY_HOURS", "24"))
+_elig_cache = {}
+_elig_lock = threading.Lock()
+
+
+def connector_eligibility():
+    """connector -> {"submitted", "ineligible", "graded"}, or None.
+
+    None means the question could not be asked, which is different from "no
+    connector grades us" and is shown differently."""
+    key = dkey()
+    now = time.monotonic()
+    with _elig_lock:
+        hit = _elig_cache.get(key)
+    if hit and now - hit[0] < 900:
+        return hit[1]
+    ours = (dep().get("relay_builder") or "").replace("'", "")
+    if not (RELAY_URL and RELAY_DS_UID and ours):
+        return None
+    try:
+        _, rows = relay(
+            "SELECT connector_identity AS c,"
+            " countIf(event = 'submitted') AS subs,"
+            " countIf(event = 'offer_rejected'"
+            "         AND reason = 'builder_not_eligible') AS bad,"
+            " countIf(event = 'round_chosen') AS won"
+            " FROM relay.mini_block_events"
+            f" WHERE timestamp >= now() - INTERVAL {ELIG_HOURS} HOUR"
+            f"   AND builder_id = '{ours}'"
+            " GROUP BY c")
+    except Exception:
+        return None
+    out = {}
+    for c, subs, bad, won in rows:
+        subs, bad, won = ch_int(subs), ch_int(bad), ch_int(won)
+        out[c] = {"submitted": subs, "ineligible": bad, "won": won,
+                  # graded if anything we sent was allowed to compete
+                  "graded": subs > 0 and bad < subs}
+    with _elig_lock:
+        if len(_elig_cache) > 6:
+            _elig_cache.clear()
+        _elig_cache[key] = (now, out)
+    return out
+
+
+def grade_filter(windows, mode):
+    """Drop windows whose leader never grades us. Unknown connectors are KEPT:
+    absence of evidence is not evidence of ineligibility."""
+    elig = connector_eligibility()
+    if mode != "graded" or not elig:
+        return windows, elig
+    return ([w for w in windows if (elig.get(w["leader"]) or {}).get("graded")],
+            elig)
+
+
+def grade_chips(mode, sel_win, sel_slot, elig, shown, total):
+    graded = sum(1 for v in (elig or {}).values() if v["graded"])
+    if elig is None:
+        return ('<span class="gradenote" data-tip="The relay is the only place '
+                "a rejection reason exists, and it is not reachable from here. "
+                'Every connector is shown.">connector grading unknown</span>')
+    if not graded:
+        return ('<span class="gradenote warn" data-tip="Every connector '
+                "rejected all of our offers with builder_not_eligible over the "
+                "last "
+                f'{ELIG_HOURS}h.">no connector is grading our offers</span>')
+    def chip(key, label):
+        q = f"?grade={key}" if key != "all" else "?"
+        if sel_win is not None:
+            q += f"&win={sel_win}"
+        if sel_slot is not None:
+            q += f"&slot={sel_slot}"
+        return (f'<a class="gradechip{" on" if mode == key else ""}" '
+                f'href="/{q}">{label}</a>')
+    return ('<span class="gradesel">'
+            + chip("all", "all connectors")
+            + chip("graded", f"grading us ({graded})")
+            + (f'<span class="dim">{shown} of {total} windows</span>'
+               if mode == "graded" else "")
+            + "</span>")
+
+def _leader_grade(leader):
+    """Say when a window's connector never grades us, so an unwinnable slot is
+    not read as one we lost."""
+    elig = connector_eligibility()
+    if not elig:
+        return ""
+    e = elig.get(leader)
+    if e is None or e["graded"]:
+        return ""
+    return ('<span class="warnpill" tabindex="0" data-tip="Over the last '
+            f'{ELIG_HOURS}h the relay rejected all {e["submitted"]:,} of our '
+            "offers to this connector with builder_not_eligible. Nothing we "
+            'sent was ever considered.">not grading us</span>')
+
+
+def strip_html(windows, sel_win, sel_slot, grade='all'):
+    """One chip per leader window, newest at the left.
+
+    Filtered FIRST: run boundaries, chips and every total below are derived
+    from this list, so filtering later would leave the counts describing
+    windows that are no longer on screen."""
+    total_windows = len(windows)
+    windows, elig = grade_filter(windows, grade)
+    if not windows:
+        return ('<div class="striphead"><span class="cap">leader windows</span>'
+                + grade_chips(grade, sel_win, sel_slot, elig, 0, total_windows)
+                + '</div><div class="err">no leader window in the last 30 days '
+                  "is on a connector that grades our offers</div>")
     # The strip is newest-first, so a chip whose run differs from the chip to
     # its LEFT is where that run began. Marking the boundary makes deploys
     # navigable: 21 runs across ~700 windows is otherwise invisible scrolling.
@@ -4633,8 +4894,11 @@ def strip_html(windows, sel_win, sel_slot):
             f'<span class="sub">{len(windows)} windows &middot; {slots} slots contested '
             f'&middot; <b class="okc">{won_rounds:,}/{rounds:,} rounds won</b>'
             f'<span class="dimc"> across {won} slots</span> &middot; {leaders} leaders '
-            f'&middot; last 30d on <code>{CH_BUILDER}</code></span>'
-            f'<span class="hint">newest at the left &mdash; scroll right for older</span>'
+            f'&middot; last 30d on <code>{dep()["builder"]}</code></span>'
+            + grade_chips(grade, sel_win, sel_slot, elig, len(windows),
+                          total_windows)
+            + f'<span class="hint">newest at the left &mdash; scroll right for '
+              f'older</span>'
             f'</div>{runbar(seen_runs)}<div class="strip">{chips}</div>'
             + window_html(windows, sel_win, sel_slot))
 
@@ -4690,6 +4954,7 @@ def window_html(windows, sel_win, sel_slot):
                if missing else "")
             + f'</span><span class="sub hascp">leader '
               f'<code>{html.escape(win["leader"])}</code>{copy_btn(win["leader"])}'
+            + _leader_grade(win["leader"])
             + ('<span class="warn"> &#9888; more than one leader identity in this '
                'window</span>' if win["leader_split"] else "")
             + f'</span></div><div class="strip sub2">'
@@ -4834,8 +5099,9 @@ def doc_baselines():
     """Live p50/p90/p99 for every documented field, so the proposed cutoffs can
     be judged against what this deployment actually does."""
     now = time.monotonic()
-    if _doc_cache["data"] is not None and now - _doc_cache["at"] < 600:
-        return _doc_cache["data"]
+    hit = _doc_cache.get(dkey())
+    if hit and now - hit["at"] < 600:
+        return hit["data"]
     out = {}
     wanted = {}
     for d in METRIC_DOCS:
@@ -4847,7 +5113,7 @@ def doc_baselines():
                 f'percentile("{f}",50), percentile("{f}",90), percentile("{f}",99), '
                 f'max("{f}"), count("{f}")' for f in fields)
             cols, rows = influx(
-                f'SELECT {sel} FROM "{meas}" WHERE "host_id" = {SIM!r} '
+                f'SELECT {sel} FROM "{meas}" WHERE "host_id" = {dep()["sim"]!r} '
                 f"AND time > now() - {DOC_WINDOW_H}h")
             if not rows:
                 continue
@@ -4862,7 +5128,7 @@ def doc_baselines():
     # the derived one: per-order commit cost, computed per datapoint
     try:
         _, rows = influx(f'SELECT "body_us","replayed" FROM "sim-commit" '
-                         f'WHERE "host_id" = {SIM!r} AND time > now() - {DOC_WINDOW_H}h')
+                         f'WHERE "host_id" = {dep()["sim"]!r} AND time > now() - {DOC_WINDOW_H}h')
         per = sorted(r[1] / r[2] for r in rows if r[1] and r[2])
         if per:
             pick = lambda p: per[min(len(per) - 1, int(round(p / 100 * (len(per) - 1))))]
@@ -4901,12 +5167,12 @@ def reference_page():
                 f'{v["active"]} (10m)')
         if h["ingest"]["ok"] and h["ingest"]["v"]:
             mine = next((x for x in h["ingest"]["v"]
-                         if x["instance"] == CH_INSTANCE), None)
+                         if x["instance"] == dep()["instance"]), None)
             peers = ", ".join(f'{x["instance"]} {x["lag"]}s'
                               for x in h["ingest"]["v"][:3])
             if mine:
                 live_health["event ingest lag"] = (
-                    f'{mine["lag"]}s for {html.escape(CH_INSTANCE)} &middot; '
+                    f'{mine["lag"]}s for {html.escape(dep()["instance"])} &middot; '
                     f"peers: {html.escape(peers)}")
     except Exception:
         pass
@@ -4994,7 +5260,7 @@ def reference_page():
 </body></html>"""
 
 def page(sel_win=None, sel_slot=None, sel_round=None, tab="rounds",
-         src="ours", partial=False):
+         src="ours", partial=False, grade="all"):
     # A partial serves only the panel, so the 30-day strip -- the expensive
     # half of this page -- is not built at all.
     strip, windows = "", []
@@ -5015,7 +5281,7 @@ def page(sel_win=None, sel_slot=None, sel_round=None, tab="rounds",
             else:
                 if sel_slot is not None and sel_win is None:
                     sel_win = window_of(sel_slot)
-                strip = strip_html(windows, sel_win, sel_slot)
+                strip = strip_html(windows, sel_win, sel_slot, grade)
                 # people walk a whole leader window, so warm its other slots in
                 # the background as soon as the window is known
                 warm_window(sel_win, skip=sel_slot)
@@ -5098,6 +5364,7 @@ def page(sel_win=None, sel_slot=None, sel_round=None, tab="rounds",
     <input name="slot" inputmode="numeric" pattern="[0-9]*" placeholder="go to slot"
            aria-label="go to slot" />
   </form>
+  {deploy_selector("/", {})}
   <a class="navlink" href="/analysis">range analysis</a>
   <a class="navlink" href="/reference">metrics reference &mdash; what is bad?</a>
 </header>
@@ -5117,6 +5384,9 @@ def page(sel_win=None, sel_slot=None, sel_round=None, tab="rounds",
 # are bounded by it, rather than the script's habit of bounding InfluxDB by
 # slot alone and letting it walk the retention.
 
+# Fallback only. A deployment's own DEPLOY_<NAME>_ANALYSIS_IDENTITY wins,
+# because the connector a builder serves is a property of that deployment --
+# opening Tokyo on an Amsterdam validator yields an empty page.
 ANALYSIS_IDENTITY = os.environ.get("ANALYSIS_IDENTITY", "")
 ANALYSIS_MAX_DAYS = 7
 PCTS = (50, 90, 95, 99)
@@ -5196,7 +5466,7 @@ def analysis_connectors(lo, hi):
     _, rows = clickhouse(
         "SELECT connector_identity, uniqExact(slot) AS slots "
         f"FROM bifrost_miniblocks WHERE ts >= '{_ch_ts(lo)}' AND ts <= '{_ch_ts(hi)}' "
-        f"AND instance_id = '{CH_INSTANCE}' AND connector_identity != '' "
+        f"AND instance_id = '{dep()["instance"]}' AND connector_identity != '' "
         "GROUP BY connector_identity ORDER BY slots DESC")
     return [(r[0], ch_int(r[1])) for r in rows]
 
@@ -5205,7 +5475,7 @@ def analysis_slots(lo, hi, identity):
     _, rows = clickhouse(
         f"SELECT DISTINCT slot FROM bifrost_miniblocks "
         f"WHERE ts >= '{_ch_ts(lo)}' AND ts <= '{_ch_ts(hi)}' "
-        f"AND connector_identity = '{identity}' AND instance_id = '{CH_INSTANCE}' "
+        f"AND connector_identity = '{identity}' AND instance_id = '{dep()["instance"]}' "
         "ORDER BY slot")
     return [int(r[0]) for r in rows]
 
@@ -5221,7 +5491,7 @@ def analysis_missing(slots):
     _, rows = clickhouse(
         "SELECT slot, index_in_slot, is_last, order_count, hex(payload) "
         f"FROM bifrost_miniblocks WHERE slot IN ({slot_list}) AND kind = 'winner' "
-        f"AND instance_id = '{CH_INSTANCE}'")
+        f"AND instance_id = '{dep()["instance"]}'")
     for slot, idx, is_last, order_count, hexpay in rows:
         try:
             refs = _decode_refs(bytes.fromhex(hexpay))
@@ -5244,7 +5514,7 @@ def analysis_missing(slots):
         "SELECT slot, index_in_slot, arrayStringConcat(sig_prefixes, ','), "
         "       arrayStringConcat(bundle_ids, ',') "
         f"FROM bifrost_miniblocks WHERE slot IN ({slot_list}) AND kind = 'selected' "
-        f"AND instance_id = '{CH_INSTANCE}'")
+        f"AND instance_id = '{dep()["instance"]}'")
     for slot, idx, pfx, bids in rows:
         key = (int(slot), int(idx))
         ours_tx.setdefault(key, set()).update(p for p in pfx.split(",") if p)
@@ -5332,8 +5602,14 @@ def _vote_sigs(missing):
         return found
 
     out = set()
+    which = dep()["name"]
+
+    def bound(win):
+        set_dep(which)
+        return one(win)
+
     with cf.ThreadPoolExecutor(max_workers=4) as pool:
-        for found in pool.map(one, sorted(by_window)):
+        for found in pool.map(bound, sorted(by_window)):
             out |= found
     return out
 
@@ -5344,7 +5620,7 @@ def _commit_rows(lo, hi, slots):
         f'SELECT * FROM "sim-commit" WHERE time >= \'{_ix_ts(lo)}\' '
         f"AND time <= '{_ix_ts(hi)}' "
         + "".join(f"AND \"host_id\" != '{h}' " for h in OFF_CHAIN)
-        + (f"AND \"host_id\" = '{SIM}'" if SIM else ""))
+        + (f"AND \"host_id\" = '{dep()["sim"]}'" if dep()["sim"] else ""))
     at = {name: i for i, name in enumerate(cols)}
     keep = set(slots)
     out = []
@@ -5438,7 +5714,7 @@ def analysis_gap(slots, threshold):
         "SELECT slot, index_in_slot, kind, max(reward), max(order_count), "
         "       max(is_last) "
         f"FROM bifrost_miniblocks WHERE slot IN ({slot_list}) "
-        f"AND instance_id = '{CH_INSTANCE}' GROUP BY slot, index_in_slot, kind")
+        f"AND instance_id = '{dep()["instance"]}' GROUP BY slot, index_in_slot, kind")
     best, win = {}, {}
     for slot, idx, kind, reward, orders, is_last in rows:
         key = (int(slot), int(idx))
@@ -5483,7 +5759,7 @@ def analysis_skew(lo, hi, slots, commits):
     _, rows = clickhouse(
         "SELECT toUnixTimestamp64Nano(ts), nums['slot'], nums['index'] "
         f"FROM bifrost_events WHERE ts >= '{_ch_ts(lo)}' AND ts <= '{_ch_ts(hi)}' "
-        f"AND event = 'round_committed' AND instance_id = '{CH_INSTANCE}' "
+        f"AND event = 'round_committed' AND instance_id = '{dep()["instance"]}' "
         f"AND nums['slot'] IN ({slot_list})")
     ch_ts = {(int(s), int(i)): int(t) for t, s, i in rows}
     at, crows = commits
@@ -5501,7 +5777,7 @@ def analysis_install(lo, hi, slots, identity, commits):
     _, rows = clickhouse(
         "SELECT toUnixTimestamp64Nano(ts), nums['slot'] FROM bifrost_events "
         f"WHERE ts >= '{_ch_ts(lo)}' AND ts <= '{_ch_ts(hi)}' AND event = 'progress' "
-        f"AND instance_id = '{CH_INSTANCE}' AND attrs['identity'] = '{identity}' "
+        f"AND instance_id = '{dep()["instance"]}' AND attrs['identity'] = '{identity}' "
         f"AND attrs['leader_state'] = 'Sequencing' AND nums['slot'] IN ({slot_list})")
     seq = {}
     for t, slot in rows:
@@ -5512,7 +5788,7 @@ def analysis_install(lo, hi, slots, identity, commits):
         f'SELECT "slot","event" FROM "sim-context" WHERE time >= \'{_ix_ts(lo)}\' '
         f"AND time <= '{_ix_ts(hi)}' "
         + "".join(f"AND \"host_id\" != '{h}' " for h in OFF_CHAIN)
-        + (f"AND \"host_id\" = '{SIM}'" if SIM else ""))
+        + (f"AND \"host_id\" = '{dep()["sim"]}'" if dep()["sim"] else ""))
     at = {n: i for i, n in enumerate(cols)}
     install = {}
     for v in vals:
@@ -5556,12 +5832,12 @@ def analysis_run(start, end, threshold, identity):
     # the identity actually used, or a request that left it blank stores under
     # one key and looks up under another, and never hits.
     connectors = analysis_connectors(lo, hi)
-    picked = (identity or ANALYSIS_IDENTITY
+    picked = (identity or dep().get("analysis_identity") or ANALYSIS_IDENTITY
               or (connectors[0][0] if connectors else ""))
     # The threshold is deliberately NOT part of the key. Only report 3 depends
     # on it and that one costs half a second, while the rest of the run costs
     # ten; keying on it would re-query everything to move a slider.
-    key = (_ch_ts(lo), _ch_ts(hi), picked)
+    key = (dkey(), _ch_ts(lo), _ch_ts(hi), picked)
     stamp = time.monotonic()
     with _analysis_lock:
         hit = _analysis_cache.get(key)
@@ -6099,6 +6375,8 @@ def analysis_page(start, end, threshold, identity):
 <header>
   <h1>sim<span>bench</span></h1>
   <div class="sub">range analysis</div>
+  {deploy_selector("/analysis", {"start": start, "end": end or "",
+                                 "threshold": f"{threshold:g}"})}
   <a class="navlink" href="/">back to the slot explorer</a>
   <a class="navlink" href="/reference">metrics reference</a>
 </header>
@@ -6109,8 +6387,36 @@ def analysis_page(start, end, threshold, identity):
 </body></html>"""
 
 class Handler(BaseHTTPRequestHandler):
+
+    def _remember_deployment(self):
+        if getattr(self, "_set_cookie", None) is None:
+            return
+        self.send_header("Set-Cookie",
+                         f"dep={self._set_cookie}; Path=/; Max-Age=31536000; "
+                         "SameSite=Lax")
+
+    def _pick_deployment(self, parsed):
+        """?dep= wins so a link is shareable; otherwise the cookie, so ordinary
+        links need not carry it and the SPA navigation keeps working
+        unchanged. Returns whether the cookie should be (re)written."""
+        qs = urllib.parse.parse_qs(parsed.query)
+        asked = (qs.get("dep", [""])[0] or "").strip()
+        if asked and asked in DEPLOY_BY_NAME:
+            set_dep(asked)
+            return True
+        cookie = ""
+        raw = self.headers.get("Cookie", "")
+        for part in raw.split(";"):
+            k, _, v = part.strip().partition("=")
+            if k == "dep":
+                cookie = v
+        set_dep(cookie if cookie in DEPLOY_BY_NAME else "")
+        return False
+
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
+        remember = self._pick_deployment(parsed)
+        self._set_cookie = dep()["name"] if remember else None
         if parsed.path == "/analysis/orders":
             qs = urllib.parse.parse_qs(parsed.query)
             one = lambda k, d: (qs.get(k, [d])[0] or d)
@@ -6124,6 +6430,7 @@ class Handler(BaseHTTPRequestHandler):
             body = out.encode()
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
+            self._remember_deployment()
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -6142,6 +6449,7 @@ class Handler(BaseHTTPRequestHandler):
                 body = f"<pre>{html.escape(str(exc))}</pre>".encode()
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
+            self._remember_deployment()
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -6153,6 +6461,7 @@ class Handler(BaseHTTPRequestHandler):
                 body = f"<pre>{html.escape(str(exc))}</pre>".encode()
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
+            self._remember_deployment()
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -6173,11 +6482,14 @@ class Handler(BaseHTTPRequestHandler):
                         tab if tab in ("compare", "timeline", "dag", "logs")
                         else "rounds",
                         src if src in ("ours", "winner") else "ours",
-                        partial=qs.get("partial", ["0"])[0] == "1").encode()
+                        partial=qs.get("partial", ["0"])[0] == "1",
+                        grade=("graded" if qs.get("grade", [""])[0] == "graded"
+                               else "all")).encode()
         except Exception as exc:
             body = f"<pre>{html.escape(str(exc))}</pre>".encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        self._remember_deployment()
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)

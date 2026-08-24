@@ -553,6 +553,54 @@ is only identifiable by having reached our own ingest with `route=vote`, and
 asking that of a whole day scans every receive in it. Per window it is about a
 second, and the windows go out together — measured 12s down to about 4s.
 
+## More than one builder
+
+We run more than one — Amsterdam and Tokyo — and they are separate in every
+store: different `local_builder_id` in `bifrost_miniblocks`, different
+`instance_id` in `bifrost_events`, a different simulator `host_id` in InfluxDB,
+and they never serve the same validator, so they never compete for a slot.
+
+A **deployment** is that whole set under one name, and a selector in the header
+switches between them. The choice is remembered in a cookie so ordinary links
+need not carry it; `?dep=<name>` overrides the cookie, so a link stays
+shareable. With `DEPLOYMENTS` unset the previous single-deployment variables are
+used as one unnamed deployment and no selector appears.
+
+Two things this had to get right:
+
+- **The active deployment is per request, not per process.** The server is
+  threaded, so a module-level "current builder" would be read by one request
+  while another wrote it. It lives in a `threading.local`, set once at the top
+  of the handler. Background work — the window prefetch, the six-way per-slot
+  fan-out, the analysis vote lookup — runs on pool threads that do **not**
+  inherit it, so each captures the name and re-sets it inside the worker.
+  Without that the prefetch would fetch Tokyo's slots against Amsterdam's
+  builder id and cache the empty result under Tokyo's key.
+- **Every cache is keyed by deployment.** Slot data, windows, health, the
+  reference page and analysis runs are all per builder; a bare slot number is
+  not unique across them.
+
+### Which connectors actually grade us
+
+A validator either considers our offers or rejects every one with
+`builder_not_eligible`, and **that verdict exists only in the relay's table** —
+`bifrost_miniblocks` records what we sent, never what was made of it. So a slot
+on an ineligible connector looks entirely normal in our own data right up to the
+point where it is never won.
+
+The strip therefore carries an **all connectors / grading us** filter, and a
+window whose connector rejects everything is marked so an unwinnable slot is not
+read as one we lost narrowly. Unknown connectors are kept: absence of evidence
+is not evidence of ineligibility. Without relay credentials the filter says
+`connector grading unknown` rather than silently showing everything as fine.
+
+**This is not the same as a mock builder.** A shadow builder id submits
+alongside ours on every validator and is rejected on all of them, so it cannot
+be used to tell mock validators from real ones — and it writes nothing to
+`bifrost_miniblocks` or `bifrost_events` at all, so there is no dashboard view
+"of" it to switch to. What *is* selectable is whether the connector grades us,
+which is the question the mock/non-mock distinction usually stands in for.
+
 ## Metrics reference — `/reference`
 
 A page documenting every metric: what it measures, its source field, the amber
