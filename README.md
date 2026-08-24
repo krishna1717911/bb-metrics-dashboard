@@ -581,8 +581,12 @@ chasing the same button down eight rounds is the annoying part.
 
 A bullet is sized by the reward it carried relative to the best bid of that
 round, so a ladder climbing toward the deadline is visible without reading a
-number. The ringed bullet is the offer the relay chose; a faded one was
-rejected; **an offer that arrived after the deadline is ringed amber rather than
+number. The **haloed** bullet carried the highest reward, which is deliberately marked
+apart from the winner because the two often differ: over three hours, **43% of
+rounds had a higher offer that lost**, since a builder the relay refuses to
+grade can bid any number it likes. When the best bid loses, the round header
+says so outright. The teal-ringed bullet is the offer the relay chose; a faded
+one was rejected; **an offer that arrived after the deadline is ringed amber rather than
 faded** — it is work that was done and then missed the window, which is worth
 seeing rather than hiding. On that slot two of them were ours, 1 ms late,
 rejected `index_mismatch`, one of them carrying 8,388,721 against a winning

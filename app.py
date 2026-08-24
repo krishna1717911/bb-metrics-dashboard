@@ -2956,7 +2956,11 @@ def offers_html(slot, data, relay_err=None):
         f"relay &middot; {total_bids:,} offers across {len(data)} rounds "
         "&middot; hover a marker for the builder, the reward and the order "
         "count</span></div>"
-        f'<div class="olegend">{legend}</div>'
+        f'<div class="olegend">{legend}'
+        '<span class="omark"><i class="omk ohalo2"></i>highest reward</span>'
+        '<span class="omark"><i class="omk owon2"></i>chosen by the relay</span>'
+        '<span class="omark"><i class="omk olate2"></i>after the deadline</span>'
+        "</div>"
         + (f'<div class="dagnote">{len(folded)} builder'
            f'{"" if len(folded) == 1 else "s"} beyond the fourth are grey: only '
            "four hues can be told apart reliably at this density, so a fifth is "
@@ -2983,7 +2987,11 @@ def offers_html(slot, data, relay_err=None):
         "than one builder's doing. A bullet is sized by the reward it carried, "
         "relative to the best bid of that round, so a ladder climbing toward "
         "the deadline is visible without reading a single number; the ringed "
-        "one is the offer the relay chose, and a faded one was rejected. An "
+        "one is the offer the relay chose. The <b>haloed</b> one carried the "
+        "highest reward, which is not the same thing: measured over three "
+        "hours, 43% of rounds had a higher offer that lost, because an offer "
+        "from a builder the relay will not grade can carry any number at all. "
+        "A faded marker was rejected. An "
         "offer that arrived <b>after the deadline</b> is ringed amber rather "
         "than faded &mdash; it is work that was done and then missed the "
         "window, which is worth seeing, not hiding. Every "
@@ -3079,9 +3087,19 @@ OFFERS_JS = r"""
     head.className = 'ohead';
     var late = rd.deadline
       ? rd.bids.filter(function(b){ return b.t > rd.deadline; }).length : 0;
+    // The best bid is NOT reliably the winning one: measured over three hours,
+    // 43% of rounds had a higher offer that lost -- an offer from a builder the
+    // relay refuses to grade can carry any number at all. So it is marked in
+    // its own right rather than assumed to be the ringed one.
+    var top = null;
+    rd.bids.forEach(function(b){ if(!top || b.r > top.r) top = b; });
+    var topLost = top && rd.chosen && top.u !== rd.chosen.u && top.r > rd.chosen.r;
     head.innerHTML = '<b>round ' + rd.round + '</b>'
       + '<span class="dim">' + rd.bids.length + ' offers over ' + span + ' ms</span>'
       + (late ? '<span class="olate">' + late + ' after the deadline</span>' : '')
+      + (top ? '<span class="otop">best bid ' + money(top.r) + ' — '
+               + esc(top.b) + '</span>' : '')
+      + (topLost ? '<span class="otoplost">the best bid did not win</span>' : '')
       + (rd.chosen
           ? '<span class="owin">won by ' + esc(rd.chosen.b) + ' · '
             + money(rd.chosen.r) + '</span>'
@@ -3200,7 +3218,10 @@ OFFERS_JS = r"""
         var cls = 'om' + (won ? ' owon' : '') + (isLate ? ' olateM' : '')
                 + (!isLate && b.v && b.v !== 'best' && b.v !== 'not best'
                    ? ' orej' : '');
-        var m = marker(g, st.s, colX(i), y(b.t - base), r, st.c, cls);
+        var cy = y(b.t - base);
+        if(top && b.u === top.u)
+          mk('circle', {cx: colX(i), cy: cy, r: r + 4.2, class: 'ohalo'}, g);
+        var m = marker(g, st.s, colX(i), cy, r, st.c, cls);
         m.addEventListener('mouseenter', function(ev){ show(ev, rd, b, base); });
         m.addEventListener('mouseleave', hide);
       });
@@ -3212,15 +3233,19 @@ OFFERS_JS = r"""
 
   function show(ev, rd, b, base){
     hide();
+    var best = null;
+    rd.bids.forEach(function(x){ if(!best || x.r > best.r) best = x; });
     tip = document.createElement('div');
     tip.className = 'ctip';
     tip.innerHTML = '<b>' + esc(b.b) + (b.b === D.ours ? ' (ours)' : '') + '</b>'
       + '<span>round ' + rd.round + ' · +' + (b.t - base) + ' ms</span>'
       + '<span>reward ' + b.r.toLocaleString() + '</span>'
       + '<span>orders ' + b.o.toLocaleString() + '</span>'
+      + (rd.chosen && rd.chosen.u === b.u ? '<span class="wonT">the relay chose this one</span>' : '')
       + (rd.deadline && b.t > rd.deadline
           ? '<span class="lateT">' + (b.t - rd.deadline)
             + ' ms after the deadline</span>' : '')
+      + (best && best.u === b.u ? '<span class="topT">highest reward this round</span>' : '')
       + (b.v ? '<span class="g">' + esc(b.v) + '</span>' : '');
     document.body.appendChild(tip);
     var r = ev.target.getBoundingClientRect();
@@ -4693,6 +4718,12 @@ details.around>summary:hover{background:#111c26}
 .olegend .om.triangle{clip-path:polygon(50% 0,100% 100%,0 100%);border-radius:0}
 .olegend .om.plus{clip-path:polygon(38% 0,62% 0,62% 38%,100% 38%,100% 62%,62% 62%,62% 100%,38% 100%,38% 62%,0 62%,0 38%,38% 38%);border-radius:0}
 .olegend .om.bar{height:4px;border-radius:1px}
+.omark{display:flex;align-items:center;gap:6px;color:#61748b}
+.omk{width:10px;height:10px;border-radius:50%;display:inline-block;
+  background:transparent;border:1.6px solid}
+.omk.ohalo2{border-color:#e8eef5}
+.omk.owon2{border-color:#5eead4}
+.omk.olate2{border-color:#fbbf24}
 .ousp{margin-left:5px;color:#5eead4;font-size:9.5px;font-weight:600;
   text-transform:uppercase;letter-spacing:.05em}
 .ofacet{background:#0c141b;border:1px solid #1a2430;border-radius:5px;
@@ -4703,6 +4734,13 @@ details.around>summary:hover{background:#111c26}
 .ohead .dim{color:#4d5c70}
 .owin{color:#5eead4;font-family:ui-monospace,Menlo,monospace}
 .osvg{width:100%;display:block}
+.otop{color:#e8eef5;font-family:ui-monospace,Menlo,monospace}
+.otoplost{color:#f87171;font-family:ui-monospace,Menlo,monospace;
+  border:1px solid #7f1d1d;background:#7f1d1d22;border-radius:4px;
+  padding:0 6px;font-size:10.5px}
+svg .ohalo{fill:none;stroke:#e8eef5;stroke-width:1.2;opacity:.9}
+.ctip .topT{color:#e8eef5}
+.ctip .wonT{color:#5eead4}
 .olate{color:#fbbf24;font-family:ui-monospace,Menlo,monospace}
 .ouuid{color:#4d5c70;font-family:ui-monospace,Menlo,monospace;font-size:10.5px}
 svg .om.olateM{stroke:#fbbf24;stroke-width:1.8}
@@ -4737,7 +4775,7 @@ svg .om.olateM{stroke:#fbbf24;stroke-width:1.8}
 .oflagt.ochosen{fill:#5eead4}
 
 svg .om{stroke:#0c141b;stroke-width:1}
-svg .om.owon{stroke:#facc15;stroke-width:1.8}
+svg .om.owon{stroke:#5eead4;stroke-width:1.8}
 svg .om.orej{opacity:.45}
 /* dispatch DAG */
 .dagbar{display:flex;align-items:center;flex-wrap:wrap;gap:5px;
