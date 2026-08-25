@@ -412,6 +412,95 @@ WINDOW = 4  # a Solana leader window is four consecutive slots
 COLD_RUN_SECONDS = 600
 
 
+# ------------------------------------------------- a relay-only deployment
+#
+# Not every builder id we care about writes to our own tables. The mock builder
+# submits tens of thousands of offers a day and is recorded ONLY by the relay --
+# checked over seven days, it has no row in bifrost_miniblocks and none in
+# bifrost_events. So a deployment can declare source=relay, and then its slot
+# list, its window list and its timestamps all come from relay.mini_block_events
+# instead.
+#
+# What that buys is the offer timeline, which was always relay-sourced. What it
+# cannot buy is anything computed from our own instrumentation -- rounds,
+# extends, the simulator's DAG, the shred path, our logs -- because for this
+# builder none of it was ever written. Those tabs say so rather than rendering
+# an empty frame that looks like a fault.
+
+def relay_windows(days=2):
+    """The strip, built from the relay, for a builder we do not instrument.
+
+    Bounded to a couple of days rather than thirty: this is a per-offer event
+    table for every builder on the network, and the equivalent 30-day scan is
+    not something to put behind a page load."""
+    ours = (dep().get("relay_builder") or "").replace("'", "")
+    if not ours or not (RELAY_URL and RELAY_DS_UID):
+        return []
+    _, rows = relay(
+        "SELECT slot, min(toString(timestamp)) AS first_ts,"
+        " any(connector_identity) AS leader,"
+        " countIf(event = 'submitted') AS offers,"
+        " uniqExactIf(index_in_slot, event = 'round_chosen') AS rounds,"
+        " uniqExactIf(index_in_slot, event = 'round_chosen'"
+        f"            AND builder_id = '{ours}') AS won_rounds"
+        " FROM relay.mini_block_events"
+        f" WHERE timestamp >= now() - INTERVAL {int(days) * 24} HOUR"
+        f"   AND builder_id = '{ours}'"
+        " GROUP BY slot ORDER BY slot DESC")
+    windows = {}
+    for slot, first_ts, leader, offers, rounds, won_rounds in rows:
+        slot = int(slot)
+        win = windows.setdefault(window_of(slot),
+                                 {"win": window_of(slot), "slots": [],
+                                  "leaders": set()})
+        win["slots"].append({"slot": slot, "ts": first_ts,
+                             "won": ch_int(won_rounds) > 0,
+                             "offers": ch_int(offers),
+                             "rounds": ch_int(rounds),
+                             "won_rounds": ch_int(won_rounds)})
+        if leader:
+            win["leaders"].add(leader)
+    out = []
+    for win in (windows[k] for k in sorted(windows, reverse=True)):
+        win["slots"].sort(key=lambda s: s["slot"])
+        win["ts"] = min(s["ts"] for s in win["slots"])
+        win["won"] = sum(1 for s in win["slots"] if s["won"])
+        win["rounds"] = sum(s["rounds"] for s in win["slots"])
+        win["won_rounds"] = sum(s["won_rounds"] for s in win["slots"])
+        leaders = sorted(win.pop("leaders"))
+        win["leader"] = leaders[0] if leaders else ""
+        win["leader_split"] = len(leaders) > 1
+        # run_id is ours, and this builder is not instrumented by us
+        win["run_id"] = ""
+        win["run_split"] = False
+        out.append(win)
+    return out
+
+
+def relay_slot_stamp(slot):
+    """A time bound for a relay-only slot, taken from the window list we have
+    already fetched rather than asking again."""
+    try:
+        for win in produced_windows():
+            for s in win["slots"]:
+                if s["slot"] == slot:
+                    return s["ts"]
+    except Exception:
+        pass
+    return None
+
+
+def uninstrumented(slot, what):
+    return ('<div class="panel"><div class="dtlhead">' + what + "</div>"
+            '<div class="none">'
+            f'<b>{html.escape(dep()["label"])}</b> is recorded only by the '
+            "relay. It writes nothing to <code>bifrost_miniblocks</code> or "
+            "<code>bifrost_events</code> &mdash; checked over seven days, not "
+            "one row &mdash; so there is no offer ladder, no simulator, no "
+            "shred path and no log stream of ours to show for it. What the "
+            "relay does see is on the <b>offer timeline</b> tab."
+            "</div></div>")
+
 def window_of(slot):
     return (slot // WINDOW) * WINDOW
 
@@ -437,6 +526,10 @@ def produced_windows(days=30):
     hit = _cache.get(dkey())
     if hit and now - hit["at"] < 300:
         return hit["windows"]
+    if dep().get("source") == "relay":
+        out = relay_windows()
+        _cache[dkey()] = {"windows": out, "at": now}
+        return out
     _, rows = clickhouse(
         "SELECT slot, toString(min(ts)) AS first_ts, any(connector_identity) AS leader, "
         "       max(won_by_us) AS won, countIf(kind = 'selected') AS offers, "
@@ -2430,7 +2523,8 @@ def _build_deployments():
                  "leader0": (os.environ.get("SHRED_LEADER_ID", "").split(",")
                              + [""])[0].strip(),
                  "relay_builder": os.environ.get("RELAY_OUR_BUILDER", ""),
-                 "analysis_identity": os.environ.get("ANALYSIS_IDENTITY", "")}]
+                 "analysis_identity": os.environ.get("ANALYSIS_IDENTITY", ""),
+                 "source": "ours"}]
     out = []
     for name in names:
         key = f"DEPLOY_{name.upper()}_"
@@ -2445,6 +2539,9 @@ def _build_deployments():
             "leader0": (os.environ.get(key + "LEADERS", "").split(",") + [""])[0].strip(),
             "relay_builder": os.environ.get(key + "RELAY_BUILDER", ""),
             "analysis_identity": os.environ.get(key + "ANALYSIS_IDENTITY", ""),
+            # "ours" reads our own instrumentation; "relay" is for a builder
+            # id that only the relay records.
+            "source": (os.environ.get(key + "SOURCE", "") or "ours").strip(),
         })
     return out
 
@@ -3393,6 +3490,12 @@ def _slot_data_uncached(slot, now):
     rounds = slot_rounds(slot)
     stamps = [i["ts"] for r in rounds
               for i in r["offers"] + ([r["winner"]] if r["winner"] else [])]
+    if not stamps and dep().get("source") == "relay":
+        # No rows of ours means no window to bound the relay query by, so take
+        # the one the strip already knows.
+        stamp = relay_slot_stamp(slot)
+        if stamp:
+            stamps = [stamp]
     # The two InfluxDB queries are independent and each costs seconds against a
     # 300s window, so run them together rather than back to back.
     import concurrent.futures as cf
@@ -5860,7 +5963,19 @@ def page(sel_win=None, sel_slot=None, sel_round=None, tab="rounds",
             for key, label in (("rounds", "rounds"), ("compare", "comparison"),
                                ("timeline", "timeline"), ("offers", "offer timeline"),
                                ("dag", "dag"), ("logs", "logs")))
-        if tab == "offers":
+        # A relay-only builder has no instrumentation of ours behind any of
+        # these, so they are answered once here instead of each discovering
+        # emptiness on its own.
+        UNINSTRUMENTED = {"rounds": "auction rounds",
+                          "compare": "round comparison",
+                          "timeline": "slot timeline",
+                          "dag": "dispatch DAG",
+                          "logs": "logs"}
+        if dep().get("source") == "relay" and tab in UNINSTRUMENTED:
+            inner = uninstrumented(sel_slot, UNINSTRUMENTED[tab])
+            blurb = ("this builder is recorded by the relay only &mdash; see "
+                     "the offer timeline.")
+        elif tab == "offers":
             try:
                 d = slot_data(sel_slot)
                 inner = offers_html(sel_slot, d.get("offers"),

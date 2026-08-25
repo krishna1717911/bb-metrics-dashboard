@@ -643,12 +643,30 @@ read as one we lost narrowly. Unknown connectors are kept: absence of evidence
 is not evidence of ineligibility. Without relay credentials the filter says
 `connector grading unknown` rather than silently showing everything as fine.
 
-**This is not the same as a mock builder.** A shadow builder id submits
-alongside ours on every validator and is rejected on all of them, so it cannot
-be used to tell mock validators from real ones — and it writes nothing to
-`bifrost_miniblocks` or `bifrost_events` at all, so there is no dashboard view
-"of" it to switch to. What *is* selectable is whether the connector grades us,
-which is the question the mock/non-mock distinction usually stands in for.
+**This is not the same as a mock builder**, which is a separate thing and has
+its own deployment — see below. A shadow builder id submits alongside ours on
+every validator and is rejected on all of them, so it cannot be used to tell
+mock validators from real ones. Whether the *connector* grades us is a different
+question, and it is the one this filter answers.
+
+### A relay-only deployment
+
+Not every builder id worth looking at writes to our tables. The mock builder
+submits tens of thousands of offers a day — measured over 24 h, **50,261
+submissions across 6 connectors, 100% rejected `builder_not_eligible`, zero
+won** — and over seven days it has **not one row** in `bifrost_miniblocks` or
+`bifrost_events`.
+
+So a deployment can declare `DEPLOY_<NAME>_SOURCE=relay`, and then its slot
+list, window list and timestamps all come from `relay.mini_block_events`. It
+needs only a label, that flag, and `RELAY_BUILDER`.
+
+What that buys is the **offer timeline**, which was always relay-sourced: you
+see every one of the mock's bids beside everyone else's, with the relay's
+verdict on each. What it cannot buy is anything from our own instrumentation —
+rounds, extends, the simulator's DAG, the shred path, our logs — because for
+this builder none of it was ever written. Those tabs say exactly that instead of
+rendering an empty frame that reads as a fault.
 
 ## Metrics reference — `/reference`
 
