@@ -553,18 +553,30 @@ is only identifiable by having reached our own ingest with `route=vote`, and
 asking that of a whole day scans every receive in it. Per window it is about a
 second, and the windows go out together — measured 12s down to about 4s.
 
-### Timeline: when each extend actually ran
+### Timeline: every extend and every offer, in order
 
-The round's extends row folds open into every individual call: when it started,
-when it finished, how long the body took, the idle **gap** since the previous
-one ended, applied-of-offered, the critical path and the status. A
-`sim-extend` point is written *after* the body finishes, so the recorded
-timestamp is the extend's **completion** and `started` is that minus the body —
-both are shown, because the start is what lines up with the round's other
-events.
+`round N extends` as a single row said almost nothing, so each individual call
+is now its own row — when it ran, how long the body took, applied-of-offered,
+the critical path, how many started unblocked, the running prefix, and the idle
+**gap** since the previous extend ended. A `sim-extend` point is written *after*
+the body finishes, so the recorded timestamp is the **completion**; rows are
+placed at completion minus body, which is the moment that lines up with
+everything else.
 
-Folded rather than flat: a round runs eight to forty extends and a slot has
-eight rounds, so as timeline rows they would bury everything else in the tab.
+Every offer we sent is a row too — order count, reward, CU, bundles and the
+miniblock uuid, with how many orders it added over the previous rung. Read
+together the chain is legible: extend, extend, offer, dispatch, extend, winner
+announced, commit, next round.
+
+A busy slot is around 370 rows, so a **summary / every extend and offer** toggle
+sits in the header; summary is the old view.
+
+**Our offers are ClickHouse rows and the simulator's are InfluxDB**, so they are
+shifted by the same measured offset the builder events use. When no
+`round_committed` pair exists for a slot the offset cannot be measured, and
+rather than hiding every offer the rows are placed on their own clock with the
+header saying so: against each other they are exact, against the extends they
+may be out by up to a second.
 
 The row that used to say "N miniblocks sent to the relay" said how many and
 never when, which is the one thing a timeline is for. It now reads as a

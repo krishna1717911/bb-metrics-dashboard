@@ -3816,7 +3816,8 @@ def extend_calls(stat):
             "throttled call rather than an idle lane.</div></details>")
 
 
-def timeline_html(slot, extends, commits, shreds, rounds, builder=None):
+def timeline_html(slot, extends, commits, shreds, rounds, builder=None,
+                  detail=True):
     """The whole causal chain for a slot, in order.
 
     It starts on the PARENT slot, because that is what actually gates us: a
@@ -3855,6 +3856,9 @@ def timeline_html(slot, extends, commits, shreds, rounds, builder=None):
         ev.append((ctx["t"], "context installed",
                    "the parent is frozen, so sequencing can begin",
                    f"built on parent {parent}", "start"))
+    # Resolved before anything is placed: our offers are ClickHouse rows and
+    # need the same shift onto the InfluxDB clock the builder events get.
+    off, spread, anchors = builder_offset(builder, commits)
     for idx in sorted(k for k in (extends or {}) if isinstance(k, int)):
         e = extends[idx]
         span = max(0, (e["t_last"] - e["t_first"]) / 1e6)
@@ -3876,9 +3880,61 @@ def timeline_html(slot, extends, commits, shreds, rounds, builder=None):
                    f'<span class="info" tabindex="0" data-tip="{tip}">i</span>',
                    f'per extend: p50 {ms(e["body_p50"])} &middot; max '
                    f'{ms(e["body_max"])} &middot; {e["applied"]:,} of '
-                   f'{e["orders"]:,} orders applied'
-                   + extend_calls(e),
-                   "ext"))
+                   f'{e["orders"]:,} orders applied',
+                   "extsum"))
+        if detail:
+            prev_end = None
+            for k, c in enumerate(e.get("calls") or []):
+                start = c["t"] - c["body"] * 1000
+                gap = ("" if prev_end is None
+                       else f'idle {(start - prev_end) / 1e6:,.2f} ms before it')
+                prev_end = c["t"]
+                dropped = c["orders"] - c["applied"]
+                status = EXT_STATUS.get(c["status"], c["status"])
+                ev.append((
+                    start, f"round {idx} &middot; extend {k}",
+                    f'{ms(c["body"])} &middot; {c["applied"]:,}/{c["orders"]:,} '
+                    "applied"
+                    + (f' <span class="dropn">&minus;{dropped}</span>'
+                       if dropped > 0 else "")
+                    + ("" if c["status"] == 1
+                       else f' <span class="bad">{status}</span>'),
+                    " &middot; ".join(x for x in (
+                        f'crit path {c["crit"]:,}' if c["crit"] else "",
+                        f'{c["iwidth"]:,} start unblocked' if c["iwidth"] else "",
+                        f'prefix now {c["prefix"]:,}' if c["prefix"] else "",
+                        gap) if x),
+                    "ext"))
+    # Our offers. These are bifrost_miniblocks rows, so ClickHouse's clock --
+    # the same shift the builder events get, and for the same reason.
+    # Placed even when the offset could not be measured. They are ClickHouse
+    # rows and the simulator's are InfluxDB, so unshifted their position
+    # against an extend can be out by the clock difference -- measured as much
+    # as 899 ms on one slot. Their position against EACH OTHER is exact either
+    # way, since they all come off the same clock, and 190 offers hidden is a
+    # worse answer than 190 offers with the caveat stated.
+    offers_unshifted = detail and off is None
+    if detail:
+        for r in rounds or []:
+            rungs = sorted(r["offers"], key=lambda o: o["ts"])
+            prev = None
+            for k, o in enumerate(rungs):
+                try:
+                    t = _rfc3339_ns(o["ts"][:26].replace(" ", "T")) + (off or 0)
+                except Exception:
+                    continue
+                grew = "" if prev is None else f'+{o["orders"] - prev:,} orders'
+                prev = o["orders"]
+                ev.append((
+                    t, f'round {r["round"]} &middot; offer {k}',
+                    f'{o["orders"]:,} orders &middot; {sol(o["reward"])} SOL'
+                    + (f' <span class="dim">{grew}</span>' if grew else ""),
+                    " &middot; ".join(x for x in (
+                        f'{o["exec_cost"]:,} CU' if o["exec_cost"] else "",
+                        f'{o["bundles"]:,} bundles' if o["bundles"] else "",
+                        html.escape(o["uuid"])) if x),
+                    "offer" + (" unshifted" if offers_unshifted else "")))
+
     for idx in sorted(k for k in (commits or {}) if isinstance(k, int)):
         c = commits[idx]
         kind = COMMIT_KIND.get(c["kind"], "?")
@@ -3889,9 +3945,15 @@ def timeline_html(slot, extends, commits, shreds, rounds, builder=None):
                    f'{kind} &middot; {ms(c["body"])}', detail, kind))
     shred_rows(slot, "chain", "")
 
-    # The builder's own events, shifted onto the InfluxDB clock.
-    off, spread, anchors = builder_offset(builder, commits)
+    # The builder's own events, on the shift resolved above.
     align = ""
+    offwarn = ""
+    if offers_unshifted:
+        offwarn = ('<span class="warn"> &#9888; no round_committed pair for '
+                   "this slot, so the ClickHouse-to-InfluxDB offset could not "
+                   "be measured: our offers are placed on their own clock and "
+                   "their position against the extends may be out by up to a "
+                   "second. Against each other they are exact.</span>")
     if builder and builder.get("events"):
         if off is None:
             align = ('<span class="warn"> &#9888; builder events omitted: no '
@@ -3973,6 +4035,7 @@ def timeline_html(slot, extends, commits, shreds, rounds, builder=None):
                 '<div class="none">no InfluxDB events for this slot</div></div>')
     ev.sort(key=lambda x: x[0])
     t0 = ev[0][0]
+    fine = sum(1 for e in ev if e[4] in ("ext", "offer"))
     total = max(1, ev[-1][0] - t0)
     rows = []
     for t, label, what, detail, cls in ev:
@@ -3991,20 +4054,29 @@ def timeline_html(slot, extends, commits, shreds, rounds, builder=None):
             ("#64748b", "parent slot &mdash; the chain arriving before us"),
             ("#c084fc", "builder &mdash; bifrost_events, clock-aligned"),
             ("#2dd4bf", "context install &mdash; we can start sequencing"),
-            ("#60a5fa", "our extends"),
+            ("#60a5fa", "our extends &mdash; one row per call"),
+            ("#7dd3fc", "an offer we sent to the relay"),
             ("#fb923c", "commit: replay &mdash; we lost, their block re-executed"),
             ("#4ade80", "commit: promote &mdash; we won, pointer move"),
             ("#475569", "commit: empty &mdash; winnerless round"),
             ("#22d3ee", "this slot on chain &mdash; complete, frozen")))
+    base = f"/?win={window_of(slot)}&slot={slot}&tab=timeline"
+    toggle = ('<span class="tlmode">'
+              f'<a class="tlchip{"" if detail else " on"}" '
+              f'href="{base}&tl=sum">summary</a>'
+              f'<a class="tlchip{" on" if detail else ""}" href="{base}">'
+              "every extend and offer"
+              + (f" ({fine:,})" if detail else "") + "</a></span>")
     return ('<div class="panel"><div class="dtlhead">slot timeline'
             "<span class='note'>starts on the PARENT slot, because a context "
             "cannot install until the parent's bank is frozen &middot; "
             "InfluxDB only, pinned to our own host, so this is a single clock "
             "and the order is real &middot; relay and ClickHouse timestamps "
             "are excluded unless they can be ALIGNED &middot; extends are "
-            "collapsed per round</span>" + align + "</div>"
+            "collapsed per round</span>" + align + offwarn + "</div>"
             f'<div class="legend">{legend}</div>'
-            "<table><thead><tr><th class=n>offset</th><th>UTC</th><th>event</th>"
+            + toggle
+            + "<table><thead><tr><th class=n>offset</th><th>UTC</th><th>event</th>"
             "<th>what</th><th>detail</th><th></th></tr></thead>"
             f"<tbody>{''.join(rows)}</tbody></table></div>"
 )
@@ -4730,6 +4802,8 @@ tr.tl-parent  td.bar span{background:#64748b}
 tr.tl-bld     td.bar span{background:#c084fc}
 tr.tl-start   td.bar span{background:#2dd4bf}
 tr.tl-ext     td.bar span{background:#60a5fa}
+tr.tl-extsum  td.bar span{background:#60a5fa}
+tr.tl-offer   td.bar span{background:#7dd3fc}
 tr.tl-replay  td.bar span{background:#fb923c}
 tr.tl-promote td.bar span{background:#4ade80}
 tr.tl-empty   td.bar span{background:#475569}
@@ -4738,6 +4812,8 @@ tr.tl-parent  td:first-child{border-left:3px solid #64748b}
 tr.tl-bld     td:first-child{border-left:3px solid #c084fc}
 tr.tl-start   td:first-child{border-left:3px solid #2dd4bf}
 tr.tl-ext     td:first-child{border-left:3px solid #60a5fa}
+tr.tl-extsum  td:first-child{border-left:3px solid #60a5fa}
+tr.tl-offer   td:first-child{border-left:3px solid #7dd3fc}
 tr.tl-replay  td:first-child{border-left:3px solid #fb923c}
 tr.tl-promote td:first-child{border-left:3px solid #4ade80}
 tr.tl-empty   td:first-child{border-left:3px solid #475569}
@@ -4746,6 +4822,8 @@ tr.tl-parent  td{background:#0f1419}
 tr.tl-bld     td{background:#1b1230}
 tr.tl-start   td{background:#07231f}
 tr.tl-ext     td{background:#0d1a2c}
+tr.tl-extsum  td{background:#0a1421}
+tr.tl-offer   td{background:#0b1a24}
 tr.tl-replay  td{background:#2a1a0c}
 tr.tl-promote td{background:#0b2416}
 tr.tl-empty   td{background:#111820}
@@ -4754,12 +4832,15 @@ tr.tl-parent  td:nth-child(3) b{color:#94a3b8}
 tr.tl-bld     td:nth-child(3) b{color:#d8b4fe}
 tr.tl-start   td:nth-child(3) b{color:#5eead4}
 tr.tl-ext     td:nth-child(3) b{color:#93c5fd}
+tr.tl-extsum  td:nth-child(3) b{color:#60a5fa}
+tr.tl-offer   td:nth-child(3) b{color:#7dd3fc}
 tr.tl-replay  td:nth-child(3) b{color:#fdba74}
 tr.tl-promote td:nth-child(3) b{color:#86efac}
 tr.tl-empty   td:nth-child(3) b{color:#94a3b8}
 tr.tl-chain   td:nth-child(3) b{color:#67e8f9}
 .panel tbody tr.tl-parent td,.panel tbody tr.tl-bld td,
 .panel tbody tr.tl-start td,.panel tbody tr.tl-ext td,
+.panel tbody tr.tl-extsum td,.panel tbody tr.tl-offer td,
 .panel tbody tr.tl-replay td,.panel tbody tr.tl-promote td,
 .panel tbody tr.tl-empty td,.panel tbody tr.tl-chain td{
   border-bottom:1px solid #0b1016;padding:6px 9px}
@@ -5046,6 +5127,12 @@ details.extcalls tr.xbad td{color:#e3c07a}
 .dropsec{margin-top:16px;padding-top:12px;border-top:1px solid #1e2937}
 .dropsh{color:#61748b;font-size:10.5px;text-transform:uppercase;
   letter-spacing:.06em;margin-bottom:7px}
+.tlmode{display:inline-flex;gap:4px;margin-left:12px}
+.tlchip{padding:1px 9px;border:1px solid #22303f;border-radius:10px;
+  color:#8fa3ba;font-size:10.5px;text-decoration:none;text-transform:none;
+  letter-spacing:0}
+.tlchip:hover{border-color:#2f4459;color:#cfe0f0}
+.tlchip.on{background:#16303f;border-color:#2c6b86;color:#7fd8f0}
 /* dispatch DAG */
 .dagbar{display:flex;align-items:center;flex-wrap:wrap;gap:5px;
   padding:8px 0 10px;border-bottom:1px solid #141d27;margin-bottom:10px}
@@ -6090,7 +6177,7 @@ def reference_page():
 </body></html>"""
 
 def page(sel_win=None, sel_slot=None, sel_round=None, tab="rounds",
-         src="ours", partial=False, grade="all"):
+         src="ours", partial=False, grade="all", tl="full"):
     # A partial serves only the panel, so the 30-day strip -- the expensive
     # half of this page -- is not built at all.
     strip, windows = "", []
@@ -6175,7 +6262,7 @@ def page(sel_win=None, sel_slot=None, sel_round=None, tab="rounds",
                 d = slot_data(sel_slot)
                 inner = timeline_html(sel_slot, d["extends"], d["commits"],
                                       d.get("shreds"), d["rounds"],
-                                      d.get("builder"))
+                                      d.get("builder"), detail=(tl != "sum"))
             except Exception as exc:
                 inner = ('<div class="err">timeline unavailable: '
                          f"{html.escape(str(exc))[:160]}</div>")
@@ -7336,7 +7423,9 @@ class Handler(BaseHTTPRequestHandler):
                         src if src in ("ours", "winner") else "ours",
                         partial=qs.get("partial", ["0"])[0] == "1",
                         grade=("graded" if qs.get("grade", [""])[0] == "graded"
-                               else "all")).encode()
+                               else "all"),
+                        tl=("sum" if qs.get("tl", [""])[0] == "sum"
+                            else "full")).encode()
         except Exception as exc:
             body = f"<pre>{html.escape(str(exc))}</pre>".encode()
         self.send_response(200)
