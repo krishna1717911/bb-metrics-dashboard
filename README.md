@@ -553,6 +553,35 @@ is only identifiable by having reached our own ingest with `route=vote`, and
 asking that of a whole day scans every receive in it. Per window it is about a
 second, and the windows go out together — measured 12s down to about 4s.
 
+### Timeline: when each extend actually ran
+
+The round's extends row folds open into every individual call: when it started,
+when it finished, how long the body took, the idle **gap** since the previous
+one ended, applied-of-offered, the critical path and the status. A
+`sim-extend` point is written *after* the body finishes, so the recorded
+timestamp is the extend's **completion** and `started` is that minus the body —
+both are shown, because the start is what lines up with the round's other
+events.
+
+Folded rather than flat: a round runs eight to forty extends and a slot has
+eight rounds, so as timeline rows they would bury everything else in the tab.
+
+The row that used to say "N miniblocks sent to the relay" said how many and
+never when, which is the one thing a timeline is for. It now reads as a
+dispatch event with the first rung's time and how long the rest took.
+
+### Logs: why the check stage refused orders
+
+Alongside the log lines, the tab lists every `check_dropped` event for the slot,
+grouped by reason with a count and the number of distinct orders. These come
+from `bifrost_events`, not the log stream, and carry `nums['slot']` on every row
+— checked over twenty minutes, 129,660 of 129,660 — so the attribution is exact
+rather than "fell inside the time window". They render whether or not ClickStack
+is configured, since they do not come from it.
+
+Grouped, because ungrouped it is thousands of rows saying one thing: a single
+slot produced 14,727 refusals for a stale blockhash, 94.9% of its 15,517.
+
 ### The `offers` tab
 
 Every builder's bidding for one slot, as the relay saw it. Our own tables record

@@ -104,6 +104,31 @@ def influx(query):
     return (series[0]["columns"], series[0]["values"]) if series else ([], [])
 
 
+# TabSeparated escapes backslash, quote and the control characters, and a
+# reader that only splits on tabs hands those straight through. It showed up as
+# a check-refusal reason reading "doesn\\'t exist" on the page while the stored
+# value is "doesn\'t exist" -- the same query in JSON has no backslash. Every
+# string field this dashboard reads came through here, so log bodies with a
+# newline in them were being shown with a literal \\n too.
+_TSV = {"\\": "\\", "'": "'", '"': '"', "b": "\b", "f": "\f", "r": "\r",
+        "n": "\n", "t": "\t", "0": "\0", "a": "\a", "v": "\v"}
+
+
+def _tsv(field):
+    if "\\" not in field:
+        return field
+    out, i, n = [], 0, len(field)
+    while i < n:
+        c = field[i]
+        if c == "\\" and i + 1 < n:
+            out.append(_TSV.get(field[i + 1], field[i + 1]))
+            i += 2
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
 def clickhouse(sql):
     """-> (columns, rows). No CTEs: bb_read is readonly=1 and WITH needs a temp table."""
     qs = urllib.parse.urlencode({"user": CH_USER, "password": CH_PASS,
@@ -111,10 +136,13 @@ def clickhouse(sql):
                                  "query": sql + " FORMAT TabSeparatedWithNames"})
     with urllib.request.urlopen(CH_URL + "?" + qs, timeout=120) as resp:
         text = resp.read().decode()
+    # split on the RAW separators first: an escaped tab or newline inside a
+    # value is the two-character sequence, so it survives this untouched
     lines = [ln for ln in text.split("\n") if ln]
     if not lines:
         return [], []
-    return lines[0].split("\t"), [ln.split("\t") for ln in lines[1:]]
+    return ([_tsv(c) for c in lines[0].split("\t")],
+            [[_tsv(v) for v in ln.split("\t")] for ln in lines[1:]])
 
 
 def relay(sql):
@@ -3516,7 +3544,8 @@ def _slot_data_uncached(slot, now):
                "logs": pool.submit(run, slot_logs, slot, stamps),
                "shred": pool.submit(run, slot_shreds, slot, stamps),
                "ready": pool.submit(run, slot_readiness, slot, stamps),
-               "offers": pool.submit(run, slot_offers, slot, stamps)}
+               "offers": pool.submit(run, slot_offers, slot, stamps),
+               "drops": pool.submit(run, slot_check_dropped, slot, stamps)}
     try:
         extends, ext_err = fut["ext"].result(), None
     except Exception as exc:
@@ -3549,12 +3578,16 @@ def _slot_data_uncached(slot, now):
         offers, offers_err = fut["offers"].result(), None
     except Exception as exc:
         offers, offers_err = None, str(exc)[:140]
+    try:
+        drops = fut["drops"].result()
+    except Exception:
+        drops = None
     data = {"rounds": rounds, "extends": extends, "ext_err": ext_err,
             "commits": commits, "relay": relay_rounds, "builder": builder_ev,
             "logs": logs,
             "relay_err": relay_err,
             "shreds": shreds, "shred_err": shred_err, "ready": ready,
-            "offers": offers, "offers_err": offers_err}
+            "offers": offers, "offers_err": offers_err, "drops": drops}
 
     if ext_err is None and shred_err is None:
         with _slot_lock:
@@ -3733,6 +3766,56 @@ def big(v):
     return f"{v:.0f}"
 
 
+def extend_calls(stat):
+    """Each individual extend of a round, behind a fold.
+
+    A round runs eight to forty of these and a slot has eight rounds, so as
+    flat timeline rows they would bury everything else in the tab. Folded, the
+    aggregate row still reads as one step in the chain and the exact times are
+    one click away.
+
+    A sim-extend point is written AFTER the body finishes, so its timestamp is
+    the extend's COMPLETION. Both ends are given: `started` backs the body
+    duration out of it, which is the number to compare against the round's
+    other events."""
+    calls = stat.get("calls") or []
+    if not calls:
+        return ""
+    rows = []
+    prev_end = None
+    for i, c in enumerate(calls):
+        start = c["t"] - c["body"] * 1000
+        gap = "" if prev_end is None else f"{(start - prev_end) / 1e6:,.2f}"
+        prev_end = c["t"]
+        bad = c["status"] != 1
+        dropped = c["orders"] - c["applied"]
+        rows.append(
+            f'<tr{" class=xbad" if bad else ""}><td class="n m">{i}</td>'
+            f'<td class="m">'
+            f'{dt.datetime.fromtimestamp(start / 1e9, dt.UTC).strftime("%H:%M:%S.%f")[:-3]}</td>'
+            f'<td class="m dim">'
+            f'{dt.datetime.fromtimestamp(c["t"] / 1e9, dt.UTC).strftime("%H:%M:%S.%f")[:-3]}</td>'
+            f'<td class="n m">{ms(c["body"])}</td>'
+            f'<td class="n m dim">{gap}</td>'
+            f'<td class="n m">{c["applied"]:,}/{c["orders"]:,}'
+            + (f' <span class="dropn">-{dropped}</span>' if dropped > 0 else "")
+            + "</td>"
+            f'<td class="n m">{c["crit"]:,}</td>'
+            f'<td class="m dim">{EXT_STATUS.get(c["status"], c["status"])}</td></tr>')
+    return ('<details class="extcalls"><summary>'
+            f'when each of the {len(calls)} ran</summary>'
+            '<table><tr><th class=n>#</th><th>started</th><th>finished</th>'
+            "<th class=n>body</th><th class=n>gap ms</th>"
+            "<th class=n>applied</th><th class=n>crit path</th><th>status</th>"
+            "</tr>" + "".join(rows) + "</table>"
+            '<div class="extnote">A point is written after the body finishes, '
+            "so <b>finished</b> is the recorded timestamp and <b>started</b> is "
+            "it minus the body. <b>gap</b> is the idle time since the previous "
+            "extend ended &mdash; the lane waiting, not working. Refused "
+            "extends emit no datapoint at all, so a large gap may be a "
+            "throttled call rather than an idle lane.</div></details>")
+
+
 def timeline_html(slot, extends, commits, shreds, rounds, builder=None):
     """The whole causal chain for a slot, in order.
 
@@ -3793,7 +3876,8 @@ def timeline_html(slot, extends, commits, shreds, rounds, builder=None):
                    f'<span class="info" tabindex="0" data-tip="{tip}">i</span>',
                    f'per extend: p50 {ms(e["body_p50"])} &middot; max '
                    f'{ms(e["body_max"])} &middot; {e["applied"]:,} of '
-                   f'{e["orders"]:,} orders applied',
+                   f'{e["orders"]:,} orders applied'
+                   + extend_calls(e),
                    "ext"))
     for idx in sorted(k for k in (commits or {}) if isinstance(k, int)):
         c = commits[idx]
@@ -3845,11 +3929,19 @@ def timeline_html(slot, extends, commits, shreds, rounds, builder=None):
                 elif e["event"] == "dispatched":
                     per_round[e["idx"]] = per_round.get(e["idx"], 0) + 1
             for idx, n in sorted(per_round.items()):
-                first = min(e["t"] for e in builder["events"]
-                            if e["event"] == "dispatched" and e["idx"] == idx)
-                ev.append((first + off, f"round {idx} dispatched",
-                           f"{n:,} miniblock{'' if n == 1 else 's'} sent to the "
-                           "relay", "", "bld"))
+                # A count of dispatches said how many rungs went out and never
+                # when any of them did, which is the question the timeline is
+                # for. First and last, and the span between them.
+                times = [e["t"] for e in builder["events"]
+                         if e["event"] == "dispatched" and e["idx"] == idx]
+                first, last = min(times), max(times)
+                ev.append((first + off, f"round {idx} dispatch",
+                           f"first of {n:,} rung{'' if n == 1 else 's'} to the "
+                           "relay",
+                           ("one rung" if n == 1 else
+                            f"last at +{(last - first) / 1e6:,.1f} ms, "
+                            f"{n:,} in {(last - first) / 1e6:,.1f} ms"),
+                           "bld"))
 
     # The replay chain: the relay announces a winner, we commit/replay it, then
     # the next round's first extend can run. Those three are already separate
@@ -3921,7 +4013,64 @@ def timeline_html(slot, extends, commits, shreds, rounds, builder=None):
 SEV_CLASS = {"warn": "sv-warn", "error": "sv-err", "fatal": "sv-fatal"}
 
 
-def logs_html(slot, logs):
+def slot_check_dropped(slot, stamps):
+    """Why the check stage refused orders in this slot, by reason.
+
+    A different kind of record from the log lines beside it: these are
+    bifrost_events rows, one per refused order, and they carry nums['slot'] on
+    every row -- checked over twenty minutes, 129,660 of 129,660 -- so the
+    attribution is exact rather than inferred from a time window.
+
+    Grouped, because ungrouped it is thousands of rows saying one thing: a
+    single slot produced 3,464 refusals for a stale blockhash alone."""
+    if not stamps:
+        return None
+    lo, hi = _ch_window(stamps, minutes=2)
+    try:
+        _, rows = clickhouse(
+            "SELECT event, reason, count() AS n, uniqExact(entity) AS orders "
+            f"FROM bifrost_events WHERE ts >= '{lo}' AND ts <= '{hi}' "
+            f"AND instance_id = '{dep()["instance"]}' "
+            f"AND event = 'check_dropped' AND nums['slot'] = {int(slot)} "
+            "GROUP BY event, reason ORDER BY n DESC")
+    except Exception:
+        return None
+    return [{"event": r[0], "reason": r[1], "n": ch_int(r[2]),
+             "orders": ch_int(r[3])} for r in rows]
+
+
+def check_dropped_html(rows):
+    if rows is None:
+        return ""
+    if not rows:
+        return ('<div class="dropsec"><div class="dropsh">check refusals</div>'
+                '<div class="none">the check stage refused nothing in this '
+                "slot</div></div>")
+    total = sum(r["n"] for r in rows)
+    body = "".join(
+        f'<tr><td class=m>{html.escape(r["event"])}</td>'
+        f'<td>{html.escape(r["reason"] or "(no reason given)")}</td>'
+        f'<td class="n m">{r["n"]:,}</td>'
+        f'<td class="n m dim">{r["orders"]:,}</td>'
+        f'<td class="n m dim">{100.0 * r["n"] / total:.1f}%</td></tr>'
+        for r in rows)
+    return ('<div class="dropsec"><div class="dropsh">check refusals &mdash; '
+            f'{total:,} across {len(rows)} reason'
+            f'{"" if len(rows) == 1 else "s"}</div>'
+            '<table class="atab"><tr><th>event</th><th>reason</th>'
+            "<th class=n>count</th><th class=n>distinct orders</th>"
+            "<th class=n>share</th></tr>" + body + "</table>"
+            '<div class="anote">From <code>bifrost_events</code>, not the log '
+            "stream: one row per order the check stage refused, carrying "
+            "<code>nums['slot']</code> on every row, so these belong to this "
+            "slot exactly rather than by falling inside its time window. "
+            "Grouped by reason because ungrouped they are thousands of rows "
+            "saying one thing. <b>distinct orders</b> differs from "
+            "<b>count</b> when the same order was refused more than once."
+            "</div></div>")
+
+
+def logs_html(slot, logs, drops=None):
     """warn / error / fatal for this slot, in order.
 
     Runs of the same message are collapsed: one ALT failure repeated 171 times
@@ -3930,22 +4079,25 @@ def logs_html(slot, logs):
     if not logs or logs.get("unconfigured"):
         return ('<div class="panel"><div class="dtlhead">logs</div>'
                 '<div class="none">ClickStack not configured &mdash; set '
-                "OTEL_URL and OTEL_SERVICE</div></div>")
+                "OTEL_URL and OTEL_SERVICE</div>"
+                + check_dropped_html(drops) + "</div>")
     if logs.get("nowindow"):
         return ('<div class="panel"><div class="dtlhead">logs</div>'
                 '<div class="none">this slot has no miniblock rows, so there '
                 "is no time window to search logs in &mdash; usually means the "
-                "builder was down for it</div></div>")
+                "builder was down for it</div>"
+                + check_dropped_html(drops) + "</div>")
     if logs.get("err"):
         return ('<div class="panel"><div class="dtlhead">logs</div>'
-                f'<div class="err">{html.escape(logs["err"])}</div></div>')
+                f'<div class="err">{html.escape(logs["err"])}</div>'
+                + check_dropped_html(drops) + "</div>")
     rows = logs.get("rows") or []
     if not rows:
         return ('<div class="panel"><div class="dtlhead">logs'
                 "<span class='note'>warn, error and fatal only &mdash; the "
                 "info-level status heartbeats are excluded</span></div>"
                 '<div class="none">no warnings or errors for this slot</div>'
-                "</div>")
+                + check_dropped_html(drops) + "</div>")
 
     # collapse consecutive identical messages at the same severity
     runs = []
@@ -3993,10 +4145,8 @@ def logs_html(slot, logs):
             "<table><thead><tr><th class=n>offset</th><th>UTC</th>"
             "<th>severity</th><th>message</th><th class=n>count</th>"
             "<th>where</th></tr></thead>"
-            f"<tbody>{''.join(body)}</tbody></table></div>")
-
-
-_extra_cache = {}
+            f"<tbody>{''.join(body)}</tbody></table>"
+            + check_dropped_html(drops) + "</div>")
 
 
 def compare_extras(slot):
@@ -4880,6 +5030,22 @@ svg .om.olateM{stroke:#fbbf24;stroke-width:1.8}
 svg .om{stroke:#0c141b;stroke-width:1}
 svg .om.owon{stroke:#5eead4;stroke-width:1.8}
 svg .om.orej{opacity:.45}
+details.extcalls{margin-top:5px}
+details.extcalls>summary{cursor:pointer;color:#60a5fa;font-size:10.5px;
+  text-transform:uppercase;letter-spacing:.05em}
+details.extcalls>summary:hover{color:#93c5fd}
+details.extcalls table{width:auto;border-collapse:collapse;margin-top:5px;
+  font-size:11px}
+details.extcalls th{color:#61748b;font-weight:500;text-align:left;
+  padding:2px 9px 2px 0;border-bottom:1px solid #1e2937;white-space:nowrap}
+details.extcalls td{padding:1px 9px 1px 0;color:#a9bed4;white-space:nowrap}
+details.extcalls th.n,details.extcalls td.n{text-align:right}
+details.extcalls tr.xbad td{color:#e3c07a}
+.extnote{color:#4d5c70;font-size:10.5px;line-height:1.6;margin-top:5px;
+  max-width:760px;white-space:normal}
+.dropsec{margin-top:16px;padding-top:12px;border-top:1px solid #1e2937}
+.dropsh{color:#61748b;font-size:10.5px;text-transform:uppercase;
+  letter-spacing:.06em;margin-bottom:7px}
 /* dispatch DAG */
 .dagbar{display:flex;align-items:center;flex-wrap:wrap;gap:5px;
   padding:8px 0 10px;border-bottom:1px solid #141d27;margin-bottom:10px}
@@ -5999,7 +6165,7 @@ def page(sel_win=None, sel_slot=None, sel_round=None, tab="rounds",
         elif tab == "logs":
             try:
                 d = slot_data(sel_slot)
-                inner = logs_html(sel_slot, d.get("logs"))
+                inner = logs_html(sel_slot, d.get("logs"), d.get("drops"))
             except Exception as exc:
                 inner = ('<div class="err">logs unavailable: '
                          f"{html.escape(str(exc))[:160]}</div>")
