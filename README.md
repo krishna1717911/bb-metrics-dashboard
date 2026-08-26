@@ -702,6 +702,19 @@ So a deployment can declare `DEPLOY_<NAME>_SOURCE=relay`, and then its slot
 list, window list and timestamps all come from `relay.mini_block_events`. It
 needs only a label, that flag, and `RELAY_BUILDER`.
 
+**The rounds and comparison tabs are rebuilt from the relay too.** It saw every
+rung such a builder submitted and carries the timestamp, round, reward, order
+count, execution cost and miniblock uuid — most of what those tabs show. What it
+does not carry is anything derived from the miniblock *payload*: the
+transaction/bundle split, `selected_cu`, the vote classification and the CSR
+dependency graph. Those render as a dash, never as zero, because "not recorded"
+and "none" are different facts. Only the **dag** tab is impossible, since the
+graph lives inside the payload and exists in no other store.
+
+A deployment may also carry **its own ClickHouse and its own ClickStack** —
+`DEPLOY_<NAME>_CH_*` and `DEPLOY_<NAME>_OTEL_*`. The mock builder does, which is
+why it looked completely empty when read against production's.
+
 What that buys is the **offer timeline**, which was always relay-sourced: you
 see every one of the mock's bids beside everyone else's, with the relay's
 verdict on each. What it cannot buy is anything from our own instrumentation —

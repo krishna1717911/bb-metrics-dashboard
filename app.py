@@ -129,12 +129,20 @@ def _tsv(field):
     return "".join(out)
 
 
+def ch_conf():
+    """This deployment's ClickHouse, or the global one."""
+    own = (dep().get("ch") or {}) if DEPLOYMENTS else {}
+    return (own.get("url") or CH_URL, own.get("user") or CH_USER,
+            own.get("pass") or CH_PASS, own.get("db") or CH_DB)
+
+
 def clickhouse(sql):
     """-> (columns, rows). No CTEs: bb_read is readonly=1 and WITH needs a temp table."""
-    qs = urllib.parse.urlencode({"user": CH_USER, "password": CH_PASS,
-                                 "database": CH_DB,
+    url, user, password, db = ch_conf()
+    qs = urllib.parse.urlencode({"user": user, "password": password,
+                                 "database": db,
                                  "query": sql + " FORMAT TabSeparatedWithNames"})
-    with urllib.request.urlopen(CH_URL + "?" + qs, timeout=120) as resp:
+    with urllib.request.urlopen(url + "?" + qs, timeout=120) as resp:
         text = resp.read().decode()
     # split on the RAW separators first: an escaped tab or newline inside a
     # value is the two-character sequence, so it survives this untouched
@@ -176,13 +184,23 @@ def relay(sql):
             list(zip(*frame["data"]["values"])))
 
 
+def otel_conf():
+    """This deployment's ClickStack, or the global one. The mock builder ships
+    to its own, on a different host and database from production."""
+    own = (dep().get("otel") or {}) if DEPLOYMENTS else {}
+    return (own.get("url") or OTEL_URL, own.get("user") or OTEL_USER,
+            own.get("pass") or OTEL_PASS, own.get("db") or OTEL_DB,
+            own.get("service") or OTEL_SERVICE)
+
+
 def otel(sql):
     """-> rows. ClickStack is a different cluster with different credentials."""
-    if not (OTEL_URL and OTEL_SERVICE):
+    url, user, password, db, service = otel_conf()
+    if not (url and service):
         raise RuntimeError("OTEL_URL / OTEL_SERVICE not configured")
-    qs = urllib.parse.urlencode({"user": OTEL_USER, "password": OTEL_PASS,
-                                 "database": OTEL_DB})
-    req = urllib.request.Request(OTEL_URL + "?" + qs,
+    qs = urllib.parse.urlencode({"user": user, "password": password,
+                                 "database": db})
+    req = urllib.request.Request(url + "?" + qs,
                                  data=(sql + " FORMAT TabSeparated").encode())
     with urllib.request.urlopen(req, timeout=60) as resp:
         text = resp.read().decode()
@@ -263,7 +281,7 @@ def health_probe():
         r = otel("SELECT countIf(LogAttributes['leader_state'] != 'Inactive') AS active, "
                  "countIf(LogAttributes['slot'] != '0') AS live_slot, count() AS total "
                  "FROM otel_logs WHERE Timestamp > now() - INTERVAL 10 MINUTE "
-                 f"AND ServiceName = '{OTEL_SERVICE}' AND Body = 'connector status'")
+                 f"AND ServiceName = '{otel_conf()[4]}' AND Body = 'connector status'")
         a, l, t = (int(x) for x in r[0])
         return {"active": a, "live_slot": l, "total": t}
 
@@ -271,7 +289,7 @@ def health_probe():
         r = otel("SELECT LogAttributes['connectors'] AS c, LogAttributes['relays'] AS s, "
                  "count() AS n FROM otel_logs "
                  "WHERE Timestamp > now() - INTERVAL 10 MINUTE "
-                 f"AND ServiceName = '{OTEL_SERVICE}' AND Body = 'builder network status' "
+                 f"AND ServiceName = '{otel_conf()[4]}' AND Body = 'builder network status' "
                  "GROUP BY c, s ORDER BY n DESC")
         return [{"connectors": x[0], "relays": x[1], "n": ch_int(x[2])} for x in r]
 
@@ -289,7 +307,7 @@ def health_probe():
                  "count() AS samples, toString(max(Timestamp)) AS at "
                  "FROM otel_logs WHERE Timestamp > now() - INTERVAL "
                  f"{SCHED_WINDOW_H} HOUR "
-                 f"AND ServiceName = '{OTEL_SERVICE}' AND Body = 'scheduler status'")
+                 f"AND ServiceName = '{otel_conf()[4]}' AND Body = 'scheduler status'")
         if not r or not ch_int(r[0][6]):
             return None
         return {"pool_max": ch_int(r[0][0]), "pool": r[0][1], "prefix": r[0][2],
@@ -519,15 +537,100 @@ def relay_slot_stamp(slot):
 
 
 def uninstrumented(slot, what):
+    """For the tabs that read bifrost_miniblocks, on a builder that writes none.
+
+    Everything here -- the offer ladder, the winner echo, the CSR graph the dag
+    tab reads -- is a miniblock row. A builder that records no miniblocks has
+    none of it, and no configuration will conjure it."""
     return ('<div class="panel"><div class="dtlhead">' + what + "</div>"
             '<div class="none">'
-            f'<b>{html.escape(dep()["label"])}</b> is recorded only by the '
-            "relay. It writes nothing to <code>bifrost_miniblocks</code> or "
-            "<code>bifrost_events</code> &mdash; checked over seven days, not "
-            "one row &mdash; so there is no offer ladder, no simulator, no "
-            "shred path and no log stream of ours to show for it. What the "
-            "relay does see is on the <b>offer timeline</b> tab."
+            f'<b>{html.escape(dep()["label"])}</b> writes no '
+            "<code>bifrost_miniblocks</code>, and this tab needs the miniblock "
+            "PAYLOAD &mdash; the dependency graph is carried inside it in CSR "
+            "form and exists in no other store. The rounds and comparison tabs "
+            "are rebuilt from the relay, which saw every rung it submitted, "
+            "but the relay carries no payloads.<br><br>Its own ClickStack says "
+            "why the rows are missing: every "
+            "<code>bifrost_miniblocks</code> write is being rejected with "
+            "<i>schema mismatch: database schema has no column named "
+            "sig_prefixes</i>. Add that column and this tab fills itself."
             "</div></div>")
+
+def sim_pin():
+    """`AND host_id IN (...)` for this deployment's simulators.
+
+    Unpinned, sim-extend and sim-commit return every host that touched the
+    slot. That was harmless while each builder served its own validators --
+    nobody else had rows for its slots -- but the mock bids on the SAME slots
+    Amsterdam leads, so unpinned its timeline showed Amsterdam's extends under
+    the mock's name. A deployment naming no simulator now gets none rather
+    than somebody else's."""
+    sims = dep().get("sims") or []
+    if sims:
+        # InfluxQL has no IN: an IN list parses but matches nothing, which
+        # silently emptied every extend row for the deployments that DID name
+        # a host while leaving the one that named none unfiltered.
+        return (" AND (" + " OR ".join('"host_id" = ' + "'" + h + "'"
+                                       for h in sims) + ") ")
+    if not dep().get("name"):
+        # the legacy single-deployment environment, where an unset host has
+        # always meant "whatever wrote this slot"
+        return ""
+    # A named deployment with no simulator gets nothing rather than another
+    # builder's rows -- the mock shares Amsterdam's slot numbers.
+    return " AND \"host_id\" = '' "
+
+
+def relay_slot_rounds(slot, stamps=None):
+    """The round ladder for a builder that records no miniblocks of its own.
+
+    The relay saw every rung it submitted, and carries the timestamp, the
+    round, the reward, the order count, the execution cost and the miniblock
+    uuid -- which is most of what the rounds tab shows. What it does NOT carry
+    is anything derived from the miniblock payload: the transaction and bundle
+    split, selected_cu, the vote classification, the signatures, and the CSR
+    graph the dag tab reads. Those are marked -1 and render as a dash rather
+    than as zero, because "the relay does not record this" and "there were
+    none" are different facts.
+
+    Same shape as slot_rounds(), so the rounds and comparison tabs take it
+    without knowing the difference."""
+    ours = (dep().get("relay_builder") or "").replace("'", "")
+    if not ours or not (RELAY_URL and RELAY_DS_UID):
+        return []
+    stamp = relay_slot_stamp(slot)
+    if stamp:
+        lo, hi = _ch_window([stamp], minutes=3)
+        bound = f"timestamp >= '{lo}' AND timestamp <= '{hi}' AND "
+    else:
+        bound = "timestamp >= now() - INTERVAL 26 HOUR AND "
+    _, rows = relay(
+        "SELECT index_in_slot AS rnd, event, toString(timestamp) AS ts,"
+        " ifNull(builder_id, '') AS b, ifNull(reward, 0) AS reward,"
+        " order_count AS orders, ifNull(execution_cost, 0) AS cu,"
+        " ifNull(toString(mini_block_uuid), '') AS uuid, is_last,"
+        " connector_identity AS conn"
+        f" FROM relay.mini_block_events WHERE {bound} slot = {int(slot)}"
+        f"   AND (event = 'round_chosen'"
+        f"        OR (event = 'submitted' AND builder_id = '{ours}'))"
+        " ORDER BY index_in_slot, timestamp")
+    rounds = {}
+    for rnd, event, ts, b, reward, orders, cu, uuid, is_last, conn in rows:
+        idx = ch_int(rnd)
+        entry = rounds.setdefault(idx, {"round": idx, "offers": [], "winner": None})
+        item = {"ts": ts, "orders": ch_int(orders), "txs": -1, "bundles": -1,
+                "reward": ch_int(reward), "exec_cost": ch_int(cu),
+                "sel_cu": -1, "is_last": is_last in TRUEISH,
+                "won": b == ours, "uuid": uuid, "connector": conn,
+                "run_id": "", "instance": dep().get("instance", ""),
+                "seq_id": 0, "votes": -1, "from_relay": True}
+        if event == "round_chosen":
+            item["builder"] = b
+            entry["winner"] = item
+        else:
+            entry["offers"].append(item)
+    return [rounds[k] for k in sorted(rounds)]
+
 
 def window_of(slot):
     return (slot // WINDOW) * WINDOW
@@ -719,6 +822,8 @@ def ago(ts_utc):
 def slot_rounds(slot):
     """One entry per auction round: our offers, and the winner echo.
     Rounds where the relay never echoed a winner simply have winner=None."""
+    if dep().get("source") == "relay":
+        return relay_slot_rounds(slot)
     _, rows = clickhouse(
         "SELECT index_in_slot, kind, toString(ts) AS ts, order_count, transaction_count, "
         "       bundle_count, reward, execution_cost, selected_cu, is_last, "
@@ -991,7 +1096,7 @@ def slot_logs(slot, stamps):
     # an unconfigured ClickStack, and a slot with no miniblock rows to derive a
     # time window from (which happens exactly when the builder was down -- the
     # case you most want logs for).
-    if not (OTEL_URL and OTEL_SERVICE):
+    if not (otel_conf()[0] and otel_conf()[4]):
         return {"unconfigured": True}
     if not stamps:
         return {"nowindow": True}
@@ -1005,7 +1110,7 @@ def slot_logs(slot, stamps):
             "SELECT toString(Timestamp) AS ts, SeverityText AS sev, Body AS body, "
             "  LogAttributes['slot'] AS s, LogAttributes['index'] AS idx "
             "FROM otel_logs "
-            f"WHERE ServiceName = '{OTEL_SERVICE}' "
+            f"WHERE ServiceName = '{otel_conf()[4]}' "
             f"  AND Timestamp >= '{lo}' AND Timestamp <= '{hi}' "
             "  AND SeverityText IN ('warn','error','fatal') "
             f"  AND (LogAttributes['slot'] = '{int(slot)}' "
@@ -1177,6 +1282,7 @@ def slot_commits(slot, stamps):
         '"winner","refusal","parent_slot","hold_us" '
         f'FROM "sim-commit","sim-context" WHERE slot = {int(slot)} '
         + "".join(f"AND \"host_id\" != '{h}' " for h in OFF_CHAIN)
+        + sim_pin()
         + f"AND time >= '{lo}' AND time <= '{hi}'")
     ctx, cols, rows = None, [], []
     for ser in series:
@@ -1294,6 +1400,7 @@ def slot_extends(slot, stamps):
         '"program_cache_loaded" '
         f'FROM "sim-extend" WHERE slot = {int(slot)} '
         + "".join(f"AND \"host_id\" != '{h}' " for h in OFF_CHAIN)
+        + sim_pin()
         + f"AND time >= '{lo}' AND time <= '{hi}'")
     if not rows:
         return {}
@@ -2544,7 +2651,11 @@ def _build_deployments():
     if not names:
         return [{"name": "", "label": CH_BUILDER or "builder",
                  "builder": CH_BUILDER, "instance": CH_INSTANCE,
-                 "sim": os.environ.get("SHRED_SIM_ID", ""),
+                 "sim": (os.environ.get("SHRED_SIM_ID", "").split(",")
+                         + [""])[0].strip(),
+                 "sims": [h.strip() for h in
+                          os.environ.get("SHRED_SIM_ID", "").split(",")
+                          if h.strip()],
                  "leaders": [h.strip() for h in
                              os.environ.get("SHRED_LEADER_ID", "").split(",")
                              if h.strip()],
@@ -2552,7 +2663,7 @@ def _build_deployments():
                              + [""])[0].strip(),
                  "relay_builder": os.environ.get("RELAY_OUR_BUILDER", ""),
                  "analysis_identity": os.environ.get("ANALYSIS_IDENTITY", ""),
-                 "source": "ours"}]
+                 "source": "ours", "ch": {}, "otel": {}}]
     out = []
     for name in names:
         key = f"DEPLOY_{name.upper()}_"
@@ -2561,7 +2672,9 @@ def _build_deployments():
             "label": os.environ.get(key + "LABEL") or name,
             "builder": os.environ.get(key + "BUILDER", ""),
             "instance": os.environ.get(key + "INSTANCE", ""),
-            "sim": os.environ.get(key + "SIM", ""),
+            "sim": (os.environ.get(key + "SIM", "").split(",") + [""])[0].strip(),
+            "sims": [h.strip() for h in
+                     os.environ.get(key + "SIM", "").split(",") if h.strip()],
             "leaders": [h.strip() for h in
                         os.environ.get(key + "LEADERS", "").split(",") if h.strip()],
             "leader0": (os.environ.get(key + "LEADERS", "").split(",") + [""])[0].strip(),
@@ -2570,6 +2683,13 @@ def _build_deployments():
             # "ours" reads our own instrumentation; "relay" is for a builder
             # id that only the relay records.
             "source": (os.environ.get(key + "SOURCE", "") or "ours").strip(),
+            # Its own stores, when it has them. The mock builder writes to a
+            # different ClickHouse entirely and ships logs to its own
+            # ClickStack, so these cannot be process-wide.
+            "ch": {k: os.environ.get(key + "CH_" + k.upper(), "")
+                   for k in ("url", "user", "pass", "db")},
+            "otel": {k: os.environ.get(key + "OTEL_" + k.upper(), "")
+                     for k in ("url", "user", "pass", "db", "service")},
         })
     return out
 
@@ -3655,9 +3775,13 @@ def detail_table(title, items, show_won=False, winner_name=None,
         nothing to count the vote program id in and it reads as a dash. The
         comparison tab classifies those refs against the block instead."""
         v = i.get("votes", -1)
-        if v is None or v < 0:
+        if v is None or v < 0 or i.get("txs", -1) < 0:
             return "&mdash;", "&mdash;"
         return f"{max(0, i['txs'] - v):,}", f"{v:,}"
+
+    def count(v):
+        """-1 means the source does not record it, which is not zero."""
+        return "&mdash;" if v is None or v < 0 else f"{v:,}"
 
     head = ("<tr><th>time (UTC)</th><th class=n>orders</th>"
             "<th class=n>non-vote</th><th class=n>vote</th>"
@@ -3668,8 +3792,10 @@ def detail_table(title, items, show_won=False, winner_name=None,
         f"<tr><td class=m>{html.escape(i['ts'][11:23])}</td>"
         f"<td class='n m'>{i['orders']:,}</td>"
         f"<td class='n m'>{split(i)[0]}</td><td class='n m dim'>{split(i)[1]}</td>"
-        f"<td class='n m'>{i['bundles']:,}</td><td class='n m'>{sol(i['reward'])}</td>"
-        f"<td class='n m'>{i['exec_cost']:,}</td><td class='n m'>{i['sel_cu']:,}</td>"
+        f"<td class='n m'>{count(i['bundles'])}</td>"
+        f"<td class='n m'>{sol(i['reward'])}</td>"
+        f"<td class='n m'>{count(i['exec_cost'])}</td>"
+        f"<td class='n m'>{count(i['sel_cu'])}</td>"
         f"<td class='m dim'>{html.escape(i['uuid'])}{copy_btn(i['uuid'])}</td>"
         # The relay names the winner whoever it was, ourselves included, so
         # prefer it in BOTH cases. Naming only the opponent meant our own
@@ -3948,6 +4074,11 @@ def timeline_html(slot, extends, commits, shreds, rounds, builder=None,
     # The builder's own events, on the shift resolved above.
     align = ""
     offwarn = ""
+    solo_clock = not (dep().get("sims") or [])
+    if solo_clock and off is None:
+        # Nothing here came from InfluxDB, so every row is already on one
+        # clock and no shift is needed or possible.
+        off = 0
     if offers_unshifted:
         offwarn = ('<span class="warn"> &#9888; no round_committed pair for '
                    "this slot, so the ClickHouse-to-InfluxDB offset could not "
@@ -3955,7 +4086,11 @@ def timeline_html(slot, extends, commits, shreds, rounds, builder=None,
                    "their position against the extends may be out by up to a "
                    "second. Against each other they are exact.</span>")
     if builder and builder.get("events"):
-        if off is None:
+        if solo_clock:
+            align = ('<span class="note">this builder runs no simulator we '
+                     "read, so every row here is a builder event on one clock "
+                     "&mdash; nothing to align</span>")
+        elif off is None:
             align = ('<span class="warn"> &#9888; builder events omitted: no '
                      "round_committed in both stores to align the clocks</span>")
         else:
@@ -3963,6 +4098,7 @@ def timeline_html(slot, extends, commits, shreds, rounds, builder=None,
                      f"{off/1e6:+,.0f} ms onto the simulator's clock, measured "
                      f"from {anchors} round_committed pairs (spread "
                      f"{spread:.1f} ms)</span>")
+        if solo_clock or off is not None:
             per_round = {}
             for e in builder["events"]:
                 t = e["t"] + off
@@ -6219,11 +6355,7 @@ def page(sel_win=None, sel_slot=None, sel_round=None, tab="rounds",
         # A relay-only builder has no instrumentation of ours behind any of
         # these, so they are answered once here instead of each discovering
         # emptiness on its own.
-        UNINSTRUMENTED = {"rounds": "auction rounds",
-                          "compare": "round comparison",
-                          "timeline": "slot timeline",
-                          "dag": "dispatch DAG",
-                          "logs": "logs"}
+        UNINSTRUMENTED = {"dag": "dispatch DAG"}
         if dep().get("source") == "relay" and tab in UNINSTRUMENTED:
             inner = uninstrumented(sel_slot, UNINSTRUMENTED[tab])
             blurb = ("this builder is recorded by the relay only &mdash; see "
