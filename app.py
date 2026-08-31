@@ -1075,7 +1075,10 @@ def slot_winner_refs(slot):
         if len(refs) != want:
             continue
         out[idx] = {"txs": [r for k, r in refs if k == "tx"],
-                    "bundles": sum(1 for k, _ in refs if k == "bundle")}
+                    "bundles": sum(1 for k, _ in refs if k == "bundle"),
+                    # kept for the false-positive check, which needs identity
+                    # rather than a count
+                    "bundle_ids": [r for k, r in refs if k == "bundle"]}
     return out
 
 
@@ -1211,6 +1214,63 @@ def builder_offset(builder, commits):
     if spread > MAX_ALIGN_SPREAD_MS:
         return None, spread, len(diffs)
     return diffs[-1], spread, len(diffs)
+
+
+_relayclock = {}
+_relayclock_lock = threading.Lock()
+
+
+def relay_clock_offset(slot):
+    """Nanoseconds the RELAY's clock runs ahead of this builder's ClickHouse.
+
+    Needed only for a relay-sourced deployment, whose offer rows come from the
+    relay while its events come from its own ClickHouse. The mock builder runs
+    on a machine 12.6 SECONDS behind the relay, so unaligned its timeline put
+    the offers twelve thousand milliseconds after the events that produced
+    them.
+
+    Anchored on the miniblock uuid, which both stores record: the builder logs
+    `dispatched` with attrs['uuid'] when it sends a rung, and the relay logs
+    `submitted` for the same uuid when it arrives. So
+
+        relay - clickhouse = offset + flight time,   flight time >= 0
+
+    and the offset is the MINIMUM, for the same reason builder_offset takes a
+    maximum -- the fastest rung carries the least delay. Measured on slot
+    442839536: 103 of 103 rungs matched, min 12,576.042 ms, spread 0.320 ms."""
+    key = (dkey(), slot)
+    with _relayclock_lock:
+        if key in _relayclock:
+            return _relayclock[key]
+    out = (None, None, 0)
+    try:
+        _, rows = clickhouse(
+            "SELECT attrs['uuid'] AS u, toUnixTimestamp64Nano(ts) AS t "
+            f"FROM bifrost_events WHERE nums['slot'] = {int(slot)} "
+            f"AND instance_id = '{dep()['instance']}' "
+            "AND event = 'dispatched' AND attrs['uuid'] != '' LIMIT 400")
+        ch = {u: int(t) for u, t in rows if t.isdigit()}
+        if ch:
+            quoted = ",".join("'" + u + "'" for u in ch
+                              if re.fullmatch(r"[0-9a-f-]{36}", u))
+            if quoted:
+                _, rl = relay(
+                    "SELECT toString(mini_block_uuid) AS u,"
+                    " toUnixTimestamp64Nano(timestamp) AS t"
+                    " FROM relay.mini_block_events"
+                    f" WHERE event = 'submitted' AND mini_block_uuid IN ({quoted})")
+                d = sorted(int(t) - ch[u] for u, t in rl if u in ch)
+                if d:
+                    spread = (d[-1] - d[0]) / 1e6
+                    out = ((d[0], spread, len(d)) if spread <= MAX_ALIGN_SPREAD_MS
+                           else (None, spread, len(d)))
+    except Exception:
+        out = (None, None, 0)
+    with _relayclock_lock:
+        if len(_relayclock) > 64:
+            _relayclock.clear()
+        _relayclock[key] = out
+    return out
 
 
 def slot_relay(slot, stamps):
@@ -3697,7 +3757,8 @@ def _slot_data_uncached(slot, now):
                "shred": pool.submit(run, slot_shreds, slot, stamps),
                "ready": pool.submit(run, slot_readiness, slot, stamps),
                "offers": pool.submit(run, slot_offers, slot, stamps),
-               "drops": pool.submit(run, slot_check_dropped, slot, stamps)}
+               "drops": pool.submit(run, slot_check_dropped, slot, stamps),
+               "fpos": pool.submit(run, slot_false_positives, slot)}
     try:
         extends, ext_err = fut["ext"].result(), None
     except Exception as exc:
@@ -3734,12 +3795,17 @@ def _slot_data_uncached(slot, now):
         drops = fut["drops"].result()
     except Exception:
         drops = None
+    try:
+        fpos = fut["fpos"].result()
+    except Exception:
+        fpos = None
     data = {"rounds": rounds, "extends": extends, "ext_err": ext_err,
             "commits": commits, "relay": relay_rounds, "builder": builder_ev,
             "logs": logs,
             "relay_err": relay_err,
             "shreds": shreds, "shred_err": shred_err, "ready": ready,
-            "offers": offers, "offers_err": offers_err, "drops": drops}
+            "offers": offers, "offers_err": offers_err, "drops": drops,
+            "fpos": fpos}
 
     if ext_err is None and shred_err is None:
         with _slot_lock:
@@ -4072,15 +4138,25 @@ def timeline_html(slot, extends, commits, shreds, rounds, builder=None,
     # way, since they all come off the same clock, and 190 offers hidden is a
     # worse answer than 190 offers with the caveat stated.
     offers_unshifted = detail and off is None
+    # A relay-sourced deployment's rungs come from the relay, which is a third
+    # clock. Bring them onto this builder's ClickHouse clock first, then the
+    # shared shift below puts everything on the simulator's.
+    rel_off, rel_spread, rel_pairs = (0, None, 0)
+    if detail and dep().get("source") == "relay":
+        measured, rel_spread, rel_pairs = relay_clock_offset(slot)
+        rel_off = measured or 0
     if detail:
         for r in rounds or []:
             rungs = sorted(r["offers"], key=lambda o: o["ts"])
             prev = None
             for k, o in enumerate(rungs):
                 try:
-                    t = _rfc3339_ns(o["ts"][:26].replace(" ", "T")) + (off or 0)
+                    t = _rfc3339_ns(o["ts"][:26].replace(" ", "T"))
                 except Exception:
                     continue
+                if o.get("from_relay"):
+                    t -= rel_off
+                t += off or 0
                 grew = "" if prev is None else f'+{o["orders"] - prev:,} orders'
                 prev = o["orders"]
                 ev.append((
@@ -4089,7 +4165,7 @@ def timeline_html(slot, extends, commits, shreds, rounds, builder=None,
                     + (f' <span class="dim">{grew}</span>' if grew else ""),
                     " &middot; ".join(x for x in (
                         f'{o["exec_cost"]:,} CU' if o["exec_cost"] else "",
-                        f'{o["bundles"]:,} bundles' if o["bundles"] else "",
+                        f'{o["bundles"]:,} bundles' if o["bundles"] > 0 else "",
                         html.escape(o["uuid"])) if x),
                     "offer" + (" unshifted" if offers_unshifted else "")))
 
@@ -4106,6 +4182,17 @@ def timeline_html(slot, extends, commits, shreds, rounds, builder=None,
     # The builder's own events, on the shift resolved above.
     align = ""
     offwarn = ""
+    relaynote = ""
+    if rel_pairs and rel_off:
+        relaynote = ('<span class="note">offers shifted '
+                     f"{-rel_off/1e6:+,.0f} ms off the relay's clock onto this "
+                     f"builder's, from {rel_pairs} miniblock uuids seen in "
+                     f"both (spread {rel_spread:.2f} ms)</span>")
+    elif rel_pairs:
+        relaynote = ('<span class="warn"> &#9888; the relay and this builder '
+                     f"disagree by {rel_spread:,.0f} ms across {rel_pairs} "
+                     "uuids, too much to call one offset, so the offers are "
+                     "left on the relay's clock</span>")
     solo_clock = not (dep().get("sims") or [])
     if solo_clock and off is None:
         # Nothing here came from InfluxDB, so every row is already on one
@@ -4251,7 +4338,7 @@ def timeline_html(slot, extends, commits, shreds, rounds, builder=None,
             "InfluxDB only, pinned to our own host, so this is a single clock "
             "and the order is real &middot; relay and ClickHouse timestamps "
             "are excluded unless they can be ALIGNED &middot; extends are "
-            "collapsed per round</span>" + align + offwarn + "</div>"
+            "collapsed per round</span>" + align + relaynote + offwarn + "</div>"
             f'<div class="legend">{legend}</div>'
             + toggle
             + "<table><thead><tr><th class=n>offset</th><th>UTC</th><th>event</th>"
@@ -4289,6 +4376,101 @@ def slot_check_dropped(slot, stamps):
              "orders": ch_int(r[3])} for r in rows]
 
 
+def slot_false_positives(slot):
+    """Orders our check stage refused that the winner's block then included.
+
+    A refusal is a prediction: this order will not execute. The winner's block
+    is the ground truth for the same base, so anything in both sets is a
+    prediction we got wrong -- value we could have carried and did not.
+
+    The comparison is deliberately SAME-SLOT. check_dropped stamps
+    `resp.base_slot`, the base the simulator judged against, and the winner of
+    that slot was built on that same base, so the two are asking one question.
+    Widening it by a slot is not a stricter test but a different and wrong one:
+    at base+1 four of slot 443079972's refusals do appear in the winner, and
+    every one of them is legitimate -- the base advanced, and a blockhash or a
+    balance that failed at base N can pass at N+1. Counting those as our error
+    would invent false positives out of correct behaviour.
+
+    Keys are the identifiers both sides already use: `entity` is a SigPrefix
+    rendered base58 for a transaction (16 bytes, 22 chars) and a BundleId
+    rendered hex for a bundle (32 bytes, 64 chars), which is exactly what the
+    winner payload's refs decode to. Validated on slot 443079973: 626 of our
+    own 639 prefixes appear in the winner's set, so the two key spaces do meet.
+
+    Measured over 212 consecutive slots: zero. The check stage did not once
+    refuse an order the winner then included. Zero is the healthy reading here
+    and the panel says so rather than rendering an empty table."""
+    refs = slot_winner_refs(slot)
+    if not refs:
+        return None
+    keys = {}
+    for idx, d in refs.items():
+        for t in d["txs"]:
+            keys.setdefault(b58encode(t), idx)
+        for b in d.get("bundle_ids") or []:
+            keys.setdefault(b.hex(), idx)
+    if not keys:
+        return None
+    try:
+        _, rows = clickhouse(
+            "SELECT DISTINCT entity, entity_kind, reason FROM bifrost_events "
+            f"WHERE nums['slot'] = {int(slot)} AND event = 'check_dropped' "
+            f"AND instance_id = '{dep()['instance']}' AND entity != '' "
+            "LIMIT 400000")
+    except Exception:
+        return None
+    hits = {}
+    for entity, kind, reason in rows:
+        if entity in keys:
+            h = hits.setdefault((reason, kind), {"reason": reason, "kind": kind,
+                                                 "entities": []})
+            h["entities"].append((entity, keys[entity]))
+    return {"drops": len({r[0] for r in rows}), "winner": len(keys),
+            "hits": sorted(hits.values(),
+                           key=lambda h: -len(h["entities"]))}
+
+
+def false_positives_html(fp):
+    if fp is None:
+        return ""
+    total = sum(len(h["entities"]) for h in fp["hits"])
+    if not total:
+        return ('<div class="dropsec"><div class="dropsh">check false positives'
+                ' &mdash; none</div><div class="none">none of the '
+                f'{fp["drops"]:,} orders the check stage refused appear in the '
+                f'winner\'s {fp["winner"]:,}. Every refusal in this slot held '
+                "up against the block that actually landed.</div>"
+                '<div class="anote">An order in both sets would be a refusal '
+                "the winner proved wrong &mdash; value we could have carried. "
+                "Compared on the same base slot, which is what "
+                "<code>check_dropped</code> records and what the winner was "
+                "built on.</div></div>")
+    body = ""
+    for h in fp["hits"]:
+        ents = h["entities"]
+        shown = ", ".join(html.escape(e) + f' <span class="dim">r{i}</span>'
+                          for e, i in ents[:12])
+        if len(ents) > 12:
+            shown += f' <span class="dim">and {len(ents) - 12:,} more</span>'
+        body += (f'<tr><td class=m>{html.escape(h["kind"])}</td>'
+                 f'<td>{html.escape(h["reason"] or "(no reason given)")}</td>'
+                 f'<td class="n m">{len(ents):,}</td>'
+                 f'<td class="m dim">{shown}</td></tr>')
+    return ('<div class="dropsec"><div class="dropsh">check false positives '
+            f'&mdash; {total:,} of {fp["drops"]:,} refusals appear in the '
+            "winner's block</div>"
+            '<table class="atab"><tr><th>kind</th><th>reason</th>'
+            "<th class=n>count</th><th>order</th></tr>" + body + "</table>"
+            '<div class="anote">Orders our check stage refused that the '
+            "winner's block then included, matched on the same base slot: the "
+            "<code>SigPrefix</code> for a transaction, the "
+            "<code>BundleId</code> for a bundle, against the refs decoded from "
+            "the winner payload. <code>r0</code>, <code>r1</code> is the round "
+            "whose winner carried it. Each of these is a refusal the block "
+            "that landed proved wrong.</div></div>")
+
+
 def check_dropped_html(rows):
     if rows is None:
         return ""
@@ -4320,7 +4502,7 @@ def check_dropped_html(rows):
             "</div></div>")
 
 
-def logs_html(slot, logs, drops=None):
+def logs_html(slot, logs, drops=None, fpos=None):
     """warn / error / fatal for this slot, in order.
 
     Runs of the same message are collapsed: one ALT failure repeated 171 times
@@ -4330,24 +4512,28 @@ def logs_html(slot, logs, drops=None):
         return ('<div class="panel"><div class="dtlhead">logs</div>'
                 '<div class="none">ClickStack not configured &mdash; set '
                 "OTEL_URL and OTEL_SERVICE</div>"
-                + check_dropped_html(drops) + "</div>")
+                + check_dropped_html(drops)
+                + false_positives_html(fpos) + "</div>")
     if logs.get("nowindow"):
         return ('<div class="panel"><div class="dtlhead">logs</div>'
                 '<div class="none">this slot has no miniblock rows, so there '
                 "is no time window to search logs in &mdash; usually means the "
                 "builder was down for it</div>"
-                + check_dropped_html(drops) + "</div>")
+                + check_dropped_html(drops)
+                + false_positives_html(fpos) + "</div>")
     if logs.get("err"):
         return ('<div class="panel"><div class="dtlhead">logs</div>'
                 f'<div class="err">{html.escape(logs["err"])}</div>'
-                + check_dropped_html(drops) + "</div>")
+                + check_dropped_html(drops)
+                + false_positives_html(fpos) + "</div>")
     rows = logs.get("rows") or []
     if not rows:
         return ('<div class="panel"><div class="dtlhead">logs'
                 "<span class='note'>warn, error and fatal only &mdash; the "
                 "info-level status heartbeats are excluded</span></div>"
                 '<div class="none">no warnings or errors for this slot</div>'
-                + check_dropped_html(drops) + "</div>")
+                + check_dropped_html(drops)
+                + false_positives_html(fpos) + "</div>")
 
     # collapse consecutive identical messages at the same severity
     runs = []
@@ -4396,7 +4582,8 @@ def logs_html(slot, logs, drops=None):
             "<th>severity</th><th>message</th><th class=n>count</th>"
             "<th>where</th></tr></thead>"
             f"<tbody>{''.join(body)}</tbody></table>"
-            + check_dropped_html(drops) + "</div>")
+            + check_dropped_html(drops)
+                + false_positives_html(fpos) + "</div>")
 
 
 def compare_extras(slot):
@@ -6430,7 +6617,8 @@ def page(sel_win=None, sel_slot=None, sel_round=None, tab="rounds",
         elif tab == "logs":
             try:
                 d = slot_data(sel_slot)
-                inner = logs_html(sel_slot, d.get("logs"), d.get("drops"))
+                inner = logs_html(sel_slot, d.get("logs"), d.get("drops"),
+                                  d.get("fpos"))
             except Exception as exc:
                 inner = ('<div class="err">logs unavailable: '
                          f"{html.escape(str(exc))[:160]}</div>")
