@@ -1173,9 +1173,31 @@ def slot_builder_events(slot, stamps):
     return {"events": out}
 
 
+# An alignment measured from pairs this far apart is not a clock offset, it is
+# two different clocks being mixed. Seen when a deployment names both simulator
+# hosts and their clocks sit 12.5s apart: the join on (slot, round) still
+# succeeds, because both replay the same winner block, so the result looks
+# valid while being nonsense. Refuse rather than shift by it.
+MAX_ALIGN_SPREAD_MS = 5.0
+
+
 def builder_offset(builder, commits):
     """Nanoseconds to add to a ClickHouse timestamp to put it on the InfluxDB
-    clock. Anchored on round_committed, which both stores record."""
+    clock. Anchored on round_committed, which both stores record.
+
+    The builder logs round_committed when it RECEIVES the commit response; the
+    simulator writes sim-commit when the body finishes. So for each round
+
+        influx - clickhouse = (offset) - (response latency),   latency >= 0
+
+    and the offset is the MAXIMUM of those differences, not the median: the
+    fastest round is the one carrying the least latency, and every other pair
+    is that same offset plus a delay we do not want to bake in. Taking the
+    median instead shifted every builder event earlier by the typical latency.
+
+    Returns (offset_ns, spread_ms, pairs). offset is None when the pairs
+    disagree by more than MAX_ALIGN_SPREAD_MS, which means they are not
+    measuring one offset."""
     if not builder or not commits:
         return None, None, 0
     ch_by_round = {e["idx"]: e["t"] for e in builder.get("events", [])
@@ -1185,9 +1207,10 @@ def builder_offset(builder, commits):
     if not diffs:
         return None, None, 0
     diffs.sort()
-    median = diffs[len(diffs) // 2]
-    spread = (max(diffs) - min(diffs)) / 1e6
-    return median, spread, len(diffs)
+    spread = (diffs[-1] - diffs[0]) / 1e6
+    if spread > MAX_ALIGN_SPREAD_MS:
+        return None, spread, len(diffs)
+    return diffs[-1], spread, len(diffs)
 
 
 def slot_relay(slot, stamps):
@@ -1279,7 +1302,7 @@ def slot_commits(slot, stamps):
     # moment a leader-window context installed and sequencing could begin.
     series = influx_series(
         'SELECT "index","body_us","queue_us","replayed","critical_path","initial_width","promoted_len","applied",'
-        '"winner","refusal","parent_slot","hold_us" '
+        '"winner","refusal","parent_slot","hold_us","host_id" '
         f'FROM "sim-commit","sim-context" WHERE slot = {int(slot)} '
         + "".join(f"AND \"host_id\" != '{h}' " for h in OFF_CHAIN)
         + sim_pin()
@@ -1310,8 +1333,17 @@ def slot_commits(slot, stamps):
         e = out.setdefault(idx, {"n": 0, "body": 0, "replayed": 0,
                                  "promoted": 0, "queue": 0, "kind": 0,
                                  "refusal": 0, "critical_path": 0,
-                                 "initial_width": 0,
-                                 "t": _rfc3339_ns(r[at["time"]])})
+                                 "initial_width": 0, "t": None,
+                                 "t_host": None})
+        # `t` anchors the clock alignment, so it must come from ONE host. When
+        # a deployment names several simulators their rows arrive interleaved
+        # in time order, and letting the first row win handed the anchor to
+        # whichever clock was furthest behind. Prefer this deployment's own
+        # simulator; fall back to any host only if it wrote nothing.
+        host = r[at["host_id"]] if "host_id" in at else None
+        if e["t"] is None or (host == dep()["sim"] and e["t_host"] != dep()["sim"]):
+            e["t"] = _rfc3339_ns(r[at["time"]])
+            e["t_host"] = host
         e["n"] += 1
         e["body"] += num("body_us")
         e["queue"] += num("queue_us")
@@ -4090,6 +4122,16 @@ def timeline_html(slot, extends, commits, shreds, rounds, builder=None,
             align = ('<span class="note">this builder runs no simulator we '
                      "read, so every row here is a builder event on one clock "
                      "&mdash; nothing to align</span>")
+        elif off is None and spread is not None:
+            # Measured, and the measurement disagreed with itself. Almost always
+            # means two simulator hosts on different clocks were both matched.
+            align = ('<span class="warn"> &#9888; builder events omitted: the '
+                     f"{anchors} round_committed pairs disagree by "
+                     f"{spread:,.1f} ms, over the {MAX_ALIGN_SPREAD_MS:.0f} ms "
+                     "limit, so no single offset describes them. Check that "
+                     "this deployment names one simulator host: two hosts with "
+                     "different clocks both match a slot, because both replay "
+                     "the same winner block.</span>")
         elif off is None:
             align = ('<span class="warn"> &#9888; builder events omitted: no '
                      "round_committed in both stores to align the clocks</span>")
@@ -4706,7 +4748,11 @@ def rounds_html(slot, sel_round):
         out.append(shred_html(
             slot, data["shreds"],
             ((data.get("commits") or {}).get("_context") or {}).get("parent"),
-            data.get("ready"), shift or 0, spread, anchors))
+            data.get("ready"), shift or 0, spread,
+            # A rejected alignment has pairs but no usable offset. Report zero
+            # anchors so the panel says the rows are NOT shifted, rather than
+            # claiming a 0 ms shift it did not measure.
+            anchors if shift is not None else 0))
     if ext_err:
         out.append('<div class="err" style="margin:0 28px 8px">sim-extend '
                    f"unavailable: {html.escape(ext_err)}</div>")
