@@ -351,7 +351,7 @@ def health_html():
                 f"{rows}"
                 f'<span class="pg">{d["gotcha"]}</span>'
                 f'<span class="pf">cutoffs: <span class="{cls}">{plabel}</span>'
-                f' &middot; <a href="/reference">full reference</a></span>'
+                f' &middot; <a href="{purl(REF_PATH)}">full reference</a></span>'
                 "</span></span>")
 
     def cell(label, value, state, detail=""):
@@ -2219,7 +2219,7 @@ def dag_html(slot, rnd, source, data):
     have = [r["round"] for r in rounds]
     if rnd not in have:
         rnd = have[0]
-    base = f"/?win={window_of(slot)}&slot={slot}&tab=dag"
+    base = dhref(f"win={window_of(slot)}&slot={slot}&tab=dag")
     chips = "".join(
         f'<a class="dchip{" on" if r == rnd else ""}" '
         f'href="{base}&round={r}&src={source}">round {r}</a>' for r in have)
@@ -2787,6 +2787,9 @@ def _build_deployments():
 
 
 DEPLOYMENTS = _build_deployments()
+# Where a URL that names no builder goes. A request is never answered under an
+# unstated deployment: it is redirected to one that says so.
+DEFAULT_DEP = os.environ.get("DEFAULT_DEP", "mock")
 DEPLOY_BY_NAME = {d["name"]: d for d in DEPLOYMENTS}
 
 
@@ -2805,6 +2808,32 @@ def dkey():
     ONE deployment; without this in the key, switching would serve Tokyo's
     slots under Amsterdam's name."""
     return dep()["name"]
+
+
+REF_PATH = "/reference"
+
+
+def purl(path):
+    """A cross-page link (/, /analysis, /reference) naming this deployment.
+
+    The nav bar used to drop it: stepping from the slot explorer to the range
+    analysis handed the deployment back to the cookie, so the two pages could
+    disagree about which builder you were reading."""
+    return path + "?dep=" + urllib.parse.quote(dep()["name"])
+
+
+def dhref(q=""):
+    """An internal link, with this deployment named in it.
+
+    Every link carries `dep=` explicitly. It used to be implicit: a bare link
+    inherited a year-long cookie, so clicking a slot dropped the deployment
+    out of the URL and the next page silently answered as whichever builder
+    the cookie happened to hold. That is how a mock reading once got read as
+    Amsterdam's. The URL is now always the whole truth about what is on
+    screen, which also makes it shareable and back-button safe."""
+    base = "/?dep=" + urllib.parse.quote(dep()["name"])
+    q = q.lstrip("?&")
+    return base + ("&" + q if q else "")
 
 
 def host_name(host):
@@ -4325,7 +4354,7 @@ def timeline_html(slot, extends, commits, shreds, rounds, builder=None,
             ("#4ade80", "commit: promote &mdash; we won, pointer move"),
             ("#475569", "commit: empty &mdash; winnerless round"),
             ("#22d3ee", "this slot on chain &mdash; complete, frozen")))
-    base = f"/?win={window_of(slot)}&slot={slot}&tab=timeline"
+    base = dhref(f"win={window_of(slot)}&slot={slot}&tab=timeline")
     toggle = ('<span class="tlmode">'
               f'<a class="tlchip{"" if detail else " on"}" '
               f'href="{base}&tl=sum">summary</a>'
@@ -4730,7 +4759,7 @@ def compare_html(slot, rounds, extends, commits, relay_rounds=None,
                     f'{"" if rl["our_subs"] == 1 else "s"} rejected: '
                     f'{html.escape(rl["our_reject"])}</div>')
         body.append(
-            f'<tr><td class="m"><a href="/?win={window_of(slot)}&slot={slot}'
+            f'<tr><td class="m"><a href="{dhref()}&win={window_of(slot)}&slot={slot}'
             f'&round={r["round"]}">round {r["round"]}</a>'
             + (' <span class="last">is_last</span>' if w and w["is_last"] else "")
             + note + "</td>"
@@ -5950,13 +5979,18 @@ NAV_JS = r"""
     var here = new URL(location.href);
     var win = here.searchParams.get('win');
     if (!win) return;
+    // Carried explicitly: a prefetched URL without it would be answered by
+    // the cookie and cached under a key that does not say which builder.
+    var pdep = here.searchParams.get('dep');
+    var dq = pdep ? 'dep=' + encodeURIComponent(pdep) + '&' : '';
     var slots = [].slice.call(
       document.querySelectorAll('.winbar ~ .strip .chip.sm[data-slot]'))
       .map(function(c){ return c.dataset.slot; });
     var queue = [];
     slots.forEach(function(s){
       TABS.forEach(function(t){
-        queue.push('/?win=' + win + '&slot=' + s + (t ? '&tab=' + t : ''));
+        queue.push('/?' + dq + 'win=' + win + '&slot=' + s
+                   + (t ? '&tab=' + t : ''));
       });
     });
     queue = queue.filter(function(u){ return !cache.has(key(u)); });
@@ -6084,13 +6118,13 @@ def grade_chips(mode, sel_win, sel_slot, elig, shown, total):
                 "last "
                 f'{ELIG_HOURS}h.">no connector is grading our offers</span>')
     def chip(key, label):
-        q = f"?grade={key}" if key != "all" else "?"
+        q = f"grade={key}" if key != "all" else ""
         if sel_win is not None:
             q += f"&win={sel_win}"
         if sel_slot is not None:
             q += f"&slot={sel_slot}"
         return (f'<a class="gradechip{" on" if mode == key else ""}" '
-                f'href="/{q}">{label}</a>')
+                f'href="{dhref(q)}">{label}</a>')
     return ('<span class="gradesel">'
             + chip("all", "all connectors")
             + chip("graded", f"grading us ({graded})")
@@ -6139,7 +6173,7 @@ def strip_html(windows, sel_win, sel_slot, grade='all'):
 
     def chip(w):
         on = w["win"] == sel_win
-        href = "/" if on else f"/?win={w['win']}"
+        href = dhref() if on else dhref(f"win={w['win']}")
         cls = ("chip" + (" on" if on else "") + (" won" if w["won"] else "")
                + (" runstart" if w.get("run_starts_here") else ""))
         return (f'<a class="{cls}" href="{href}" '
@@ -6221,7 +6255,8 @@ def window_html(windows, sel_win, sel_slot):
     missing = WINDOW - len(win["slots"])
     def slotchip(s):
         on = s["slot"] == sel_slot
-        href = f"/?win={sel_win}" if on else f"/?win={sel_win}&slot={s['slot']}"
+        href = (dhref(f"win={sel_win}") if on
+                else dhref(f"win={sel_win}&slot={s['slot']}"))
         cls = "chip sm" + (" on" if on else "") + (" won" if s["won"] else "")
         return (f'<a class="{cls}" href="{href}" data-slot="{s["slot"]}">'
                 f'<div class="slot">{s["slot"]}{copy_btn(s["slot"])}</div>'
@@ -6531,7 +6566,7 @@ def reference_page():
 <header>
   <h1>sim<span>bench</span></h1>
   <div class="sub">metrics reference &mdash; what each number means and when it is bad</div>
-  <a class="navlink" href="/">&larr; back to slots</a>
+  <a class="navlink" href="{purl("/")}">&larr; back to slots</a>
 </header>
 <div class="callout">
   <b>Thresholds marked PROVISIONAL are inferences, not agreed limits.</b>
@@ -6578,7 +6613,7 @@ def page(sel_win=None, sel_slot=None, sel_round=None, tab="rounds",
         body = (f'<main><div class="empty"><b>No slot selected.</b><br>{note}'
                 "</div></main>")
     else:
-        base = f"/?win={window_of(sel_slot)}&slot={sel_slot}"
+        base = dhref(f"win={window_of(sel_slot)}&slot={sel_slot}")
         tabs = "".join(
             f'<a class="tab{" on" if tab == key else ""}" '
             f'href="{base}{"" if key == "rounds" else "&tab=" + key}">{label}</a>'
@@ -6670,8 +6705,8 @@ def page(sel_win=None, sel_slot=None, sel_round=None, tab="rounds",
            aria-label="go to slot" />
   </form>
   {deploy_selector("/", {})}
-  <a class="navlink" href="/analysis">range analysis</a>
-  <a class="navlink" href="/reference">metrics reference &mdash; what is bad?</a>
+  <a class="navlink" href="{purl("/analysis")}">range analysis</a>
+  <a class="navlink" href="{purl("/reference")}">metrics reference &mdash; what is bad?</a>
 </header>
 {health_html()}
 {strip}
@@ -7171,7 +7206,7 @@ def analysis_run(start, end, threshold, identity):
 
 
 def _slot_link(slot, rnd=None, tab=None):
-    href = f"/?win={window_of(slot)}&slot={slot}"
+    href = dhref(f"win={window_of(slot)}&slot={slot}")
     if tab:
         href += f"&tab={tab}"
     if rnd is not None:
@@ -7650,8 +7685,8 @@ def analysis_page(start, end, threshold, identity):
                 "range.</b><br>Pick another connector or widen the range.</div>")
     else:
         qs = urllib.parse.urlencode(
-            {"start": start, "end": end or "", "threshold": f"{threshold:g}",
-             "identity": rep["identity"]})
+            {"dep": dep()["name"], "start": start, "end": end or "",
+             "threshold": f"{threshold:g}", "identity": rep["identity"]})
         head = (f'<div class="ahead">'
                 f'<span class="hascp"><code>{html.escape(rep["identity"])}</code>'
                 f'{copy_btn(rep["identity"])}</span>'
@@ -7682,8 +7717,8 @@ def analysis_page(start, end, threshold, identity):
   <div class="sub">range analysis</div>
   {deploy_selector("/analysis", {"start": start, "end": end or "",
                                  "threshold": f"{threshold:g}"})}
-  <a class="navlink" href="/">back to the slot explorer</a>
-  <a class="navlink" href="/reference">metrics reference</a>
+  <a class="navlink" href="{purl("/")}">back to the slot explorer</a>
+  <a class="navlink" href="{purl("/reference")}">metrics reference</a>
 </header>
 {form}
 <main class="awrap">{body}</main>
@@ -7700,26 +7735,58 @@ class Handler(BaseHTTPRequestHandler):
                          f"dep={self._set_cookie}; Path=/; Max-Age=31536000; "
                          "SameSite=Lax")
 
+    def _cookie_dep(self):
+        cookie = ""
+        for part in (self.headers.get("Cookie", "") or "").split(";"):
+            k, _, v = part.strip().partition("=")
+            if k == "dep":
+                cookie = v
+        return cookie if cookie in DEPLOY_BY_NAME else ""
+
     def _pick_deployment(self, parsed):
-        """?dep= wins so a link is shareable; otherwise the cookie, so ordinary
-        links need not carry it and the SPA navigation keeps working
-        unchanged. Returns whether the cookie should be (re)written."""
+        """Resolve the deployment from `dep=`, which every link now carries.
+
+        Returns whether the cookie should be (re)written. A URL without
+        `dep=` is not answered from the cookie any more -- _redirect_dep sends
+        it to an explicit one first -- so by the time this returns, what is on
+        screen and what is in the address bar agree."""
         qs = urllib.parse.parse_qs(parsed.query)
         asked = (qs.get("dep", [""])[0] or "").strip()
         if asked and asked in DEPLOY_BY_NAME:
             set_dep(asked)
             return True
-        cookie = ""
-        raw = self.headers.get("Cookie", "")
-        for part in raw.split(";"):
-            k, _, v = part.strip().partition("=")
-            if k == "dep":
-                cookie = v
-        set_dep(cookie if cookie in DEPLOY_BY_NAME else "")
+        set_dep(self._cookie_dep())
         return False
+
+    def _redirect_dep(self, parsed):
+        """Send a URL that names no builder to one that does.
+
+        The deployment used to live in a year-long cookie, invisible in the
+        URL, so a page could answer as the mock under any heading. Rather than
+        guess quietly, redirect: the last explicit choice if there is one,
+        else DEFAULT_DEP. Everything downstream then sees a URL that states
+        which builder it is about, and so does the user."""
+        qs = urllib.parse.parse_qs(parsed.query)
+        asked = (qs.get("dep", [""])[0] or "").strip()
+        if asked in DEPLOY_BY_NAME:
+            return False
+        name = self._cookie_dep() or DEFAULT_DEP
+        if name not in DEPLOY_BY_NAME:
+            name = DEPLOYMENTS[0]["name"]
+        qs.pop("dep", None)
+        pairs = [("dep", name)] + [(k, v) for k, vs in qs.items() for v in vs]
+        target = parsed.path + "?" + urllib.parse.urlencode(pairs)
+        self.send_response(302)
+        self.send_header("Location", target)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+        return True
 
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
+        if self._redirect_dep(parsed):
+            return
         remember = self._pick_deployment(parsed)
         self._set_cookie = dep()["name"] if remember else None
         if parsed.path == "/analysis/orders":
