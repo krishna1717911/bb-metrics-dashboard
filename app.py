@@ -4615,6 +4615,14 @@ def logs_html(slot, logs, drops=None, fpos=None):
                 + false_positives_html(fpos) + "</div>")
 
 
+# Keyed by (deployment, slot) and guarded by _slot_lock, like the other
+# per-slot caches. Its definition was deleted by an over-broad replace in
+# ad5491a while all four uses stayed, so the comparison tab has been raising
+# NameError ever since -- caught only because the tab reports the exception
+# instead of failing the page.
+_extra_cache = {}
+
+
 def compare_extras(slot):
     """Bundle and non-vote inputs for the comparison tab only, so the rounds
     view never pays for the block fetch."""
