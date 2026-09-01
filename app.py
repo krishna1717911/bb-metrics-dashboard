@@ -2861,7 +2861,28 @@ def deploy_selector(path, params):
             {k: v for k, v in q.items() if v})
         out.append(f'<a class="depchip{" on" if d["name"] == here else ""}" '
                    f'href="{html.escape(href)}">{html.escape(d["label"])}</a>')
-    return '<div class="depsel"><span>builder</span>' + "".join(out) + "</div>"
+    d = dep()
+    sims = d.get("sims") or []
+    # The two identities every number on the page is filtered by. They were
+    # invisible: the simulator appeared only as the words "our simulator", so
+    # when DEPLOY_AMS_SIM listed the mock's host as well, Amsterdam's panels
+    # blended a clock 12.6 s away and the page gave no way to notice. Shown in
+    # full, never truncated -- a prefix would compare equal across builders.
+    who = ('<div class="depwho">'
+           f'<span class="dwk">instance</span>'
+           f'<code>{html.escape(d.get("instance") or "&mdash;")}</code>'
+           + copy_btn(d.get("instance") or ""))
+    if sims:
+        who += ('<span class="dwk">simulator</span>'
+                + "".join(f"<code>{html.escape(h)}</code>" + copy_btn(h)
+                          for h in sims))
+    else:
+        who += ('<span class="dwk">simulator</span>'
+                '<span class="dwnone">none &mdash; this builder writes no '
+                "InfluxDB rows we read</span>")
+    who += "</div>"
+    return ('<div class="depsel"><span>builder</span>' + "".join(out)
+            + "</div>" + who)
 # measurement -> (row label, sort key). The timestamp IS the datum for all four.
 SHRED_STAGES = [("shred_insert_is_full", "slot complete"),
                 ("bank_frozen", "bank frozen")]
@@ -3051,7 +3072,8 @@ def shred_html(slot, shreds, parent=None, ready=None, shift=0,
     leader = next((h for h in dep()["leaders"] if h in present), dep()["leader0"])
     hosts = [h for h in (leader, dep()["sim"]) if h]
     head = ("<tr><th>stage</th>"
-            + "".join(f"<th class=n>{html.escape(host_name(h))}</th>" for h in hosts)
+            + "".join(f'<th class=n title="{html.escape(h, quote=True)}">'
+                        f"{html.escape(host_name(h))}</th>" for h in hosts)
             + "<th class=n>sim &minus; leader</th><th>detail</th></tr>")
     body = []
     for which, why in groups:
@@ -5437,6 +5459,14 @@ details.around>summary:hover{background:#111c26}
 .depchip:hover{border-color:#2f4459;color:#cfe0f0}
 .depchip.on{background:#0f766e;border-color:#5eead4;color:#eafffb;
   font-weight:600}
+.depwho{flex-basis:100%;display:flex;flex-wrap:wrap;align-items:center;
+  gap:4px;justify-content:flex-end;padding:4px 14px 0 0;font-size:10.5px}
+.depwho code{color:#8fa3ba;font-family:ui-monospace,SFMono-Regular,monospace;
+  font-size:10.5px;background:#0f1720;border:1px solid #1b2733;
+  border-radius:4px;padding:1px 5px}
+.depwho .dwk{color:#4d5c70;font-size:9.5px;text-transform:uppercase;
+  letter-spacing:.06em;margin:0 2px 0 8px}
+.depwho .dwnone{color:#7a5c2a}
 /* connector grading */
 .gradesel{display:inline-flex;align-items:center;gap:5px;margin-left:14px}
 .gradechip{display:inline-block;padding:1px 9px;border:1px solid #22303f;
