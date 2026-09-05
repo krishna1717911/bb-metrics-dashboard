@@ -5011,29 +5011,51 @@ def _relayer_lookup(slot, prefixes, bundles):
     return out
 
 
-def _order_cell(it):
-    """The order id, and for a bundle the transactions inside it.
+ID_PREFIX = 16
+# Only shorten what shortening actually buys room for. A transaction here
+# is a 22-character SigPrefix: cutting it to 16 saves six characters and
+# spends them again on an ellipsis and a control, so the row gets wider,
+# not narrower. A 64-character BundleId is what was crushing the columns.
+ID_SHORTEN_OVER = 28
 
-    A BundleId is a hash: it names the bundle but says nothing about what is
-    in it, and the bundle is the unit the auction accepted or refused, so the
-    useful question is always which transactions went down with it. The relay
-    records the members, so the row opens to them."""
-    cell = (f'<td class="m hascp"><code>{html.escape(it["id"])}</code>'
-            f'{copy_btn(it["id"])}')
-    if it["kind"] != "bundle":
-        return cell + "</td>"
+
+def _order_cell(it):
+    """The order id, short enough to leave room for the columns that matter.
+
+    A signature is 88 characters and a BundleId 64, which crowded every other
+    column off the row. Shown as a 16-character prefix, but never only that:
+    the copy button carries the whole value, and expanding reveals it in full.
+    Nothing here is a truncated identifier you could accidentally paste into a
+    query -- 16 characters would not be unique and is not meant to be compared,
+    it is meant to be recognised.
+
+    A BundleId is a hash and says nothing about what is inside it, while the
+    bundle is the unit the auction accepted or refused, so for a bundle the
+    same expansion also lists the transactions that went down with it."""
+    full = it["id"]
     sigs = it.get("sigs") or []
-    if sigs:
+    long_id = len(full) > ID_SHORTEN_OVER
+    shown = full[:ID_PREFIX] if long_id else full
+    cell = (f'<td class="m ord"><span class="hascp">'
+            f'<code>{html.escape(shown)}</code>'
+            + ('<span class="ell">&hellip;</span>' if long_id else "")
+            + f"{copy_btn(full)}</span>")
+    detail = (f'<div class="idfull"><code>{html.escape(full)}</code></div>'
+              if long_id else "")
+    if it["kind"] == "bundle" and sigs:
         plural = "" if len(sigs) == 1 else "s"
-        cell += (f'<details class="bsigs"><summary>{len(sigs)} signature'
-                 f'{plural}</summary><ol>'
-                 + "".join(f'<li class="hascp"><code>{html.escape(x)}</code>'
-                           f"{copy_btn(x)}</li>" for x in sigs)
-                 + "</ol></details>")
-    elif it.get("txs"):
+        detail += (f'<div class="idlab">{len(sigs)} transaction{plural} in this '
+                   "bundle</div><ol class=\"bsiglist\">"
+                   + "".join(f'<li class="hascp"><code>{html.escape(x)}</code>'
+                             f"{copy_btn(x)}</li>" for x in sigs)
+                   + "</ol>")
+    elif it["kind"] == "bundle" and it.get("txs"):
         plural = "" if it["txs"] == 1 else "s"
-        cell += (f'<div class="note">{it["txs"]} transaction{plural}, which '
-                 "the relay did not record</div>")
+        detail += (f'<div class="idlab">{it["txs"]} transaction{plural}, which '
+                   "the relay did not record</div>")
+    if detail:
+        cell += (f'<details class="idexp"><summary>expand</summary>'
+                 f'{detail}</details>')
     return cell + "</td>"
 
 
@@ -5119,7 +5141,7 @@ def missing_html(slot, data):
                    else '<td class="m dim">&mdash;</td>')
             kind = it["kind"]
             if kind == "bundle" and it.get("txs"):
-                kind += f' <span class="dim">{it["txs"]} tx</span>'
+                kind += f'<span class="dim"> &times;{it["txs"]}</span>'
             rows.append(
                 f'<tr><td class="n m dim">{it["pos"]}</td>'
                 f'<td class="m">{kind}</td>'
@@ -5989,12 +6011,23 @@ details.around>summary:hover{background:#111c26}
 table.mstab{font-size:11px}
 table.mstab code{font-size:10.5px}
 table.mstab td.bad{color:#f87171}
-details.bsigs{margin-top:4px}
-details.bsigs>summary{cursor:pointer;color:#60a5fa;font-size:10px;
-  text-transform:uppercase;letter-spacing:.05em}
-details.bsigs>summary:hover{color:#93c5fd}
-details.bsigs ol{margin:4px 0 2px;padding-left:20px}
-details.bsigs li{margin:2px 0;font-size:10.5px}
+table.mstab td.ord{white-space:nowrap}
+table.mstab td.ord code{font-size:10.5px}
+td.ord .ell{color:#4d5c70}
+details.idexp{display:inline}
+details.idexp>summary{display:inline;cursor:pointer;color:#60a5fa;
+  font-size:9.5px;text-transform:uppercase;letter-spacing:.05em;
+  margin-left:6px;list-style:none}
+details.idexp>summary::-webkit-details-marker{display:none}
+details.idexp>summary:hover{color:#93c5fd}
+details.idexp[open]>summary{color:#8fa3ba}
+.idfull{margin:4px 0 0;white-space:normal;word-break:break-all;
+  max-width:420px}
+.idlab{color:#61748b;font-size:9.5px;text-transform:uppercase;
+  letter-spacing:.05em;margin:6px 0 2px}
+ol.bsiglist{margin:2px 0 2px;padding-left:20px;white-space:normal;
+  max-width:420px}
+ol.bsiglist li{margin:2px 0;font-size:10px;word-break:break-all}
 /* connector grading */
 .gradesel{display:inline-flex;align-items:center;gap:5px;margin-left:14px}
 .gradechip{display:inline-block;padding:1px 9px;border:1px solid #22303f;
