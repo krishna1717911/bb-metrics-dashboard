@@ -4925,11 +4925,37 @@ def _slot_missing_uncached(slot):
     except Exception:
         pass
 
+    # Our own telemetry knows every one of these, unlike the relay: the
+    # chain-watch emits `executed` for each order in the block that landed,
+    # and `winner_order_refused` whenever the winner asked us to commit one
+    # and our simulator would not. That second event is the informative one --
+    # it is the difference between "we never had it" and "we had it and said
+    # no", and its detail sits in attrs, not in the reason column.
+    mine = {}
+    try:
+        _, rows = clickhouse(
+            "SELECT entity, event, attrs['outcome'] AS outcome,"
+            " attrs['error'] AS error, nums['cu'] AS cu, reason"
+            f" FROM bifrost_events WHERE nums['slot'] = {int(slot)}"
+            f" AND instance_id = '{dep()['instance']}' AND entity != ''"
+            " AND event IN ('executed', 'winner_order_refused') LIMIT 400000")
+        for entity, event, outcome, error, cu, reason in rows:
+            rec = mine.setdefault(entity, {})
+            if event == "executed":
+                rec["exec_cu"] = ch_int(cu)
+                rec["exec_outcome"] = reason
+            else:
+                rec["refused"] = outcome or "refused"
+                rec["refused_why"] = error
+    except Exception:
+        pass
+
     seen = _relayer_lookup(slot, lookup_tx, lookup_bundle)
     for r in rounds:
         for it in r["items"]:
             it["reasons"] = drops.get(it["id"]) or []
             it["dropped"] = bool(it["reasons"])
+            it.update(mine.get(it["id"]) or {})
             it.update(seen.get(it["id"]) or {})
     return {"rounds": rounds, "note": "",
             "looked_up": len(lookup_tx) + len(lookup_bundle),
@@ -4973,14 +4999,42 @@ def _relayer_lookup(slot, prefixes, bundles):
                 rows = relayer(
                     "SELECT bundle_uuid AS k, toUInt64(min(recv_ts)) * 1000 AS recv,"
                     " any(approx_slot) AS aslot, any(num_transactions) AS ntx,"
+                    " arrayStringConcat(any(signatures), ',') AS sigs,"
                     " count() AS n FROM relayer.validator_bundle_events"
                     f" WHERE bundle_uuid IN ({quoted}) GROUP BY k")
-                for k, recv, aslot, ntx, n in rows:
+                for k, recv, aslot, ntx, sigs, n in rows:
                     out[k] = {"recv_ms": ch_int(recv), "approx_slot": ch_int(aslot),
-                              "txs": ch_int(ntx), "seen": ch_int(n)}
+                              "txs": ch_int(ntx), "seen": ch_int(n),
+                              "sigs": [x for x in sigs.split(",") if x]}
             except Exception:
                 pass
     return out
+
+
+def _order_cell(it):
+    """The order id, and for a bundle the transactions inside it.
+
+    A BundleId is a hash: it names the bundle but says nothing about what is
+    in it, and the bundle is the unit the auction accepted or refused, so the
+    useful question is always which transactions went down with it. The relay
+    records the members, so the row opens to them."""
+    cell = (f'<td class="m hascp"><code>{html.escape(it["id"])}</code>'
+            f'{copy_btn(it["id"])}')
+    if it["kind"] != "bundle":
+        return cell + "</td>"
+    sigs = it.get("sigs") or []
+    if sigs:
+        plural = "" if len(sigs) == 1 else "s"
+        cell += (f'<details class="bsigs"><summary>{len(sigs)} signature'
+                 f'{plural}</summary><ol>'
+                 + "".join(f'<li class="hascp"><code>{html.escape(x)}</code>'
+                           f"{copy_btn(x)}</li>" for x in sigs)
+                 + "</ol></details>")
+    elif it.get("txs"):
+        plural = "" if it["txs"] == 1 else "s"
+        cell += (f'<div class="note">{it["txs"]} transaction{plural}, which '
+                 "the relay did not record</div>")
+    return cell + "</td>"
 
 
 def _tip_total(tips):
@@ -4990,10 +5044,10 @@ def _tip_total(tips):
 def missing_html(slot, data):
     """One row per winner order our best offer of that round did not hold."""
     if data is None:
-        return ('<div class="panel"><div class="dtlhead">winner-only orders'
+        return ('<div class="panel"><div class="dtlhead">missing txns'
                 "</div><div class=none>nothing to compare</div></div>")
     if data.get("note"):
-        return ('<div class="panel"><div class="dtlhead">winner-only orders'
+        return ('<div class="panel"><div class="dtlhead">missing txns'
                 f'</div><div class=none>{html.escape(data["note"])}</div></div>')
     rounds = data.get("rounds") or []
     total = sum(len(r["items"]) for r in rounds)
@@ -5041,6 +5095,9 @@ def missing_html(slot, data):
             else:
                 rew = '<td class="n m dim" colspan=5>&mdash;</td>'
                 cu = '<td class="n m dim" colspan=2>&mdash;</td>'
+            ecu = it.get("exec_cu")
+            cu += (f'<td class="n m">{ecu:,}</td>' if ecu
+                   else '<td class="n m dim">&mdash;</td>')
             recv = it.get("recv_ms")
             arrival = (f'<td class="m dim">'
                        f'{dt.datetime.fromtimestamp(recv / 1000, dt.UTC).strftime("%H:%M:%S.%f")[:-3]}'
@@ -5048,28 +5105,38 @@ def missing_html(slot, data):
             aslot = it.get("approx_slot")
             aslot_td = (f'<td class="n m dim">{aslot:,}</td>' if aslot
                         else '<td class="n m dim">&mdash;</td>')
-            if it["dropped"]:
-                flag = '<td class="m bad">yes</td>'
-                why = ('<td class="m">'
-                       + "; ".join(html.escape(x or "(no reason given)")
-                                   for x in it["reasons"]) + "</td>")
-            else:
-                flag = '<td class="m dim">no</td>'
-                why = '<td class="m dim">&mdash;</td>'
+            flag = ('<td class="m bad">yes</td>' if it["dropped"]
+                    else '<td class="m dim">no</td>')
+            refused = it.get("refused")
+            ref_td = (f'<td class="m bad">{html.escape(refused)}</td>' if refused
+                      else '<td class="m dim">&mdash;</td>')
+            why_bits = [x for x in it["reasons"] if x]
+            if it.get("refused_why"):
+                why_bits.append(it["refused_why"])
+            why = (('<td class="m">'
+                    + "; ".join(html.escape(x) for x in dict.fromkeys(why_bits))
+                    + "</td>") if why_bits
+                   else '<td class="m dim">&mdash;</td>')
+            kind = it["kind"]
+            if kind == "bundle" and it.get("txs"):
+                kind += f' <span class="dim">{it["txs"]} tx</span>'
             rows.append(
                 f'<tr><td class="n m dim">{it["pos"]}</td>'
-                f'<td class="m">{it["kind"]}</td>'
-                f'<td class="m hascp"><code>{html.escape(it["id"])}</code>'
-                f'{copy_btn(it["id"])}</td>'
-                + rew + cu + aslot_td + arrival + flag + why + "</tr>")
+                f'<td class="m">{kind}</td>'
+                + _order_cell(it)
+                + rew + cu + aslot_td + arrival + flag + ref_td + why
+                + "</tr>")
         body.append(
             f'<div class="mssec">{head}<table class="atab mstab">'
             "<tr><th class=n>#</th><th>kind</th><th>order</th>"
             "<th class=n>reward</th><th class=n>base</th><th class=n>prio</th>"
             "<th class=n>jito tip</th><th class=n>other tip</th>"
-            "<th class=n>CU</th><th class=n>&micro;lam/CU</th>"
+            '<th class=n title="compute units the transaction asked for via ComputeBudget; * means it set none, so the runtime default applies">declared CU</th>'
+            '<th class=n title="the priority-fee bid, in micro-lamports per compute unit. prio = declared CU x this / 1,000,000">prio price</th>'
+            '<th class=n title="compute units the chain actually charged, from our own executed event">charged CU</th>'
             "<th class=n>approx slot</th><th>reached relay</th>"
-            "<th>dropped</th><th>reason</th></tr>"
+            '<th title="our check stage refused it before the auction ever saw it">check dropped</th>'
+            '<th title="the winner asked us to commit this order and our simulator refused">refused at commit</th><th>reason</th></tr>'
             + "".join(rows) + "</table></div>")
 
     found = data.get("found", 0)
@@ -5086,7 +5153,14 @@ def missing_html(slot, data):
         "is what the auction judged; these orders were never executed by us, "
         "so no actual cost exists to read. A CU marked <code>*</code> set no "
         "ComputeBudget limit and gets the runtime default. <b>dropped</b> is "
-        "our own check stage refusing it, with the simulator's reason."
+        "our own check stage refusing it before the auction, which is "
+        "rare. <b>refused at commit</b> is the informative one: the "
+        "winner asked us to commit this order and our simulator would "
+        "not, and it separates an order we never had from one we had "
+        "and said no to. <b>charged CU</b> is what the chain actually "
+        "billed, from our own <code>executed</code> record, which "
+        "covers every row here -- unlike the declared columns, which "
+        "need the transaction bytes."
         f" Arrival and cost come from the relay's packet log, which had {cov}"
         " of these orders: it records only what came through Astralane, so a "
         "dash means not recorded there rather than zero. A tip paid to an "
@@ -5095,7 +5169,7 @@ def missing_html(slot, data):
     if not have_relayer:
         note = ('<div class="anote warn">RELAYER_URL is not set, so no arrival '
                 "or declared-cost columns can be filled.</div>") + note
-    return ('<div class="panel"><div class="dtlhead">winner-only orders'
+    return ('<div class="panel"><div class="dtlhead">missing txns'
             f'<span class="note">{total:,} across {len(rounds)} round'
             f'{"" if len(rounds) == 1 else "s"}</span></div>'
             + "".join(body) + note + "</div>")
@@ -5915,6 +5989,12 @@ details.around>summary:hover{background:#111c26}
 table.mstab{font-size:11px}
 table.mstab code{font-size:10.5px}
 table.mstab td.bad{color:#f87171}
+details.bsigs{margin-top:4px}
+details.bsigs>summary{cursor:pointer;color:#60a5fa;font-size:10px;
+  text-transform:uppercase;letter-spacing:.05em}
+details.bsigs>summary:hover{color:#93c5fd}
+details.bsigs ol{margin:4px 0 2px;padding-left:20px}
+details.bsigs li{margin:2px 0;font-size:10.5px}
 /* connector grading */
 .gradesel{display:inline-flex;align-items:center;gap:5px;margin-left:14px}
 .gradechip{display:inline-block;padding:1px 9px;border:1px solid #22303f;
@@ -7105,13 +7185,13 @@ def page(sel_win=None, sel_slot=None, sel_round=None, tab="rounds",
             f'href="{base}{"" if key == "rounds" else "&tab=" + key}">{label}</a>'
             for key, label in (("rounds", "rounds"), ("compare", "comparison"),
                                ("timeline", "timeline"), ("offers", "offer timeline"),
-                               ("dag", "dag"), ("missing", "winner-only"),
+                               ("dag", "dag"), ("missing", "missing-txns"),
                                ("logs", "logs")))
         # A relay-only builder has no instrumentation of ours behind any of
         # these, so they are answered once here instead of each discovering
         # emptiness on its own.
         UNINSTRUMENTED = {"dag": "dispatch DAG",
-                          "missing": "winner-only order list"}
+                          "missing": "missing-txn list"}
         if dep().get("source") == "relay" and tab in UNINSTRUMENTED:
             inner = uninstrumented(sel_slot, UNINSTRUMENTED[tab])
             blurb = ("this builder is recorded by the relay only &mdash; see "
@@ -7163,8 +7243,8 @@ def page(sel_win=None, sel_slot=None, sel_round=None, tab="rounds",
             except Exception as exc:
                 inner = ('<div class="err">winner-only list unavailable: '
                          f"{html.escape(str(exc))[:160]}</div>")
-            blurb = ("what the winner's block carried that our best offer of "
-                     "that round did not.")
+            blurb = ("txns and bundles the winner's block carried that our "
+                     "best offer of that round did not.")
         elif tab == "compare":
             try:
                 d = slot_data(sel_slot)
