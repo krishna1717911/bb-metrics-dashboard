@@ -29,6 +29,8 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import rewards
+
 # ------------------------------------------------------------------- clients
 
 # Comma-separated and tried in order, so a DNS name can carry an IP fallback.
@@ -6745,6 +6747,7 @@ def page(sel_win=None, sel_slot=None, sel_round=None, tab="rounds",
   {deploy_selector("/", {})}
   <a class="navlink" href="{purl("/analysis")}">range analysis</a>
   <a class="navlink" href="{purl("/reference")}">metrics reference &mdash; what is bad?</a>
+  <a class="navlink" href="{purl("/rewards")}">reward distribution by scheduler</a>
 </header>
 {health_html()}
 {strip}
@@ -7855,6 +7858,18 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 body = analysis_page(one("start", "-24h"), one("end", ""),
                                      thr, one("identity", "")).encode()
+            except Exception as exc:
+                body = f"<pre>{html.escape(str(exc))}</pre>".encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self._remember_deployment()
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if parsed.path == "/rewards":
+            try:
+                body = rewards.rewards_page(CSS, purl).encode()
             except Exception as exc:
                 body = f"<pre>{html.escape(str(exc))}</pre>".encode()
             self.send_response(200)
