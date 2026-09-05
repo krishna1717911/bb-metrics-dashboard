@@ -4663,6 +4663,444 @@ def compare_extras(slot):
     return extras
 
 
+# ---------------------------------------------------------------------------
+# What the winner carried that we never offered.
+#
+# gbx_tip_accounts.txt, extracted from simulation-service/src/state.rs at
+# b0f775b43a. Kept with their families because they are NOT interchangeable:
+# only JITO funds the epoch TipDistributionAccount and so is validator income.
+# TITAN is a landing route, GRAVITY is searcher revenue, BIFROST is unresolved.
+# Summing them into one "tip" would overstate what the leader actually earns.
+TIP_ACCOUNTS = {}
+for _fam, _keys in (
+    ("jito", """96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5
+        HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucfZ2bU7gRe
+        Cw8CFyM9FkoMi7K7Crf6HNQqf4uEMzpKw6QNghXLvLkY
+        ADaUMid9yfUytqMBgopwjb2DTLSokTSzL1zt6iGPaS49
+        DfXygSm4jCyNCybVYYK6DwvWqjKee8pbDmJGcLWNDXjh
+        ADuUkR4vqLUMWXxW9gh6D6L8pMSawimctcNZ5pGwDcEt
+        DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL
+        3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT"""),
+    ("bifrost", """BifrU9xXTEebSVftkHTSLyLztJR4yJyHF3kaZ8aEAytZ
+        BiFr9udkWn26s4RLjMZ2iwugibPzRV6ZrXYsHFfHxByJ
+        BifrnpS6g6NUHWcwvTtLMV1D2rKPy28c3JuKdTf2ttEa
+        BifrDg5pq1Jfh3MiGA2YxmvmkpCL1PR4CMCgdaAERaqo
+        BifRXtNG6F5QN1sYDgKTgChd2dPc8okKVbUyp1pyi6cy
+        BifrXhZTj6iwBRVxtcanqf83zZiTDr9QCBoZ2nP6jC2T
+        BiFrewNddv4Ai4kDcDYUWfpZ5qxAfHUZvCDRLL3LsoTo
+        BifrDVX2ZZS3E5uFoqgc22zsdwY6LwrSjverK7xmqetw"""),
+    ("titan", """xk95T6h7nFSRZepEf6JGdv9BCvZLER6dDGXg2KmJ1t1
+        AEg8jYwFpEYXaVd3jMpxPu8V1HXvSvmZr9ms8wm4ub1a
+        HiLntniupDE3Y18j8BtoMtE6MxQdXRfJw3xYCKfBt3t5
+        8bXKHaeUzcYGr8ag8WJVdg2Etiy8vw3TCcb5f3dQ4xaq
+        HtmPJ2k1SzFzLE6Zdu7RXqGxgDPKx2C5Hkdu189B7TXe
+        5yjjgHRL8q4uuWXsg3CAvBJdLQ3NUDwJK17EjHHeCorX
+        DDceWhu2X1x38FWGzjPXnNGnKqJwPYHqTX4Xr2gd6xbW
+        2bERRYFDaZfMNN4TwiFLgm5wntZ457YnmpRBrpSUw9Aj"""),
+    ("gravity", """GbXQ8tZm8rWVXWUDocxLJmFEtjokJiQn9zhQ2yQVjrVb
+        GBxHhTkLWf9BRL7ReFCdLFZkUhateUEpNy2DzTWxoyA3
+        GBXwaPHGboRDoBpvmMyafLXSUFKFfs4NHowjFUpVHTua
+        GBXhAshXxEcurAe8zJ1J2QFs91sGjeKSXAHNq7g5L3XF
+        GBXyRjuAC9LEb5pW9BavGf72tbUuY4SUGNqjBv71dG5M
+        GBXLVmTuhyAtdSreFKYHaZhXM5izwKF9oqfqGbNUw2Ez
+        GBXnrHXZENJZrpCHjSX177XR78e9Pmjmawp2ZukiJcv6
+        GbXyGGt39MyX5yrUEYWpELsp69uoyo3zF8xZyZj3MwCX""")):
+    for _k in _keys.split():
+        TIP_ACCOUNTS[_k] = _fam
+
+COMPUTE_BUDGET = b58decode("ComputeBudget111111111111111111111111111111")
+SYSTEM_PROGRAM = b"\0" * 32
+LAMPORTS_PER_SIG = 5000
+DEFAULT_CU_PER_IX = 200_000
+MAX_TX_CU = 1_400_000
+# How many orders one slot may ask the relayer about. A slot's winner can hold
+# 1,500 refs across its rounds and the query names every one of them.
+MISSING_LOOKUP_CAP = 4000
+
+
+def _cu16(b, pos):
+    """Solana's compact-u16: seven bits a byte, high bit continues."""
+    value = 0
+    for shift in (0, 7, 14):
+        if pos[0] >= len(b):
+            raise ValueError("truncated compact-u16")
+        byte = b[pos[0]]
+        pos[0] += 1
+        value |= (byte & 0x7F) << shift
+        if not byte & 0x80:
+            return value
+    raise ValueError("compact-u16 too long")
+
+
+def tx_costs(raw):
+    """What a transaction declares it will pay and spend, from its own bytes.
+
+    Nothing here is telemetry, so nothing here needs a clock or a join: the
+    signature count fixes the base fee, the ComputeBudget instructions fix the
+    limit and the unit price, and a SystemProgram transfer to a known tip
+    account is a tip. That is deliberate -- these orders were never executed
+    by us, so there is no actual cost to read anywhere. These are the numbers
+    the auction had in front of it when it passed.
+
+    Two honest limits. A transaction that sets no limit is charged the runtime
+    default of 200k per instruction, capped at 1.4M, and is marked implied
+    rather than declared. And a tip paid to an address loaded from an address
+    lookup table cannot be seen here: only the static keys travel in the
+    message, so such a tip reads as zero rather than as a wrong number.
+
+    Raises rather than guesses -- a half-parsed transaction yields a plausible
+    wrong figure, which is worse than a gap."""
+    pos = [0]
+    nsig = _cu16(raw, pos)
+    pos[0] += nsig * 64
+    if pos[0] >= len(raw):
+        raise ValueError("no message")
+    if raw[pos[0]] & 0x80:              # versioned (v0); step over the marker
+        pos[0] += 1
+    req = raw[pos[0]]
+    pos[0] += 3                         # required, ro-signed, ro-unsigned
+    nkeys = _cu16(raw, pos)
+    keys = []
+    for _ in range(nkeys):
+        keys.append(raw[pos[0]:pos[0] + 32])
+        pos[0] += 32
+    pos[0] += 32                        # recent blockhash
+    nix = _cu16(raw, pos)
+
+    cu_limit = cu_price = None
+    tips = {}
+    for _ in range(nix):
+        prog = raw[pos[0]]
+        pos[0] += 1
+        naccts = _cu16(raw, pos)
+        accts = raw[pos[0]:pos[0] + naccts]
+        pos[0] += naccts
+        dlen = _cu16(raw, pos)
+        data = raw[pos[0]:pos[0] + dlen]
+        pos[0] += dlen
+        if prog >= len(keys):
+            continue
+        pid = keys[prog]
+        if pid == COMPUTE_BUDGET and dlen >= 5 and data[0] == 2:
+            cu_limit = int.from_bytes(data[1:5], "little")
+        elif pid == COMPUTE_BUDGET and dlen >= 9 and data[0] == 3:
+            cu_price = int.from_bytes(data[1:9], "little")
+        elif (pid == SYSTEM_PROGRAM and dlen >= 12 and len(accts) >= 2
+              and int.from_bytes(data[0:4], "little") == 2):
+            dest = accts[1]
+            if dest < len(keys):
+                fam = TIP_ACCOUNTS.get(b58encode(keys[dest]))
+                if fam:
+                    tips[fam] = tips.get(fam, 0) + int.from_bytes(
+                        data[4:12], "little")
+
+    declared = (cu_limit if cu_limit is not None
+                else min(DEFAULT_CU_PER_IX * nix, MAX_TX_CU))
+    return {"base": LAMPORTS_PER_SIG * max(req, 1),
+            "prio": (declared * cu_price) // 1_000_000 if cu_price else 0,
+            "tips": tips, "cu": declared, "cu_declared": cu_limit is not None,
+            "cu_price": cu_price or 0, "sigs": max(req, 1)}
+
+
+def relayer(query):
+    """The relay's own packet log — a fourth store, and not the relay Grafana.
+
+    It records what arrived at Astralane's relay and when, which is the only
+    place an order we never offered can be looked up at all: our own telemetry
+    has nothing to say about a transaction we did not carry."""
+    url = os.environ.get("RELAYER_URL", "")
+    if not url:
+        raise RuntimeError("RELAYER_URL is not set")
+    qs = urllib.parse.urlencode(
+        {"user": os.environ.get("RELAYER_USER", ""),
+         "password": os.environ.get("RELAYER_PASS", ""),
+         "database": os.environ.get("RELAYER_DB", "relayer"),
+         "default_format": "TabSeparated"})
+    req = urllib.request.Request(url.rstrip("/") + "/?" + qs,
+                                 data=query.encode())
+    with urllib.request.urlopen(req, timeout=180) as resp:
+        body = resp.read().decode("utf-8", "replace")
+    return [[_tsv(c) for c in line.split("\t")]
+            for line in body.splitlines() if line]
+
+
+_missing_cache = {}
+
+
+def slot_missing(slot):
+    """Per round, the winner's orders that our best offer did not contain.
+
+    "Best offer" is the highest-reward miniblock we sent that round, not the
+    last: the ladder can step down when a late order displaces others, so the
+    final rung is not always the strongest thing we said.
+
+    The difference is taken on identity, not on count -- the SigPrefix for a
+    transaction, the BundleId for a bundle, which is what both sides store.
+    Order is the winner's own: order_refs is their execution order, so a row's
+    position is where in their block it sat.
+
+    Each row is then asked three questions from three stores. Did our check
+    stage refuse it, and why (bifrost_events, same slot). When did it reach
+    the relay (relayer.validator_packet_events, or validator_bundle_events for
+    a bundle). What did it declare it would pay and spend (decoded from the
+    transaction bytes the relay kept).
+
+    The relay only sees what came through Astralane. Measured on slot
+    444530195: 368 of the winner's 1,097 transactions, so about a third. The
+    rest reached the leader by some other route and simply are not in this
+    store -- their cost columns read as a dash, which is "not recorded here",
+    not zero."""
+    key = (dkey(), slot)
+    with _slot_lock:
+        hit = _missing_cache.get(key)
+    if hit is not None:
+        return hit
+    out = _slot_missing_uncached(slot)
+    with _slot_lock:
+        if len(_missing_cache) > 16:
+            _missing_cache.clear()
+        _missing_cache[key] = out
+    return out
+
+
+def _slot_missing_uncached(slot):
+    theirs = slot_winner_refs(slot)
+    if not theirs:
+        return {"rounds": [], "note": "no decodable winner payload for this slot"}
+
+    # our best rung per round, by reward rather than by recency
+    ours = {}
+    best = {}
+    try:
+        _, rows = clickhouse(
+            "SELECT index_in_slot,"
+            " arrayStringConcat(argMax(sig_prefixes, reward), ',') AS pfx,"
+            " arrayStringConcat(argMax(bundle_ids, reward), ',') AS bids,"
+            " max(reward) AS best, count() AS rungs"
+            f" FROM bifrost_miniblocks WHERE slot = {int(slot)}"
+            f" AND kind = 'selected' AND local_builder_id = '{dep()['builder']}'"
+            " GROUP BY index_in_slot")
+        for idx, pfx, bids, rew, rungs in rows:
+            i = ch_int(idx)
+            ours[i] = ({x for x in pfx.split(",") if x}
+                       | {x for x in bids.split(",") if x})
+            best[i] = {"reward": ch_int(rew), "rungs": ch_int(rungs),
+                       "orders": len([x for x in pfx.split(",") if x])
+                       + len([x for x in bids.split(",") if x])}
+    except Exception:
+        pass
+
+    rounds = []
+    lookup_tx, lookup_bundle = set(), set()
+    for idx in sorted(theirs):
+        d = theirs[idx]
+        mine = ours.get(idx, set())
+        items = []
+        seq = 0
+        for raw in d["txs"]:
+            seq += 1
+            k = b58encode(raw)
+            if k not in mine:
+                items.append({"pos": seq, "kind": "tx", "id": k})
+                lookup_tx.add(k)
+        for raw in (d.get("bundle_ids") or []):
+            seq += 1
+            k = raw.hex()
+            if k not in mine:
+                items.append({"pos": seq, "kind": "bundle", "id": k})
+                lookup_bundle.add(k)
+        rounds.append({"round": idx, "items": items,
+                       "winner_orders": len(d["txs"]) + len(d.get("bundle_ids") or []),
+                       "ours": best.get(idx)})
+
+    drops = {}
+    try:
+        _, rows = clickhouse(
+            "SELECT DISTINCT entity, reason FROM bifrost_events "
+            f"WHERE nums['slot'] = {int(slot)} AND event = 'check_dropped' "
+            f"AND instance_id = '{dep()['instance']}' AND entity != '' "
+            "LIMIT 400000")
+        for entity, reason in rows:
+            drops.setdefault(entity, []).append(reason)
+    except Exception:
+        pass
+
+    seen = _relayer_lookup(slot, lookup_tx, lookup_bundle)
+    for r in rounds:
+        for it in r["items"]:
+            it["reasons"] = drops.get(it["id"]) or []
+            it["dropped"] = bool(it["reasons"])
+            it.update(seen.get(it["id"]) or {})
+    return {"rounds": rounds, "note": "",
+            "looked_up": len(lookup_tx) + len(lookup_bundle),
+            "found": len(seen)}
+
+
+def _relayer_lookup(slot, prefixes, bundles):
+    """Arrival and declared cost for the orders we are asking about."""
+    out = {}
+    if not (os.environ.get("RELAYER_URL") and (prefixes or bundles)):
+        return out
+    pfx = sorted(prefixes)[:MISSING_LOOKUP_CAP]
+    bids = sorted(bundles)[:MISSING_LOOKUP_CAP]
+    if pfx:
+        quoted = ",".join(
+            "'" + p + "'" for p in pfx if re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{1,44}", p))
+        try:
+            rows = relayer(
+                "SELECT base58Encode(substring(base58Decode(signature),1,16)) AS k,"
+                " min(toUInt64(recv_ts)) AS recv, any(approx_slot) AS aslot,"
+                " argMin(tx_body, recv_ts) AS body, count() AS n"
+                " FROM relayer.validator_packet_events"
+                f" WHERE approx_slot BETWEEN {int(slot) - 40} AND {int(slot) + 4}"
+                "   AND signature IS NOT NULL AND tx_body IS NOT NULL"
+                f"   AND k IN ({quoted}) GROUP BY k")
+            for k, recv, aslot, body, n in rows:
+                rec = {"recv_ms": ch_int(recv), "approx_slot": ch_int(aslot),
+                       "seen": ch_int(n)}
+                try:
+                    rec.update(tx_costs(base64.b64decode(body)))
+                except Exception:
+                    rec["parse_err"] = True
+                out[k] = rec
+        except Exception:
+            pass
+    if bids:
+        quoted = ",".join("'" + b + "'" for b in bids
+                          if re.fullmatch(r"[0-9a-f]{64}", b))
+        if quoted:
+            try:
+                rows = relayer(
+                    "SELECT bundle_uuid AS k, toUInt64(min(recv_ts)) * 1000 AS recv,"
+                    " any(approx_slot) AS aslot, any(num_transactions) AS ntx,"
+                    " count() AS n FROM relayer.validator_bundle_events"
+                    f" WHERE bundle_uuid IN ({quoted}) GROUP BY k")
+                for k, recv, aslot, ntx, n in rows:
+                    out[k] = {"recv_ms": ch_int(recv), "approx_slot": ch_int(aslot),
+                              "txs": ch_int(ntx), "seen": ch_int(n)}
+            except Exception:
+                pass
+    return out
+
+
+def _tip_total(tips):
+    return sum((tips or {}).values())
+
+
+def missing_html(slot, data):
+    """One row per winner order our best offer of that round did not hold."""
+    if data is None:
+        return ('<div class="panel"><div class="dtlhead">winner-only orders'
+                "</div><div class=none>nothing to compare</div></div>")
+    if data.get("note"):
+        return ('<div class="panel"><div class="dtlhead">winner-only orders'
+                f'</div><div class=none>{html.escape(data["note"])}</div></div>')
+    rounds = data.get("rounds") or []
+    total = sum(len(r["items"]) for r in rounds)
+    have_relayer = bool(os.environ.get("RELAYER_URL"))
+    body = []
+    for r in rounds:
+        mine = r.get("ours")
+        head = (f'<div class="msh">round {r["round"]}'
+                f'<span class="dim">{len(r["items"]):,} of '
+                f'{r["winner_orders"]:,} winner orders were not in our best '
+                "offer</span>")
+        if mine:
+            head += (f'<span class="dim">our best rung: {mine["orders"]:,} '
+                     f'orders, {sol(mine["reward"])} SOL, of {mine["rungs"]:,} '
+                     "sent</span>")
+        else:
+            head += '<span class="warn">we offered nothing this round</span>'
+        head += "</div>"
+        if not r["items"]:
+            body.append(f'<div class="mssec">{head}<div class="none">our best '
+                        "offer held every order the winner used</div></div>")
+            continue
+        rows = []
+        for it in r["items"]:
+            tips = it.get("tips") or {}
+            jito = tips.get("jito", 0)
+            other = _tip_total(tips) - jito
+            known = "cu" in it
+            if known:
+                total_lam = it["base"] + it["prio"] + _tip_total(tips)
+                rew = (f'<td class="n m">{sol(total_lam)}</td>'
+                       f'<td class="n m dim">{it["base"]:,}</td>'
+                       f'<td class="n m dim">{it["prio"]:,}</td>'
+                       f'<td class="n m">{jito:,}</td>'
+                       + (f'<td class="n m dim" title="'
+                          + html.escape(", ".join(f"{k} {v:,}" for k, v in tips.items()
+                                                  if k != "jito"), quote=True)
+                          + f'">{other:,}</td>' if other else
+                          '<td class="n m dim">&mdash;</td>'))
+                cu = (f'<td class="n m">{it["cu"]:,}</td>'
+                      if it.get("cu_declared") else
+                      f'<td class="n m dim" title="no ComputeBudget limit set; '
+                      f'the runtime default applies">{it["cu"]:,}*</td>')
+                cu += f'<td class="n m dim">{it.get("cu_price", 0):,}</td>'
+            else:
+                rew = '<td class="n m dim" colspan=5>&mdash;</td>'
+                cu = '<td class="n m dim" colspan=2>&mdash;</td>'
+            recv = it.get("recv_ms")
+            arrival = (f'<td class="m dim">'
+                       f'{dt.datetime.fromtimestamp(recv / 1000, dt.UTC).strftime("%H:%M:%S.%f")[:-3]}'
+                       "</td>") if recv else '<td class="m dim">&mdash;</td>'
+            aslot = it.get("approx_slot")
+            aslot_td = (f'<td class="n m dim">{aslot:,}</td>' if aslot
+                        else '<td class="n m dim">&mdash;</td>')
+            if it["dropped"]:
+                flag = '<td class="m bad">yes</td>'
+                why = ('<td class="m">'
+                       + "; ".join(html.escape(x or "(no reason given)")
+                                   for x in it["reasons"]) + "</td>")
+            else:
+                flag = '<td class="m dim">no</td>'
+                why = '<td class="m dim">&mdash;</td>'
+            rows.append(
+                f'<tr><td class="n m dim">{it["pos"]}</td>'
+                f'<td class="m">{it["kind"]}</td>'
+                f'<td class="m hascp"><code>{html.escape(it["id"])}</code>'
+                f'{copy_btn(it["id"])}</td>'
+                + rew + cu + aslot_td + arrival + flag + why + "</tr>")
+        body.append(
+            f'<div class="mssec">{head}<table class="atab mstab">'
+            "<tr><th class=n>#</th><th>kind</th><th>order</th>"
+            "<th class=n>reward</th><th class=n>base</th><th class=n>prio</th>"
+            "<th class=n>jito tip</th><th class=n>other tip</th>"
+            "<th class=n>CU</th><th class=n>&micro;lam/CU</th>"
+            "<th class=n>approx slot</th><th>reached relay</th>"
+            "<th>dropped</th><th>reason</th></tr>"
+            + "".join(rows) + "</table></div>")
+
+    found = data.get("found", 0)
+    asked = data.get("looked_up", 0)
+    cov = (f"{found:,} of {asked:,} ({100.0 * found / asked:.0f}%)"
+           if asked else "none")
+    note = (
+        '<div class="anote">Each row is an order the winner\'s block carried '
+        "that our highest-reward offer of that round did not, matched on the "
+        "<code>SigPrefix</code> for a transaction and the <code>BundleId</code>"
+        " for a bundle. <b>#</b> is its position in the winner's execution "
+        "order. <b>reward</b>, <b>CU</b> and the fee split are decoded from "
+        "the transaction's own bytes -- what it declared it would pay, which "
+        "is what the auction judged; these orders were never executed by us, "
+        "so no actual cost exists to read. A CU marked <code>*</code> set no "
+        "ComputeBudget limit and gets the runtime default. <b>dropped</b> is "
+        "our own check stage refusing it, with the simulator's reason."
+        f" Arrival and cost come from the relay's packet log, which had {cov}"
+        " of these orders: it records only what came through Astralane, so a "
+        "dash means not recorded there rather than zero. A tip paid to an "
+        "address loaded from a lookup table is invisible in the message and "
+        "reads as zero.</div>")
+    if not have_relayer:
+        note = ('<div class="anote warn">RELAYER_URL is not set, so no arrival '
+                "or declared-cost columns can be filled.</div>") + note
+    return ('<div class="panel"><div class="dtlhead">winner-only orders'
+            f'<span class="note">{total:,} across {len(rounds)} round'
+            f'{"" if len(rounds) == 1 else "s"}</span></div>'
+            + "".join(body) + note + "</div>")
+
+
 def compare_html(slot, rounds, extends, commits, relay_rounds=None,
                  relay_err=None, extras=None, shreds=None):
     """Round-by-round: what won, what we offered, and what the lane spent.
@@ -5469,6 +5907,14 @@ details.around>summary:hover{background:#111c26}
 .depwho .dwk{color:#4d5c70;font-size:9.5px;text-transform:uppercase;
   letter-spacing:.06em;margin:0 2px 0 8px}
 .depwho .dwnone{color:#7a5c2a}
+.mssec{margin:0 0 14px}
+.msh{display:flex;flex-wrap:wrap;align-items:baseline;gap:12px;margin:12px 0 6px;
+  font-size:12px;color:#cfe0f0;font-weight:600}
+.msh .dim{font-weight:400;font-size:11px}
+.msh .warn{font-weight:400;font-size:11px;color:#fbbf24}
+table.mstab{font-size:11px}
+table.mstab code{font-size:10.5px}
+table.mstab td.bad{color:#f87171}
 /* connector grading */
 .gradesel{display:inline-flex;align-items:center;gap:5px;margin-left:14px}
 .gradechip{display:inline-block;padding:1px 9px;border:1px solid #22303f;
@@ -6014,7 +6460,7 @@ NAV_JS = r"""
   // Warm the rest of the window: every tab of every slot in it. Two at a time
   // and only once the page is idle, so the view the user is actually looking
   // at never waits behind a prefetch.
-  var TABS = ['', 'compare', 'timeline', 'offers', 'dag', 'logs'];
+  var TABS = ['', 'compare', 'timeline', 'offers', 'dag', 'missing', 'logs'];
   function prefetchAll(){
     var here = new URL(location.href);
     var win = here.searchParams.get('win');
@@ -6659,11 +7105,13 @@ def page(sel_win=None, sel_slot=None, sel_round=None, tab="rounds",
             f'href="{base}{"" if key == "rounds" else "&tab=" + key}">{label}</a>'
             for key, label in (("rounds", "rounds"), ("compare", "comparison"),
                                ("timeline", "timeline"), ("offers", "offer timeline"),
-                               ("dag", "dag"), ("logs", "logs")))
+                               ("dag", "dag"), ("missing", "winner-only"),
+                               ("logs", "logs")))
         # A relay-only builder has no instrumentation of ours behind any of
         # these, so they are answered once here instead of each discovering
         # emptiness on its own.
-        UNINSTRUMENTED = {"dag": "dispatch DAG"}
+        UNINSTRUMENTED = {"dag": "dispatch DAG",
+                          "missing": "winner-only order list"}
         if dep().get("source") == "relay" and tab in UNINSTRUMENTED:
             inner = uninstrumented(sel_slot, UNINSTRUMENTED[tab])
             blurb = ("this builder is recorded by the relay only &mdash; see "
@@ -6709,6 +7157,14 @@ def page(sel_win=None, sel_slot=None, sel_round=None, tab="rounds",
                          f"{html.escape(str(exc))[:160]}</div>")
             blurb = ("everything that happened in this slot, in order, on a "
                      "single clock.")
+        elif tab == "missing":
+            try:
+                inner = missing_html(sel_slot, slot_missing(sel_slot))
+            except Exception as exc:
+                inner = ('<div class="err">winner-only list unavailable: '
+                         f"{html.escape(str(exc))[:160]}</div>")
+            blurb = ("what the winner's block carried that our best offer of "
+                     "that round did not.")
         elif tab == "compare":
             try:
                 d = slot_data(sel_slot)
@@ -7905,7 +8361,7 @@ class Handler(BaseHTTPRequestHandler):
             src = qs.get("src", ["ours"])[0]
             body = page(as_int("win"), as_int("slot"), as_int("round"),
                         tab if tab in ("compare", "timeline", "offers", "dag",
-                                       "logs") else "rounds",
+                                       "missing", "logs") else "rounds",
                         src if src in ("ours", "winner") else "ours",
                         partial=qs.get("partial", ["0"])[0] == "1",
                         grade=("graded" if qs.get("grade", [""])[0] == "graded"
