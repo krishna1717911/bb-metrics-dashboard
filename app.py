@@ -4716,6 +4716,9 @@ MAX_TX_CU = 1_400_000
 # How many orders one slot may ask the relayer about. A slot's winner can hold
 # 1,500 refs across its rounds and the query names every one of them.
 MISSING_LOOKUP_CAP = 4000
+# The one winner_order_refused outcome that explains nothing: see the
+# comment where it is filtered.
+REPLAY_SELF_COLLISION = "ALREADY_PROCESSED"
 
 
 def _cu16(b, pos):
@@ -4916,12 +4919,13 @@ def _slot_missing_uncached(slot):
     drops = {}
     try:
         _, rows = clickhouse(
-            "SELECT DISTINCT entity, reason FROM bifrost_events "
+            "SELECT DISTINCT entity, stage, event, reason FROM bifrost_events "
             f"WHERE nums['slot'] = {int(slot)} AND event = 'check_dropped' "
             f"AND instance_id = '{dep()['instance']}' AND entity != '' "
             "LIMIT 400000")
-        for entity, reason in rows:
-            drops.setdefault(entity, []).append(reason)
+        for entity, stage, event, reason in rows:
+            drops.setdefault(entity, []).append(
+                {"stage": stage, "event": event, "text": reason})
     except Exception:
         pass
 
@@ -4935,18 +4939,30 @@ def _slot_missing_uncached(slot):
     try:
         _, rows = clickhouse(
             "SELECT entity, event, attrs['outcome'] AS outcome,"
-            " attrs['error'] AS error, nums['cu'] AS cu, reason"
+            " attrs['error'] AS error, nums['cu'] AS cu, reason, stage"
             f" FROM bifrost_events WHERE nums['slot'] = {int(slot)}"
             f" AND instance_id = '{dep()['instance']}' AND entity != ''"
             " AND event IN ('executed', 'winner_order_refused') LIMIT 400000")
-        for entity, event, outcome, error, cu, reason in rows:
+        for entity, event, outcome, error, cu, reason, stage in rows:
             rec = mine.setdefault(entity, {})
             if event == "executed":
                 rec["exec_cu"] = ch_int(cu)
                 rec["exec_outcome"] = reason
+            elif outcome == REPLAY_SELF_COLLISION:
+                # Not a reason this order went unoffered, and not evidence of
+                # anything lost. It is our replay of the winner's block meeting
+                # that same block's own work already in the bank: on slot
+                # 445016093 round 0, 39 of the orders refused this way landed
+                # in the very miniblock uuid being replayed, 41 ms earlier.
+                # It is also causally downstream -- measured after the auction
+                # closed, so it cannot explain a decision taken before it.
+                # Counted so the page can say it was set aside, never shown as
+                # a cause.
+                rec["self_collision"] = True
             else:
                 rec["refused"] = outcome or "refused"
-                rec["refused_why"] = error
+                rec["refused_why"] = {"stage": stage, "event": event,
+                                      "text": error}
     except Exception:
         pass
 
@@ -4958,6 +4974,8 @@ def _slot_missing_uncached(slot):
             it.update(mine.get(it["id"]) or {})
             it.update(seen.get(it["id"]) or {})
     return {"rounds": rounds, "note": "",
+            "self_collisions": sum(1 for r in rounds for i in r["items"]
+                                   if i.get("self_collision")),
             "looked_up": len(lookup_tx) + len(lookup_bundle),
             "found": len(seen)}
 
@@ -5132,12 +5150,18 @@ def missing_html(slot, data):
             refused = it.get("refused")
             ref_td = (f'<td class="m bad">{html.escape(refused)}</td>' if refused
                       else '<td class="m dim">&mdash;</td>')
-            why_bits = [x for x in it["reasons"] if x]
-            if it.get("refused_why"):
+            why_bits = [x for x in it["reasons"] if x.get("text")]
+            if it.get("refused_why", {}).get("text"):
                 why_bits.append(it["refused_why"])
+            seen_why = {}
+            for x in why_bits:
+                seen_why.setdefault((x["stage"], x["event"], x["text"]), x)
             why = (('<td class="m">'
-                    + "; ".join(html.escape(x) for x in dict.fromkeys(why_bits))
-                    + "</td>") if why_bits
+                    + " ".join(
+                        f'<span class="evsrc">{html.escape(x["stage"])}'
+                        f'&middot;{html.escape(x["event"])}</span> '
+                        f'{html.escape(x["text"])}' for x in seen_why.values())
+                    + "</td>") if seen_why
                    else '<td class="m dim">&mdash;</td>')
             kind = it["kind"]
             if kind == "bundle" and it.get("txs"):
@@ -5165,6 +5189,15 @@ def missing_html(slot, data):
     asked = data.get("looked_up", 0)
     cov = (f"{found:,} of {asked:,} ({100.0 * found / asked:.0f}%)"
            if asked else "none")
+    sup = data.get("self_collisions") or 0
+    supline = (
+        f" <b>{sup:,}</b> row{'' if sup == 1 else 's'} here also carried a"
+        " replay-time <code>ALREADY_PROCESSED</code> refusal, which is"
+        " deliberately not shown as a reason: that is our replay of the"
+        " winner's block meeting that same block's own work already in the"
+        " bank, and it is measured after the auction closed, so it cannot"
+        " explain why the order went unoffered. Nothing was lost to it --"
+        " those orders are in the winner's block." if sup else "")
     note = (
         '<div class="anote">Each row is an order the winner\'s block carried '
         "that our highest-reward offer of that round did not, matched on the "
@@ -5187,7 +5220,7 @@ def missing_html(slot, data):
         " of these orders: it records only what came through Astralane, so a "
         "dash means not recorded there rather than zero. A tip paid to an "
         "address loaded from a lookup table is invisible in the message and "
-        "reads as zero.</div>")
+        "reads as zero." + supline + "</div>")
     if not have_relayer:
         note = ('<div class="anote warn">RELAYER_URL is not set, so no arrival '
                 "or declared-cost columns can be filled.</div>") + note
@@ -6011,6 +6044,10 @@ details.around>summary:hover{background:#111c26}
 table.mstab{font-size:11px}
 table.mstab code{font-size:10.5px}
 table.mstab td.bad{color:#f87171}
+.evsrc{display:inline-block;color:#61748b;font-size:9.5px;
+  font-family:ui-monospace,SFMono-Regular,monospace;
+  background:#0f1720;border:1px solid #1b2733;border-radius:4px;
+  padding:0 4px;margin-right:4px;white-space:nowrap}
 table.mstab td.ord{white-space:nowrap}
 table.mstab td.ord code{font-size:10.5px}
 td.ord .ell{color:#4d5c70}
