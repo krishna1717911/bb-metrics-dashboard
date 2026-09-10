@@ -155,25 +155,36 @@ def _axes(svg, L, T, pw, ph, xlab, ylab, xt, yt, W, H):
                f'text-anchor="middle">{ylab}</text>')
 
 
-def _sankey(P, side, title, col):
-    """Where a cohort's gross inflow ends up, over the selected range.
-
-    Three columns: source stream -> intermediate -> destination. Link height is
-    proportional to SOL, so the 6% Jito ribbon and the staker ribbon are read
-    directly against the fee ribbon.
-    """
-    fee, jg, jn = P["fee"] / 1e9, P["jito_gross"] / 1e9, P["jito_net"] / 1e9
-    oth = P["other"] / 1e9
-    jito_cut = jg - jn
+def _sankey_flows(P):
+    """Per-slot flows for one cohort. Everything divided by that cohort's own
+    slot count, so a 77k-slot cohort and a 1.5M-slot one are on one scale."""
+    n = max(P["slots"], 1)
+    fee = P["fee"] / 1e9 / n
+    jg = P["jito_gross"] / 1e9 / n
+    jn = P["jito_net"] / 1e9 / n
+    oth = P["other"] / 1e9 / n
     keep = jn * P["comm_bps"] / 10000.0
-    stake = jn - keep
-    gross = fee + jg + oth
-    if gross <= 0:
+    return dict(fee=fee, jg=jg, jn=jn, oth=oth, jito_cut=jg - jn,
+                keep=keep, stake=jn - keep, gross=fee + jg + oth)
+
+
+def _sankey(P, side, title, col, scale_gross):
+    """Where a cohort's gross inflow ends up, PER SLOT, over the range.
+
+    Three columns: source stream -> intermediate -> destination. Ribbon height
+    is proportional to SOL per slot, and `scale_gross` is shared by both
+    cohorts' diagrams, so ribbons are comparable BETWEEN them and not just
+    within one. Without that the two would each fill the panel and look equal.
+    """
+    F = _sankey_flows(P)
+    fee, jg, jn, oth = F["fee"], F["jg"], F["jn"], F["oth"]
+    jito_cut, keep, stake, gross = F["jito_cut"], F["keep"], F["stake"], F["gross"]
+    if gross <= 0 or scale_gross <= 0:
         return "", []
     W, H = 1010, 250
     T, B, LW = 26, 26, 150
     ph = H - T - B
-    scale = ph / gross
+    scale = ph / scale_gross
     x0, x1, x2, x3 = 24, 24 + LW, 24 + LW * 2 + 210, 24 + LW * 3 + 300
     sv = []
 
@@ -184,7 +195,7 @@ def _sankey(P, side, title, col):
         tx = x + 16 if anchor == "start" else x - 6
         sv.append(f'<text x="{tx:.0f}" y="{y+h/2+3.5:.1f}" fill="#c3d3e6" '
                   f'font-size="10.5" text-anchor="{anchor}">{lab} '
-                  f'<tspan fill="#6b7f96">{val:,.1f}</tspan></text>')
+                  f'<tspan fill="#6b7f96">{val:.6f}</tspan></text>')
 
     def link(xa, ya, xb, yb, h, c, op=0.34):
         h = max(h, 1.2)
@@ -231,9 +242,12 @@ def _sankey(P, side, title, col):
              y_keep + h_fee + keep * scale, h_o, C_OTHER)
 
     sv.append(f'<text x="{x0}" y="{T-10}" fill="#8fa6bf" font-size="11" '
-              f'font-weight="600">{title} &mdash; SOL over the range</text>')
-    facts = [("gross inflow", gross), ("Jito 6% cut", jito_cut),
-             ("to stakers", stake), ("validator keeps", fee + keep + oth)]
+              f'font-weight="600">{title} &mdash; SOL per slot '
+              f'<tspan fill="#6b7f96">({P["slots"]:,} slots)</tspan></text>')
+    facts = [("gross inflow / slot", gross), ("fees / slot", fee),
+             ("Jito tips gross / slot", jg), ("Jito 6% cut / slot", jito_cut),
+             ("to stakers / slot", stake),
+             ("validator keeps / slot", fee + keep + oth)]
     return (f'<svg viewBox="0 0 {W} {H}" width="100%" '
             f'style="max-width:{W}px;display:block" role="img" '
             f'aria-label="{title} revenue flow: gross inflow to Jito '
@@ -313,16 +327,28 @@ def rewards_page(CSS, purl, d_from=None, d_to=None):
         for q in (.50, .90):
             v = _pct(P["hist"], P["slots"], q)
             if v <= xmax:
+                dy = -11 if c == C_GBX else 15
                 p2.append(f'<circle cx="{sx2(v):.1f}" cy="{sy2(q):.1f}" r="4.4" '
                           f'fill="{c}" stroke="#0e151d" stroke-width="2"/>')
-    p2.append(f'<line id="rw-cross" x1="0" y1="{T2}" x2="0" y2="{T2+ph2}" '
+                p2.append(f'<text x="{sx2(v):.1f}" y="{sy2(q)+dy:.1f}" '
+                          f'text-anchor="middle" fill="{c}" font-size="9.5" '
+                          f'font-weight="600">{v:.4f}</text>')
+    # horizontal: the mouse picks a PERCENTILE, and the tooltip reads each
+    # cohort's SOL at that level -- the horizontal gap is the revenue gap.
+    p2.append(f'<line id="rw-cross" x1="{L2}" y1="0" x2="{L2+pw2}" y2="0" '
               f'stroke="#5eead4" stroke-width="1" stroke-dasharray="3 3" '
               f'opacity="0"/>')
+    p2.append(f'<circle id="rw-dg" r="5" fill="none" stroke="{C_GBX}" '
+              f'stroke-width="2" opacity="0"/>')
+    p2.append(f'<circle id="rw-dh" r="5" fill="none" stroke="{C_HARM}" '
+              f'stroke-width="2" opacity="0"/>')
     p2.append(f'<rect id="rw-hit" x="{L2}" y="{T2}" width="{pw2}" '
               f'height="{ph2}" fill="transparent"/>')
 
-    sk_g, f_g = _sankey(G, "gbx", "GBX", C_GBX)
-    sk_h, f_h = _sankey(Hm, "harm", "Agave Harmonic", C_HARM)
+    # one scale for both diagrams: the larger per-slot gross sets the height
+    sg_max = max(_sankey_flows(G)["gross"], _sankey_flows(Hm)["gross"])
+    sk_g, f_g = _sankey(G, "gbx", "GBX", C_GBX, sg_max)
+    sk_h, f_h = _sankey(Hm, "harm", "Agave Harmonic", C_HARM, sg_max)
 
     tiles = [
         ("GBX mean / slot", f"{gm:.6f}", f"{G['slots']:,} slots", ""),
@@ -389,12 +415,15 @@ def rewards_page(CSS, purl, d_from=None, d_to=None):
             f'<td>{g["comm_bps"]/100:.1f}%</td><td>{h["comm_bps"]/100:.1f}%</td>'
             f'<td>{g["other"]/max(g["slots"],1)/1e9:.6f}</td></tr>')
 
-    js = json.dumps({"gbx": _curve(G["hist"], G["slots"], xmax),
-                     "harm": _curve(Hm["hist"], Hm["slots"], xmax),
-                     "xmax": xmax})
+    # exact p1..p100 in SOL, so the tooltip inverts the curve without
+    # re-reading the sampled polyline
+    js = json.dumps({
+        "gbx": [_pct(G["hist"], G["slots"], q / 100) for q in range(1, 101)],
+        "harm": [_pct(Hm["hist"], Hm["slots"], q / 100) for q in range(1, 101)],
+        "xmax": xmax})
     cav = "".join(f"<li>{html.escape(c)}</li>" for c in meta["caveats"])
     facts = "".join(
-        f'<tr><td>{n}</td><td>{a:,.2f}</td><td>{b:,.2f}</td></tr>'
+        f'<tr><td>{n}</td><td>{a:.6f}</td><td>{b:.6f}</td></tr>'
         for (n, a), (_, b) in zip(f_g, f_h))
 
     return f"""<!doctype html><html><head><meta charset="utf-8">
@@ -434,8 +463,10 @@ def rewards_page(CSS, purl, d_from=None, d_to=None):
     <div class="cs">Exact empirical CDF pooled over the selected range: at
       revenue <i>x</i>, the height is the share of that cohort's slots earning
       at or below <i>x</i>. Lower and further right is better. Markers show p50
-      and p90. Pooling is exact because the source is 0.5 mSOL histograms
-      &mdash; bin counts sum across days where percentiles could not.</div>
+      and p90 with their SOL values. Pooling is exact because the source is
+      0.5 mSOL histograms &mdash; bin counts sum across days where percentiles
+      could not. <b>Hover reads horizontally</b>: pick a percentile and compare
+      each cohort's SOL at that level, which is the gap that matters.</div>
     <svg viewBox="0 0 {W2} {H2}" width="100%"
          style="max-width:{W2}px;display:block" role="img"
          aria-label="Empirical CDF of per-slot revenue pooled over
@@ -451,12 +482,14 @@ def rewards_page(CSS, purl, d_from=None, d_to=None):
     {sk_g}{sk_h}
     <div class="rw-legend">{sk_lg}</div>
     <table class="rw-tbl" style="max-width:520px">
-      <thead><tr><th>over the range</th><th>GBX</th>
+      <thead><tr><th>SOL per slot</th><th>GBX</th>
         <th>Agave Harmonic</th></tr></thead>
       <tbody>{facts}</tbody>
     </table>
-    <div class="rw-note">SOL. Ribbon height is proportional to SOL, so the 6%
-      Jito cut and the staker share read directly against the fee stream.
+    <div class="rw-note">Every flow is <b>per slot</b>, and both diagrams share
+      one scale, so ribbons are comparable between the two cohorts as well as
+      within each. Without that, GBX's {G['slots']:,} slots and Harmonic's
+      {Hm['slots']:,} would each fill the panel and look equal.
       Harmonic's staker ribbon is the wider one relative to its tips: its
       operators run {Hm['comm_bps']/100:.1f}% MEV commission against GBX's
       {G['comm_bps']/100:.1f}%, so they keep more of each tip.</div>
@@ -490,30 +523,41 @@ def rewards_page(CSS, purl, d_from=None, d_to=None):
   var boxes=document.querySelectorAll('.rw-box svg'), svg=boxes[1],
       hit=document.getElementById('rw-hit'),
       cross=document.getElementById('rw-cross'),
+      dg=document.getElementById('rw-dg'), dh=document.getElementById('rw-dh'),
       tip=document.getElementById('rw-tip');
   if(!svg||!hit) return;
-  function pick(a,x){{
-    for(var i=0;i<a.length;i++){{ if(a[i][0]>=x) return a[i][1]; }}
-    return a.length?a[a.length-1][1]:0;
-  }}
+  function px(v){{ return L+PW*Math.min(v/D.xmax,1); }}
   hit.addEventListener('mousemove',function(ev){{
-    var r=svg.getBoundingClientRect(), k=VB/r.width;
-    var f=Math.min(1,Math.max(0,((ev.clientX-r.left)*k-L)/PW)), x=f*D.xmax;
-    cross.setAttribute('x1',L+PW*f); cross.setAttribute('x2',L+PW*f);
+    var r=svg.getBoundingClientRect(), k=VB/r.height;
+    // the mouse picks a percentile off the y axis
+    var f=Math.min(1,Math.max(0,1-((ev.clientY-r.top)*k-T)/PH));
+    var q=Math.min(100,Math.max(1,Math.round(f*100)));
+    var y=T+PH*(1-q/100);
+    var g=D.gbx[q-1], h=D.harm[q-1];
+    cross.setAttribute('y1',y); cross.setAttribute('y2',y);
     cross.setAttribute('opacity','1');
-    var h='<div class="tx">'+x.toFixed(5)+' SOL</div>';
-    h+='<div class="tr"><span class="rw-sw" style="background:{C_GBX}"></span>'
-      +'<span>GBX</span><span>'+(pick(D.gbx,x)*100).toFixed(1)+'%</span></div>';
-    h+='<div class="tr"><span class="rw-sw" style="background:{C_HARM}"></span>'
-      +'<span>Agave Harmonic</span><span>'
-      +(pick(D.harm,x)*100).toFixed(1)+'%</span></div>';
-    tip.innerHTML=h; tip.style.display='block';
+    dg.setAttribute('cx',px(g)); dg.setAttribute('cy',y);
+    dg.setAttribute('opacity', g<=D.xmax?'1':'0');
+    dh.setAttribute('cx',px(h)); dh.setAttribute('cy',y);
+    dh.setAttribute('opacity', h<=D.xmax?'1':'0');
+    var pct=h>0?((g/h-1)*100):0;
+    var sign=pct>=0?'+':'';
+    var hh='<div class="tx">p'+q+'</div>';
+    hh+='<div class="tr"><span class="rw-sw" style="background:{C_GBX}"></span>'
+      +'<span>GBX</span><span>'+g.toFixed(5)+' SOL</span></div>';
+    hh+='<div class="tr"><span class="rw-sw" style="background:{C_HARM}"></span>'
+      +'<span>Agave Harmonic</span><span>'+h.toFixed(5)+' SOL</span></div>';
+    hh+='<div class="tr" style="border-top:1px solid #22303f;margin-top:6px;'
+      +'padding-top:5px"><span>GBX vs H</span><span style="color:'
+      +(pct>=0?'#5eead4':'#fca5a5')+'">'+sign+pct.toFixed(1)+'%</span></div>';
+    tip.innerHTML=hh; tip.style.display='block';
     var tw=tip.offsetWidth, th=tip.offsetHeight;
     tip.style.left=Math.min(window.innerWidth-tw-12,ev.clientX+16)+'px';
     tip.style.top=Math.max(8,ev.clientY-th/2)+'px';
   }});
   hit.addEventListener('mouseleave',function(){{
     cross.setAttribute('opacity','0'); tip.style.display='none';
+    dg.setAttribute('opacity','0'); dh.setAttribute('opacity','0');
   }});
 }})();
 </script>
