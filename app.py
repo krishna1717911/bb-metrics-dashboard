@@ -8477,7 +8477,9 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 qs2 = urllib.parse.parse_qs(parsed.query)
                 body = rewards.rewards_page(
-                    CSS, purl, (qs2.get("day", [""])[0] or None)).encode()
+                    CSS, purl,
+                    (qs2.get("from", [""])[0] or None),
+                    (qs2.get("to", [""])[0] or None)).encode()
             except Exception as exc:
                 body = f"<pre>{html.escape(str(exc))}</pre>".encode()
             self.send_response(200)
