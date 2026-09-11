@@ -5,10 +5,18 @@ Kept out of app.py deliberately: a self-contained feature over a static
 rewards_daily.json, where app.py is already 8k lines several people edit.
 app.py needs only the route and the nav link.
 
-The data is per-day 0.5 mSOL HISTOGRAMS, not per-day percentiles. That is what
-makes an arbitrary date range exact: bin counts sum across days, percentiles do
-not. Every curve and every percentile here is computed from summed bins at
-request time, so ?from=/?to= can name any sub-range without a re-pull.
+The data is per-day 0.5 mSOL histograms carrying both a slot count and an exact
+SOL sum per bin. Histograms are what make an arbitrary date range exact: bin
+counts and sums add across days, percentiles do not. Every curve, percentile
+and trimmed mean here is computed from summed bins at request time, so ?from=
+and ?to= can name any sub-range without a re-pull.
+
+Three line panels, in the order the argument runs:
+  1. the ECDF -- what the two distributions look like
+  2. the quantile ratio harmonic(p)/gbx(p) -- WHERE they differ
+  3. the cumulative share of the mean gap -- how much of the total gap each
+     part of the distribution accounts for
+then the Sankeys, which follow the money rather than compare it.
 
 Regenerating the data is an offline step (Dune + reports.firedancer.io + kobe);
 nothing here queries anything at request time.
@@ -22,83 +30,32 @@ REWARDS_JSON = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                             "rewards_daily.json")
 
 BIN = 0.0005          # SOL per histogram bucket
+TRIM_LO, TRIM_HI = 0.01, 0.99
 C_GBX = "#3987e5"
 C_HARM = "#d95926"
-C_FEE = "#199e70"     # sankey: kept-in-full stream
-C_JITO = "#c98500"    # sankey: jito's own cut
-C_STAKE = "#9085e9"   # sankey: staker share
-C_OTHER = "#d55181"   # sankey: titan/bifrost
-
-REWARDS_CSS = """
-.rw-wrap{margin:16px 28px 34px}
-.rw-hero{display:flex;gap:10px;flex-wrap:wrap;margin:0 0 18px}
-.rw-tile{background:#0e151d;border:1px solid #1e2937;border-radius:10px;
-  padding:12px 16px;min-width:148px}
-.rw-tile .k{color:#6b7f96;font-size:10px;text-transform:uppercase;
-  letter-spacing:.07em}
-.rw-tile .v{color:#dbe4ee;font-size:20px;font-weight:650;margin-top:5px;
-  font-variant-numeric:tabular-nums}
-.rw-tile .d{color:#6b7f96;font-size:11px;margin-top:3px}
-.rw-tile .up{color:#5eead4}
-.rw-tile .dn{color:#fca5a5}
-.rw-box{background:#0e151d;border:1px solid #1e2937;border-radius:11px;
-  padding:16px 18px 10px;overflow-x:auto;margin-bottom:16px}
-.rw-box h2{margin:0 0 2px;font-size:14px;font-weight:650;color:#dbe4ee}
-.rw-box .cs{color:#6b7f96;font-size:11.5px;margin-bottom:10px;line-height:1.6}
-.rw-legend{display:flex;gap:16px;flex-wrap:wrap;margin:8px 0 2px;
-  padding-top:11px;border-top:1px solid #1e2937}
-.rw-lg{display:flex;align-items:center;gap:7px;color:#9fb2c8;font-size:11.5px}
-.rw-sw{width:15px;height:3px;border-radius:2px;flex:none}
-.rw-tbl{width:100%;border-collapse:collapse;margin-top:8px;font-size:12px}
-.rw-tbl th{text-align:right;color:#6b7f96;font-size:10px;font-weight:600;
-  text-transform:uppercase;letter-spacing:.06em;padding:7px 9px;
-  border-bottom:1px solid #22303f;white-space:nowrap}
-.rw-tbl th:first-child{text-align:left}
-.rw-tbl td{text-align:right;padding:6px 9px;border-bottom:1px solid #141c26;
-  font-variant-numeric:tabular-nums;color:#c3d3e6}
-.rw-tbl td:first-child{text-align:left;color:#dbe4ee}
-.rw-tbl tr.win td{background:#0f766e18}
-.rw-tbl tr.out td{opacity:.42}
-.rw-note{color:#6b7f96;font-size:11px;margin-top:9px;line-height:1.65}
-.rw-ok{color:#5eead4}
-form.rw-range{display:flex;gap:9px;align-items:flex-end;flex-wrap:wrap;
-  margin:0 0 14px}
-form.rw-range label{display:flex;flex-direction:column;gap:4px;
-  color:#6b7f96;font-size:10px;text-transform:uppercase;letter-spacing:.06em}
-form.rw-range select,form.rw-range button{background:#0e151d;
-  border:1px solid #22303f;border-radius:6px;color:#cfe0f0;padding:5px 10px;
-  font:12px ui-monospace,Menlo,monospace}
-form.rw-range button{color:#5eead4;border-color:#14b8a655;cursor:pointer}
-form.rw-range button:hover{background:#0f766e22;border-color:#5eead4}
-form.rw-range .q{display:flex;gap:5px;align-items:center;margin-left:6px}
-form.rw-range .q a{color:#8fa6bf;font-size:10.5px;text-decoration:none;
-  padding:4px 8px;border:1px solid #22303f;border-radius:5px}
-form.rw-range .q a:hover{border-color:#5eead4;color:#5eead4}
-#rw-tip{position:fixed;display:none;z-index:80;background:#0d151d;
-  border:1px solid #2f4256;border-radius:8px;padding:9px 11px;
-  box-shadow:0 10px 30px #000a;font-size:11.5px;color:#c3d3e6;
-  pointer-events:none;min-width:200px}
-#rw-tip .tx{color:#dbe4ee;font-weight:650;margin-bottom:6px;
-  font-variant-numeric:tabular-nums}
-#rw-tip .tr{display:flex;align-items:center;gap:7px;margin-top:3px;
-  font-variant-numeric:tabular-nums}
-#rw-tip .tr span:last-child{margin-left:auto;color:#dbe4ee}
-"""
+C_FEE = "#199e70"
+C_JITO = "#c98500"
+C_STAKE = "#9085e9"
+C_OTHER = "#d55181"
+C_RATIO = "#c98500"
+C_GAP = "#3987e5"
 
 
 def _pool(days, dates, side):
-    """Sum a cohort's histograms and component totals over a date range.
+    """Sum a cohort's histograms and totals over a date range.
 
-    Exact: bin counts add. This is the whole reason the source is histograms
-    rather than the per-day percentiles -- those cannot be pooled.
+    Exact: both bin counts and per-bin SOL sums add. This is the whole reason
+    the source is histograms rather than per-day percentiles.
     """
     h, out = {}, dict(slots=0, fee=0.0, jito_gross=0.0, jito_net=0.0,
                       other=0.0, like=0.0, with_jito=0, with_other=0,
                       comm_num=0.0, vals=0)
     for d in dates:
         e = days[d][side]
-        for b, c in zip(e["bins"], e["counts"]):
-            h[b] = h.get(b, 0) + c
+        for b, c, sm in zip(e["bins"], e["counts"], e["sums"]):
+            r = h.setdefault(b, [0, 0.0])
+            r[0] += c
+            r[1] += sm
         for k in ("slots", "with_jito", "with_other"):
             out[k] += e[k]
         for k in ("fee", "jito_gross", "jito_net", "other", "like"):
@@ -114,26 +71,55 @@ def _pct(h, total, q):
     """Exact nearest-rank percentile from a summed histogram, in SOL."""
     target, c = q * total, 0
     for b in sorted(h):
-        c += h[b]
+        c += h[b][0]
         if c >= target:
             return b * BIN
     return 0.0
 
 
+def _quantiles(h, total, n=99):
+    """q[1..n] in SOL -- the grid both comparison panels are computed on."""
+    return [_pct(h, total, i / (n + 1)) for i in range(1, n + 1)]
+
+
+def _trimmed_mean(h, total, lo=TRIM_LO, hi=TRIM_HI):
+    """Mean with the tails outside [lo, hi] dropped.
+
+    Uses each bin's exact SOL sum rather than its midpoint, so only the two
+    boundary bins are apportioned (at half weight) and everything between them
+    is exact. Returns (mean SOL, slots kept).
+    """
+    def bin_at(q):
+        t, c = q * total, 0
+        for b in sorted(h):
+            c += h[b][0]
+            if c >= t:
+                return b
+        return max(h) if h else 0
+    b_lo, b_hi = bin_at(lo), bin_at(hi)
+    cnt, tot = 0.0, 0.0
+    for b in sorted(h):
+        if b < b_lo or b > b_hi:
+            continue
+        k, sm = h[b]
+        w = 0.5 if (b == b_lo or b == b_hi) else 1.0
+        cnt += k * w
+        tot += sm * w
+    return (tot / cnt / 1e9 if cnt else 0.0), cnt
+
+
 def _curve(h, total, xmax, n=200):
-    """(x, cumulative-share) sampled evenly across [0, xmax]."""
     cum, run = {}, 0
     for b in sorted(h):
-        run += h[b]
+        run += h[b][0]
         cum[b] = run
     bs, out, j, r = sorted(cum), [], 0, 0
     for i in range(n + 1):
-        x = xmax * i / n
-        bi = int(x / BIN)
+        bi = int((xmax * i / n) / BIN)
         while j < len(bs) and bs[j] <= bi:
             r = cum[bs[j]]
             j += 1
-        out.append((x, r / total if total else 0))
+        out.append((xmax * i / n, r / total if total else 0))
     return out
 
 
@@ -155,6 +141,74 @@ def _axes(svg, L, T, pw, ph, xlab, ylab, xt, yt, W, H):
                f'text-anchor="middle">{ylab}</text>')
 
 
+REWARDS_CSS = """
+.rw-wrap{margin:16px 28px 34px}
+.rw-hero{display:flex;gap:10px;flex-wrap:wrap;margin:0 0 18px}
+.rw-tile{background:#0e151d;border:1px solid #1e2937;border-radius:10px;
+  padding:12px 16px;min-width:148px}
+.rw-tile .k{color:#6b7f96;font-size:10px;text-transform:uppercase;
+  letter-spacing:.07em}
+.rw-tile .v{color:#dbe4ee;font-size:20px;font-weight:650;margin-top:5px;
+  font-variant-numeric:tabular-nums}
+.rw-tile .d{color:#6b7f96;font-size:11px;margin-top:3px}
+.rw-tile .up{color:#5eead4}
+.rw-tile .dn{color:#fca5a5}
+.rw-box{background:#0e151d;border:1px solid #1e2937;border-radius:11px;
+  padding:16px 18px 10px;overflow-x:auto;margin-bottom:16px}
+.rw-box h2{margin:0 0 2px;font-size:14px;font-weight:650;color:#dbe4ee}
+.rw-box .cs{color:#6b7f96;font-size:11.5px;margin-bottom:10px;line-height:1.6}
+.rw-legend{display:flex;gap:16px;flex-wrap:wrap;margin:8px 0 2px;
+  padding-top:11px;border-top:1px solid #1e2937}
+.rw-lg{display:flex;align-items:center;gap:7px;color:#9fb2c8;font-size:11.5px}
+.rw-sw{width:15px;height:3px;border-radius:2px;flex:none}
+.rw-stats{display:flex;gap:0;flex-wrap:wrap;margin-top:12px;
+  border:1px solid #1e2937;border-radius:9px;overflow:hidden}
+.rw-stats div{flex:1;min-width:170px;padding:12px 15px;
+  border-right:1px solid #1e2937}
+.rw-stats div:last-child{border-right:none}
+.rw-stats .sv{color:#dbe4ee;font-size:19px;font-weight:650;
+  font-variant-numeric:tabular-nums}
+.rw-stats .sk{color:#8fa6bf;font-size:11px;margin-top:4px}
+.rw-stats .ss{color:#6b7f96;font-size:10px;margin-top:2px}
+.rw-tbl{width:100%;border-collapse:collapse;margin-top:8px;font-size:12px}
+.rw-tbl th{text-align:right;color:#6b7f96;font-size:10px;font-weight:600;
+  text-transform:uppercase;letter-spacing:.06em;padding:7px 9px;
+  border-bottom:1px solid #22303f;white-space:nowrap}
+.rw-tbl th:first-child{text-align:left}
+.rw-tbl td{text-align:right;padding:6px 9px;border-bottom:1px solid #141c26;
+  font-variant-numeric:tabular-nums;color:#c3d3e6}
+.rw-tbl td:first-child{text-align:left;color:#dbe4ee}
+.rw-tbl tr.win td{background:#0f766e18}
+.rw-tbl tr.out td{opacity:.42}
+.rw-key{display:grid;grid-template-columns:repeat(auto-fit,minmax(275px,1fr));
+  gap:4px 18px;margin-top:10px;padding-top:10px;border-top:1px solid #1e2937}
+.rw-key div{color:#6b7f96;font-size:11px;line-height:1.55}
+.rw-key b{color:#9fb2c8;font-weight:600}
+.rw-note{color:#6b7f96;font-size:11px;margin-top:9px;line-height:1.65}
+.rw-ok{color:#5eead4}
+form.rw-range{display:flex;gap:9px;align-items:flex-end;flex-wrap:wrap;
+  margin:0 0 14px}
+form.rw-range label{display:flex;flex-direction:column;gap:4px;
+  color:#6b7f96;font-size:10px;text-transform:uppercase;letter-spacing:.06em}
+form.rw-range select,form.rw-range button{background:#0e151d;
+  border:1px solid #22303f;border-radius:6px;color:#cfe0f0;padding:5px 10px;
+  font:12px ui-monospace,Menlo,monospace}
+form.rw-range button{color:#5eead4;border-color:#14b8a655;cursor:pointer}
+form.rw-range button:hover{background:#0f766e22;border-color:#5eead4}
+form.rw-range .q{display:flex;gap:5px;align-items:center;margin-left:6px}
+form.rw-range .q a{color:#8fa6bf;font-size:10.5px;text-decoration:none;
+  padding:4px 8px;border:1px solid #22303f;border-radius:5px}
+form.rw-range .q a:hover{border-color:#5eead4;color:#5eead4}
+#rw-tip{position:fixed;display:none;z-index:80;background:#0d151d;
+  border:1px solid #2f4256;border-radius:8px;padding:9px 11px;
+  box-shadow:0 10px 30px #000a;font-size:11.5px;color:#c3d3e6;
+  pointer-events:none;min-width:210px}
+#rw-tip .tx{color:#dbe4ee;font-weight:650;margin-bottom:6px;
+  font-variant-numeric:tabular-nums}
+#rw-tip .tr{display:flex;align-items:center;gap:7px;margin-top:3px;
+  font-variant-numeric:tabular-nums}
+#rw-tip .tr span:last-child{margin-left:auto;color:#dbe4ee}
+"""
 def _sankey_flows(P):
     """Per-slot flows for one cohort. Everything divided by that cohort's own
     slot count, so a 77k-slot cohort and a 1.5M-slot one are on one scale."""
@@ -255,6 +309,114 @@ def _sankey(P, side, title, col, scale_gross):
             f'below.">{"".join(sv)}</svg>'), facts
 
 
+def _panel_ratio(qg, qh, W=1010, H=250):
+    """harmonic(p) / gbx(p) at each percentile.
+
+    A ratio rather than two lines because the question is where the cohorts
+    differ, not what either earns. 1.0 is parity; the shaded band marks the
+    percentiles where GBX is ahead.
+    """
+    L, R, T, B = 66, 60, 22, 44
+    pw, ph = W - L - R, H - T - B
+    rat = [(h / g if g > 0 else 1.0) for g, h in zip(qg, qh)]
+    lo = min(0.9, min(rat) * 0.98)
+    hi = max(1.1, max(rat) * 1.02)
+    sx = lambda i: L + pw * i / (len(rat) - 1)
+    sy = lambda v: T + ph * (1 - (v - lo) / (hi - lo))
+    sv = []
+    ticks = [(f"p{p}", sx(p - 1)) for p in (1, 10, 20, 30, 40, 50, 60, 70, 80, 90, 99)]
+    ysteps = [lo + (hi - lo) * i / 4 for i in range(5)]
+    _axes(sv, L, T, pw, ph, "percentile", "",
+          ticks, [(f"{v:.2f}×", sy(v)) for v in ysteps], W, H)
+    # parity line
+    if lo <= 1.0 <= hi:
+        sv.append(f'<line x1="{L}" y1="{sy(1):.1f}" x2="{L+pw}" y2="{sy(1):.1f}" '
+                  f'stroke="#8fa6bf" stroke-width="1.4"/>')
+    # shade where GBX leads
+    under = [i for i, v in enumerate(rat) if v < 1.0]
+    if under and lo <= 1.0 <= hi:
+        runs, cur = [], [under[0]]
+        for i in under[1:]:
+            (cur.append(i) if i == cur[-1] + 1 else (runs.append(cur), cur := [i]))
+        runs.append(cur)
+        for rn in runs:
+            pts = " ".join(f"{sx(i):.1f},{sy(rat[i]):.1f}" for i in rn)
+            sv.append(f'<polygon points="{sx(rn[0]):.1f},{sy(1):.1f} {pts} '
+                      f'{sx(rn[-1]):.1f},{sy(1):.1f}" fill="{C_GBX}" '
+                      f'opacity="0.18"/>')
+        e = runs[0][-1]
+        sv.append(f'<text x="{sx(runs[0][0])+4:.1f}" y="{sy(1)+16:.1f}" '
+                  f'fill="{C_GBX}" font-size="10" font-weight="600">GBX ahead, '
+                  f'p{runs[0][0]+1}&ndash;p{e+1}</text>')
+    pts = " ".join(f"{sx(i):.1f},{sy(v):.1f}" for i, v in enumerate(rat))
+    sv.append(f'<polyline points="{pts}" fill="none" stroke="#0e151d" '
+              f'stroke-width="4.4" stroke-linejoin="round"/>')
+    sv.append(f'<polyline points="{pts}" fill="none" stroke="{C_RATIO}" '
+              f'stroke-width="2.2" stroke-linejoin="round"/>')
+    sv.append(f'<text x="{sx(len(rat)-1):.1f}" y="{sy(rat[-1])-9:.1f}" '
+              f'text-anchor="end" fill="{C_RATIO}" font-size="10.5" '
+              f'font-weight="600">{rat[-1]:.2f}× at p99</text>')
+    return (f'<svg viewBox="0 0 {W} {H}" width="100%" '
+            f'style="max-width:{W}px;display:block" role="img" '
+            f'aria-label="Ratio of Agave Harmonic to GBX revenue at each '
+            f'percentile. Values in the table below.">{"".join(sv)}</svg>'), rat
+
+
+def _panel_gap(qg, qh, W=1010, H=230):
+    """Cumulative share of the total mean gap, by percentile.
+
+    Each percentile contributes (harm(p) - gbx(p)) / n to the difference in
+    trimmed means. Plotting the running share against the diagonal shows
+    whether the gap is spread evenly or concentrated: a curve below the
+    diagonal means the tail is doing the work.
+    """
+    L, R, T, B = 66, 60, 22, 44
+    pw, ph = W - L - R, H - T - B
+    d = [h - g for g, h in zip(qg, qh)]
+    tot = sum(d)
+    sv = []
+    sx = lambda i: L + pw * i / (len(d) - 1)
+    sy = lambda f: T + ph * (1 - f)
+    _axes(sv, L, T, pw, ph, "percentile", "",
+          [(f"p{p}", sx(p - 1)) for p in (1, 25, 50, 75, 90, 99)],
+          [(f"{int(f*100)}%", sy(f)) for f in (0, .25, .5, .75, 1)], W, H)
+    sv.append(f'<line x1="{L}" y1="{sy(0):.1f}" x2="{L+pw}" y2="{sy(1):.1f}" '
+              f'stroke="#6b7f96" stroke-width="1" stroke-dasharray="4 4"/>')
+    run, pts = 0.0, []
+    for i, v in enumerate(d):
+        run += v
+        pts.append(f"{sx(i):.1f},{sy(run/tot if tot else 0):.1f}")
+    sv.append(f'<polyline points="{" ".join(pts)}" fill="none" stroke="#0e151d" '
+              f'stroke-width="4.4" stroke-linejoin="round"/>')
+    sv.append(f'<polyline points="{" ".join(pts)}" fill="none" stroke="{C_GAP}" '
+              f'stroke-width="2.2" stroke-linejoin="round"/>')
+    # how much of the gap sits above p90
+    r90 = sum(d[:90]) / tot if tot else 0
+    sv.append(f'<text x="{L+pw-6:.0f}" y="{sy(.42):.1f}" text-anchor="end" '
+              f'fill="#8fa6bf" font-size="10" font-style="italic">below the '
+              f'diagonal &rarr; gap concentrated in the tail</text>')
+    return (f'<svg viewBox="0 0 {W} {H}" width="100%" '
+            f'style="max-width:{W}px;display:block" role="img" '
+            f'aria-label="Cumulative share of the total mean gap by '
+            f'percentile.">{"".join(sv)}</svg>'), tot, r90
+
+
+COL_KEY = [
+    ("day", "the report's own slot range for that date, not a UTC calendar day"),
+    ("GBX slots", "blocks the 11 GBX validators produced that day"),
+    ("H vals", "how many Agave Harmonic validators ran that day (50&ndash;61; "
+               "membership is resolved per day)"),
+    ("H slots", "blocks the Agave Harmonic cohort produced that day"),
+    ("GBX mean / H mean", "trimmed mean SOL per slot, p1&ndash;p99, of fee + "
+                          "Jito tip net of 6%"),
+    ("GBX vs H", "GBX trimmed mean over Harmonic's, as a percent"),
+    ("GBX comm / H comm", "block-weighted validator MEV commission &mdash; the "
+                          "share of each tip the operator keeps, stakers get the rest"),
+    ("GBX other", "Titan/Bifrost tips per slot, on routes Harmonic never "
+                  "receives; excluded from every comparison here"),
+]
+
+
 def rewards_page(CSS, purl, d_from=None, d_to=None):
     with open(REWARDS_JSON) as fh:
         D = json.load(fh)
@@ -269,40 +431,16 @@ def rewards_page(CSS, purl, d_from=None, d_to=None):
     dates = [d for d in all_dates if d_from <= d <= d_to]
 
     G, Hm = _pool(days, dates, "gbx"), _pool(days, dates, "harm")
-    gm = G["like"] / G["slots"] / 1e9 if G["slots"] else 0
-    hm = Hm["like"] / Hm["slots"] / 1e9 if Hm["slots"] else 0
-    delta = (gm / hm - 1) * 100 if hm else 0
-    wins = sum(1 for d in dates
-               if days[d]["gbx"]["like"] / max(days[d]["gbx"]["slots"], 1)
-               > days[d]["harm"]["like"] / max(days[d]["harm"]["slots"], 1))
+    gt, g_kept = _trimmed_mean(G["hist"], G["slots"])
+    ht, h_kept = _trimmed_mean(Hm["hist"], Hm["slots"])
+    gmed = _pct(G["hist"], G["slots"], .50)
+    hmed = _pct(Hm["hist"], Hm["slots"], .50)
+    d_mean = (gt / ht - 1) * 100 if ht else 0
+    d_med = (gmed / hmed - 1) * 100 if hmed else 0
+    qg = _quantiles(G["hist"], G["slots"])
+    qh = _quantiles(Hm["hist"], Hm["slots"])
 
-    # ---- panel 1: daily means across the whole window, range shaded
-    W, H = 1010, 300
-    L, R, T, B = 66, 122, 16, 46
-    pw, ph = W - L - R, H - T - B
-    mean_of = lambda d, s: days[d][s]["like"] / max(days[d][s]["slots"], 1) / 1e9
-    ymax = max(max(mean_of(d, s) for s in ("gbx", "harm"))
-               for d in all_dates) * 1.08
-    sx = lambda i: L + pw * i / max(len(all_dates) - 1, 1)
-    sy = lambda v: T + ph * (1 - v / ymax)
-    p1 = []
-    i0 = all_dates.index(dates[0]); i1 = all_dates.index(dates[-1])
-    p1.append(f'<rect x="{sx(i0):.1f}" y="{T}" width="{max(sx(i1)-sx(i0),2):.1f}" '
-              f'height="{ph}" fill="#5eead4" opacity="0.07"/>')
-    _axes(p1, L, T, pw, ph, "day", "mean SOL / slot",
-          [(all_dates[i][5:], sx(i)) for i in range(0, len(all_dates), 4)],
-          [(f"{ymax*i/4:.3f}", sy(ymax * i / 4)) for i in range(5)], W, H)
-    for s, c, nm in (("harm", C_HARM, "Agave Harmonic"), ("gbx", C_GBX, "GBX")):
-        pts = " ".join(f"{sx(i):.1f},{sy(mean_of(d, s)):.1f}"
-                       for i, d in enumerate(all_dates))
-        p1.append(f'<polyline points="{pts}" fill="none" stroke="#0e151d" '
-                  f'stroke-width="4.6" stroke-linejoin="round"/>')
-        p1.append(f'<polyline points="{pts}" fill="none" stroke="{c}" '
-                  f'stroke-width="2.2" stroke-linejoin="round"/>')
-        p1.append(f'<text x="{L+pw+9}" y="{sy(mean_of(all_dates[-1], s))+4:.1f}" '
-                  f'fill="{c}" font-size="11" font-weight="600">{nm}</text>')
-
-    # ---- panel 2: pooled ECDF for the range
+    # ---------------- panel 1: ECDF
     W2, H2 = 1010, 400
     L2, R2, T2, B2 = 66, 132, 16, 46
     pw2, ph2 = W2 - L2 - R2, H2 - T2 - B2
@@ -314,7 +452,7 @@ def rewards_page(CSS, purl, d_from=None, d_to=None):
     step = xmax / 6
     _axes(p2, L2, T2, pw2, ph2,
           "per-slot revenue (SOL) &mdash; fee + Jito tip net of 6%",
-          "cumulative share of slots",
+          "cumulative probability",
           [(f"{step*i:.3f}", sx2(step * i)) for i in range(7)],
           [(f"{i*10}%", sy2(i / 10)) for i in range(11)], W2, H2)
     for P, c in ((Hm, C_HARM), (G, C_GBX)):
@@ -324,6 +462,7 @@ def rewards_page(CSS, purl, d_from=None, d_to=None):
                   f'stroke-width="4.8" stroke-linejoin="round"/>')
         p2.append(f'<polyline points="{pts}" fill="none" stroke="{c}" '
                   f'stroke-width="2.3" stroke-linejoin="round"/>')
+    for P, c in ((Hm, C_HARM), (G, C_GBX)):
         for q in (.50, .90):
             v = _pct(P["hist"], P["slots"], q)
             if v <= xmax:
@@ -333,8 +472,6 @@ def rewards_page(CSS, purl, d_from=None, d_to=None):
                 p2.append(f'<text x="{sx2(v):.1f}" y="{sy2(q)+dy:.1f}" '
                           f'text-anchor="middle" fill="{c}" font-size="9.5" '
                           f'font-weight="600">{v:.4f}</text>')
-    # horizontal: the mouse picks a PERCENTILE, and the tooltip reads each
-    # cohort's SOL at that level -- the horizontal gap is the revenue gap.
     p2.append(f'<line id="rw-cross" x1="{L2}" y1="0" x2="{L2+pw2}" y2="0" '
               f'stroke="#5eead4" stroke-width="1" stroke-dasharray="3 3" '
               f'opacity="0"/>')
@@ -345,23 +482,25 @@ def rewards_page(CSS, purl, d_from=None, d_to=None):
     p2.append(f'<rect id="rw-hit" x="{L2}" y="{T2}" width="{pw2}" '
               f'height="{ph2}" fill="transparent"/>')
 
-    # one scale for both diagrams: the larger per-slot gross sets the height
+    ratio_svg, rat = _panel_ratio(qg, qh)
+    gap_svg, gap_tot, r90 = _panel_gap(qg, qh)
+
     sg_max = max(_sankey_flows(G)["gross"], _sankey_flows(Hm)["gross"])
     sk_g, f_g = _sankey(G, "gbx", "GBX", C_GBX, sg_max)
     sk_h, f_h = _sankey(Hm, "harm", "Agave Harmonic", C_HARM, sg_max)
 
+    # ---------------- chrome
     tiles = [
-        ("GBX mean / slot", f"{gm:.6f}", f"{G['slots']:,} slots", ""),
-        ("Agave Harmonic", f"{hm:.6f}",
+        ("GBX trimmed mean", f"{gt:.6f}", f"{G['slots']:,} slots, p1&ndash;p99", ""),
+        ("Agave Harmonic", f"{ht:.6f}",
          f"{Hm['slots']:,} slots, {Hm['vals']} vals", ""),
-        ("GBX vs Harmonic", f"{delta:+.1f}%",
-         f"{len(dates)} day{'s' if len(dates) != 1 else ''} selected",
-         "up" if delta > 0 else "dn"),
-        ("days GBX ahead", f"{wins} / {len(dates)}", "on mean per slot", ""),
+        ("GBX vs Harmonic", f"{d_mean:+.1f}%", "on the trimmed mean",
+         "up" if d_mean > 0 else "dn"),
+        ("median gap", f"{d_med:+.1f}%",
+         f"{gmed:.4f} vs {hmed:.4f} SOL", "up" if d_med > 0 else "dn"),
         ("GBX tip share", f"{G['jito_net']/G['like']*100:.1f}%"
          if G["like"] else "&mdash;",
-         f"Harmonic {Hm['jito_net']/Hm['like']*100:.1f}%"
-         if Hm["like"] else "", ""),
+         f"Harmonic {Hm['jito_net']/Hm['like']*100:.1f}%" if Hm["like"] else "", ""),
         ("MEV commission", f"{G['comm_bps']/100:.1f}%",
          f"Harmonic {Hm['comm_bps']/100:.1f}% &mdash; they keep more", ""),
     ]
@@ -369,13 +508,23 @@ def rewards_page(CSS, purl, d_from=None, d_to=None):
                    f'<div class="v {c}">{v}</div><div class="d">{d}</div></div>'
                    for k, v, d, c in tiles)
 
-    # carry the current deployment through the form; purl() renders
-    # "<path>?dep=<name>", so the name is whatever follows "dep=".
-    dep_val = purl("/rewards").partition("dep=")[2]
+    stats = (
+        f'<div class="rw-stats">'
+        f'<div><div class="sv">{gt:.4f} SOL</div>'
+        f'<div class="sk">GBX mean, p1&ndash;p99</div>'
+        f'<div class="ss">tail values outside p1&ndash;p99 excluded</div></div>'
+        f'<div><div class="sv">{ht:.4f} SOL</div>'
+        f'<div class="sk">Harmonic mean, p1&ndash;p99</div>'
+        f'<div class="ss">tail values outside p1&ndash;p99 excluded</div></div>'
+        f'<div><div class="sv">{d_mean:+.1f}%</div>'
+        f'<div class="sk">GBX mean relative to Harmonic</div></div>'
+        f'<div><div class="sv">{d_med:+.1f}%</div>'
+        f'<div class="sk">GBX median relative to Harmonic</div></div></div>')
 
     opts = lambda sel: "".join(
         f'<option value="{d}"{" selected" if d == sel else ""}>{d}</option>'
         for d in all_dates)
+    dep_val = purl("/rewards").partition("dep=")[2]
     base = purl("/rewards")
     quick = "".join(
         f'<a href="{base}&from={all_dates[max(0,len(all_dates)-n)]}'
@@ -389,9 +538,9 @@ def rewards_page(CSS, purl, d_from=None, d_to=None):
            f'<span class="q">{quick}</span></form>')
 
     lg = (f'<div class="rw-lg"><span class="rw-sw" style="background:{C_GBX}">'
-          f'</span>GBX</div>'
+          f'</span>GBX n={G["slots"]:,}</div>'
           f'<div class="rw-lg"><span class="rw-sw" style="background:{C_HARM}">'
-          f'</span>Agave Harmonic</div>')
+          f'</span>Agave Harmonic n={Hm["slots"]:,}</div>')
     sk_lg = "".join(
         f'<div class="rw-lg"><span class="rw-sw" style="background:{c}"></span>'
         f'{n}</div>' for c, n in ((C_FEE, "fees &mdash; kept in full"),
@@ -402,8 +551,10 @@ def rewards_page(CSS, purl, d_from=None, d_to=None):
     rows = []
     for d in all_dates:
         g, h = days[d]["gbx"], days[d]["harm"]
-        a = g["like"] / max(g["slots"], 1) / 1e9
-        b = h["like"] / max(h["slots"], 1) / 1e9
+        gp = _pool(days, [d], "gbx")
+        hp = _pool(days, [d], "harm")
+        a, _ = _trimmed_mean(gp["hist"], gp["slots"])
+        b, _ = _trimmed_mean(hp["hist"], hp["slots"])
         dd = (a / b - 1) * 100 if b else 0
         inr = d_from <= d <= d_to
         cls = ("win" if dd > 0 else "") + ("" if inr else " out")
@@ -415,12 +566,8 @@ def rewards_page(CSS, purl, d_from=None, d_to=None):
             f'<td>{g["comm_bps"]/100:.1f}%</td><td>{h["comm_bps"]/100:.1f}%</td>'
             f'<td>{g["other"]/max(g["slots"],1)/1e9:.6f}</td></tr>')
 
-    # exact p1..p100 in SOL, so the tooltip inverts the curve without
-    # re-reading the sampled polyline
-    js = json.dumps({
-        "gbx": [_pct(G["hist"], G["slots"], q / 100) for q in range(1, 101)],
-        "harm": [_pct(Hm["hist"], Hm["slots"], q / 100) for q in range(1, 101)],
-        "xmax": xmax})
+    key = "".join(f'<div><b>{k}</b> &mdash; {v}</div>' for k, v in COL_KEY)
+    js = json.dumps({"gbx": qg, "harm": qh, "xmax": xmax})
     cav = "".join(f"<li>{html.escape(c)}</li>" for c in meta["caveats"])
     facts = "".join(
         f'<tr><td>{n}</td><td>{a:.6f}</td><td>{b:.6f}</td></tr>'
@@ -442,7 +589,8 @@ def rewards_page(CSS, purl, d_from=None, d_to=None):
   <b class="rw-ok">Verified against reports.firedancer.io on all
   {len(all_dates)} days.</b> {html.escape(meta['verification'])}<br><br>
   <b>Basis.</b> {html.escape(meta['basis'])}<br>
-  <b>Like-for-like.</b> {html.escape(meta['like_note'])}
+  <b>Like-for-like.</b> {html.escape(meta['like_note'])}<br>
+  <b>Means.</b> {html.escape(meta.get('trimmed_note',''))}
 </div>
 
 <div class="rw-wrap">
@@ -450,30 +598,52 @@ def rewards_page(CSS, purl, d_from=None, d_to=None):
   <div class="rw-hero">{hero}</div>
 
   <div class="rw-box">
-    <h2>Mean revenue per slot, by day</h2>
-    <div class="cs">Whole window, with the selected range shaded. Each point is
-      that day's block-weighted mean of fee + Jito tip net of 6%.</div>
-    <svg viewBox="0 0 {W} {H}" width="100%" style="max-width:{W}px;display:block"
-         role="img" aria-label="Daily mean revenue per slot, GBX versus Agave
-         Harmonic. Values in the table below.">{''.join(p1)}</svg>
+    <h2>Rewards distribution &mdash; {d_from} to {d_to}</h2>
+    <div class="cs">Exact ECDF pooled over the selected range: at revenue
+      <i>x</i>, the height is the share of that cohort's slots earning at or
+      below <i>x</i>. Markers give p50 and p90 with their SOL values. Hover
+      reads <b>horizontally</b> &mdash; pick a percentile and compare each
+      cohort's SOL at that level, which is the gap that matters.</div>
+    <svg viewBox="0 0 {W2} {H2}" width="100%"
+         style="max-width:{W2}px;display:block" role="img"
+         aria-label="Empirical CDF of per-slot revenue pooled over {d_from} to
+         {d_to}.">{''.join(p2)}</svg>
+    <div class="rw-legend">{lg}</div>
+    {stats}
+    <div class="rw-note">x-axis is framed on p90 &times; 1.6; the tail runs far
+      past it. Means on the cards are trimmed to p1&ndash;p99
+      ({g_kept:,.0f} of {G['slots']:,} GBX slots and {h_kept:,.0f} of
+      {Hm['slots']:,} Harmonic slots kept), so a handful of extreme blocks
+      cannot carry the headline.</div>
   </div>
 
   <div class="rw-box">
-    <h2>Revenue distribution &mdash; {d_from} to {d_to}</h2>
-    <div class="cs">Exact empirical CDF pooled over the selected range: at
-      revenue <i>x</i>, the height is the share of that cohort's slots earning
-      at or below <i>x</i>. Lower and further right is better. Markers show p50
-      and p90 with their SOL values. Pooling is exact because the source is
-      0.5 mSOL histograms &mdash; bin counts sum across days where percentiles
-      could not. <b>Hover reads horizontally</b>: pick a percentile and compare
-      each cohort's SOL at that level, which is the gap that matters.</div>
-    <svg viewBox="0 0 {W2} {H2}" width="100%"
-         style="max-width:{W2}px;display:block" role="img"
-         aria-label="Empirical CDF of per-slot revenue pooled over
-         {d_from} to {d_to}, GBX versus Agave Harmonic.">{''.join(p2)}</svg>
-    <div class="rw-legend">{lg}</div>
-    <div class="rw-note">x-axis is framed on p90 &times; 1.6; the tail runs far
-      past it. p96&ndash;p100 rest on few slots when the range is short.</div>
+    <h2>Quantile ratio &mdash; harmonic / gbx at each percentile</h2>
+    <div class="cs">At each percentile <i>p</i>, Harmonic's revenue divided by
+      GBX's. Above 1.0 Harmonic leads; the shaded band marks where GBX does.
+      This is the panel that says <b>where</b> the two differ rather than by
+      how much overall.</div>
+    {ratio_svg}
+    <div class="rw-note">Ratio at p1 {rat[0]:.2f}&times;, p50 {rat[49]:.2f}&times;,
+      p90 {rat[89]:.2f}&times;, p99 {rat[-1]:.2f}&times;. A rising line means the
+      gap widens with block value.</div>
+  </div>
+
+  <div class="rw-box">
+    <h2>Cumulative share of the total mean gap ({ht-gt:.6f} SOL)</h2>
+    <div class="cs">The headline gap is the exact difference in trimmed means,
+      {ht:.6f} &minus; {gt:.6f}. The curve decomposes it on the p1&ndash;p99
+      quantile grid: each percentile contributes (harmonic &minus; gbx), and the
+      line is the running share of that total. The dashed diagonal is what an
+      evenly spread gap would look like.</div>
+    {gap_svg}
+    <div class="rw-note">Percentiles p1&ndash;p90 account for
+      {r90*100:.0f}% of the gap, so the remaining {100-r90*100:.0f}% comes from
+      the top tenth of slots &mdash; which is why trimming to p1&ndash;p99
+      narrows the gap to {d_mean:+.1f}%. The quantile grid sums to
+      {gap_tot/99:.6f} SOL against the exact {ht-gt:.6f}; the ~{abs((gap_tot/99)/(ht-gt)-1)*100:.0f}%
+      difference is 99 sample points and 0.5 mSOL bins, and affects the curve's
+      level, not its shape.</div>
   </div>
 
   <div class="rw-box">
@@ -487,12 +657,10 @@ def rewards_page(CSS, purl, d_from=None, d_to=None):
       <tbody>{facts}</tbody>
     </table>
     <div class="rw-note">Every flow is <b>per slot</b>, and both diagrams share
-      one scale, so ribbons are comparable between the two cohorts as well as
-      within each. Without that, GBX's {G['slots']:,} slots and Harmonic's
-      {Hm['slots']:,} would each fill the panel and look equal.
-      Harmonic's staker ribbon is the wider one relative to its tips: its
-      operators run {Hm['comm_bps']/100:.1f}% MEV commission against GBX's
-      {G['comm_bps']/100:.1f}%, so they keep more of each tip.</div>
+      one scale, so ribbons are comparable between the cohorts as well as
+      within each. Harmonic's operators run {Hm['comm_bps']/100:.1f}% MEV
+      commission against GBX's {G['comm_bps']/100:.1f}%, so they keep more of
+      each tip.</div>
   </div>
 
   <table class="rw-tbl">
@@ -501,9 +669,9 @@ def rewards_page(CSS, purl, d_from=None, d_to=None):
       <th>GBX comm</th><th>H comm</th><th>GBX other</th></tr></thead>
     <tbody>{''.join(rows)}</tbody>
   </table>
-  <div class="rw-note">All SOL per slot. Shaded rows are days GBX led; faded
-    rows fall outside the selected range. <code>GBX other</code> is
-    Titan/Bifrost revenue excluded from every comparison on this page.</div>
+  <div class="rw-key">{key}</div>
+  <div class="rw-note">Shaded rows are days GBX led; faded rows fall outside
+    the selected range.</div>
 
   <div class="rw-note" style="margin-top:22px">
     <b style="color:#8fa6bf">Read this before quoting a number</b>
@@ -520,7 +688,7 @@ def rewards_page(CSS, purl, d_from=None, d_to=None):
 <script>
 (function(){{
   var D={js}, L={L2}, PW={pw2}, T={T2}, PH={ph2}, VB={W2};
-  var boxes=document.querySelectorAll('.rw-box svg'), svg=boxes[1],
+  var boxes=document.querySelectorAll('.rw-box svg'), svg=boxes[0],
       hit=document.getElementById('rw-hit'),
       cross=document.getElementById('rw-cross'),
       dg=document.getElementById('rw-dg'), dh=document.getElementById('rw-dh'),
@@ -529,19 +697,16 @@ def rewards_page(CSS, purl, d_from=None, d_to=None):
   function px(v){{ return L+PW*Math.min(v/D.xmax,1); }}
   hit.addEventListener('mousemove',function(ev){{
     var r=svg.getBoundingClientRect(), k=VB/r.height;
-    // the mouse picks a percentile off the y axis
     var f=Math.min(1,Math.max(0,1-((ev.clientY-r.top)*k-T)/PH));
-    var q=Math.min(100,Math.max(1,Math.round(f*100)));
-    var y=T+PH*(1-q/100);
-    var g=D.gbx[q-1], h=D.harm[q-1];
+    var q=Math.min(99,Math.max(1,Math.round(f*100)));
+    var y=T+PH*(1-q/100), g=D.gbx[q-1], h=D.harm[q-1];
     cross.setAttribute('y1',y); cross.setAttribute('y2',y);
     cross.setAttribute('opacity','1');
     dg.setAttribute('cx',px(g)); dg.setAttribute('cy',y);
     dg.setAttribute('opacity', g<=D.xmax?'1':'0');
     dh.setAttribute('cx',px(h)); dh.setAttribute('cy',y);
     dh.setAttribute('opacity', h<=D.xmax?'1':'0');
-    var pct=h>0?((g/h-1)*100):0;
-    var sign=pct>=0?'+':'';
+    var pct=h>0?((g/h-1)*100):0, sign=pct>=0?'+':'';
     var hh='<div class="tx">p'+q+'</div>';
     hh+='<div class="tr"><span class="rw-sw" style="background:{C_GBX}"></span>'
       +'<span>GBX</span><span>'+g.toFixed(5)+' SOL</span></div>';
