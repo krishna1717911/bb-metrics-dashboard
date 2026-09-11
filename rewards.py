@@ -153,8 +153,12 @@ REWARDS_CSS = """
 .rw-tile .d{color:#6b7f96;font-size:11px;margin-top:3px}
 .rw-tile .up{color:#5eead4}
 .rw-tile .dn{color:#fca5a5}
+.rw-grid{display:grid;gap:16px;margin-bottom:16px;
+  grid-template-columns:repeat(auto-fit,minmax(440px,1fr))}
+.rw-grid>.rw-box{margin-bottom:0}
 .rw-box{background:#0e151d;border:1px solid #1e2937;border-radius:11px;
   padding:16px 18px 10px;overflow-x:auto;margin-bottom:16px}
+.rw-box.wide{grid-column:1/-1}
 .rw-box h2{margin:0 0 2px;font-size:14px;font-weight:650;color:#dbe4ee}
 .rw-box .cs{color:#6b7f96;font-size:11.5px;margin-bottom:10px;line-height:1.6}
 .rw-legend{display:flex;gap:16px;flex-wrap:wrap;margin:8px 0 2px;
@@ -222,7 +226,7 @@ def _sankey_flows(P):
                 keep=keep, stake=jn - keep, gross=fee + jg + oth)
 
 
-def _sankey(P, side, title, col, scale_gross):
+def _sankey(P, side, title, col, scale_gross, W=620, H=300):
     """Where a cohort's gross inflow ends up, PER SLOT, over the range.
 
     Three columns: source stream -> intermediate -> destination. Ribbon height
@@ -235,36 +239,36 @@ def _sankey(P, side, title, col, scale_gross):
     jito_cut, keep, stake, gross = F["jito_cut"], F["keep"], F["stake"], F["gross"]
     if gross <= 0 or scale_gross <= 0:
         return "", []
-    W, H = 1010, 250
-    T, B, LW = 26, 26, 150
+    T, B = 42, 24
     ph = H - T - B
     scale = ph / scale_gross
-    x0, x1, x2, x3 = 24, 24 + LW, 24 + LW * 2 + 210, 24 + LW * 3 + 300
+    x0, x2, x3 = 16, W * 0.42, W - 118
     sv = []
 
     def node(x, y, h, c, lab, val, anchor="start"):
+        # label sits ABOVE the bar: at 620 wide there is no room for three
+        # columns of side-set text without collisions.
         h = max(h, 1.2)
-        sv.append(f'<rect x="{x:.0f}" y="{y:.1f}" width="11" height="{h:.1f}" '
+        sv.append(f'<rect x="{x:.0f}" y="{y:.1f}" width="9" height="{h:.1f}" '
                   f'fill="{c}" rx="2"/>')
-        tx = x + 16 if anchor == "start" else x - 6
-        sv.append(f'<text x="{tx:.0f}" y="{y+h/2+3.5:.1f}" fill="#c3d3e6" '
-                  f'font-size="10.5" text-anchor="{anchor}">{lab} '
-                  f'<tspan fill="#6b7f96">{val:.6f}</tspan></text>')
+        sv.append(f'<text x="{x:.0f}" y="{y-4:.1f}" fill="#c3d3e6" '
+                  f'font-size="9.5" text-anchor="start">{lab} '
+                  f'<tspan fill="#6b7f96">{val:.5f}</tspan></text>')
 
     def link(xa, ya, xb, yb, h, c, op=0.34):
         h = max(h, 1.2)
         mx = (xa + xb) / 2
-        sv.append(f'<path d="M{xa+11:.0f},{ya:.1f} C{mx:.0f},{ya:.1f} '
+        sv.append(f'<path d="M{xa+9:.0f},{ya:.1f} C{mx:.0f},{ya:.1f} '
                   f'{mx:.0f},{yb:.1f} {xb:.0f},{yb:.1f} L{xb:.0f},{yb+h:.1f} '
                   f'C{mx:.0f},{yb+h:.1f} {mx:.0f},{ya+h:.1f} '
-                  f'{xa+11:.0f},{ya+h:.1f} Z" fill="{c}" opacity="{op}"/>')
+                  f'{xa+9:.0f},{ya+h:.1f} Z" fill="{c}" opacity="{op}"/>')
 
     # column 1: sources
     y = T
     y_fee, h_fee = y, fee * scale
-    node(x0, y_fee, h_fee, C_FEE, "fees", fee); y += h_fee + 6
+    node(x0, y_fee, h_fee, C_FEE, "fees", fee); y += h_fee + 16
     y_jg, h_jg = y, jg * scale
-    node(x0, y_jg, h_jg, C_JITO, "Jito tips (gross)", jg); y += h_jg + 6
+    node(x0, y_jg, h_jg, C_JITO, "Jito gross", jg); y += h_jg + 16
     y_o, h_o = y, oth * scale
     if oth > 0:
         node(x0, y_o, h_o, C_OTHER, "Titan/Bifrost", oth)
@@ -273,8 +277,8 @@ def _sankey(P, side, title, col, scale_gross):
     y = T
     y_dist, h_dist = y, (fee + jn + oth) * scale
     node(x2, y_dist, h_dist, col, "distributable", fee + jn + oth)
-    y_cut = y_dist + h_dist + 10
-    node(x2, y_cut, jito_cut * scale, C_JITO, "Jito 6% commission", jito_cut)
+    y_cut = y_dist + h_dist + 18
+    node(x2, y_cut, jito_cut * scale, C_JITO, "Jito 6%", jito_cut)
 
     link(x0, y_fee, x2, y_dist, h_fee, C_FEE)
     link(x0, y_jg, x2, y_dist + h_fee, jn * scale, C_JITO)
@@ -285,9 +289,9 @@ def _sankey(P, side, title, col, scale_gross):
     # column 3: validator vs stakers
     y = T
     y_keep, h_keep = y, (fee + keep + oth) * scale
-    node(x3, y_keep, h_keep, col, "validator keeps", fee + keep + oth, "end")
-    y_st = y_keep + h_keep + 10
-    node(x3, y_st, stake * scale, C_STAKE, "stakers", stake, "end")
+    node(x3, y_keep, h_keep, col, "validator", fee + keep + oth)
+    y_st = y_keep + h_keep + 18
+    node(x3, y_st, stake * scale, C_STAKE, "stakers", stake)
     link(x2, y_dist, x3, y_keep, h_fee, C_FEE)
     link(x2, y_dist + h_fee, x3, y_keep + h_fee, keep * scale, C_JITO)
     link(x2, y_dist + h_fee + keep * scale, x3, y_st, stake * scale, C_STAKE, 0.5)
@@ -295,9 +299,10 @@ def _sankey(P, side, title, col, scale_gross):
         link(x2, y_dist + h_fee + jn * scale, x3,
              y_keep + h_fee + keep * scale, h_o, C_OTHER)
 
-    sv.append(f'<text x="{x0}" y="{T-10}" fill="#8fa6bf" font-size="11" '
-              f'font-weight="600">{title} &mdash; SOL per slot '
-              f'<tspan fill="#6b7f96">({P["slots"]:,} slots)</tspan></text>')
+    sv.append(f'<text x="{x0}" y="14" fill="#8fa6bf" font-size="11" '
+              f'font-weight="600">{title} '
+              f'<tspan fill="#6b7f96">&mdash; SOL/slot, n={P["slots"]:,}</tspan>'
+              f'</text>')
     facts = [("gross inflow / slot", gross), ("fees / slot", fee),
              ("Jito tips gross / slot", jg), ("Jito 6% cut / slot", jito_cut),
              ("to stakers / slot", stake),
@@ -309,7 +314,7 @@ def _sankey(P, side, title, col, scale_gross):
             f'below.">{"".join(sv)}</svg>'), facts
 
 
-def _panel_ratio(qg, qh, W=1010, H=250):
+def _panel_ratio(qg, qh, W=620, H=290):
     """harmonic(p) / gbx(p) at each percentile.
 
     A ratio rather than two lines because the question is where the cohorts
@@ -324,7 +329,7 @@ def _panel_ratio(qg, qh, W=1010, H=250):
     sx = lambda i: L + pw * i / (len(rat) - 1)
     sy = lambda v: T + ph * (1 - (v - lo) / (hi - lo))
     sv = []
-    ticks = [(f"p{p}", sx(p - 1)) for p in (1, 10, 20, 30, 40, 50, 60, 70, 80, 90, 99)]
+    ticks = [(f"p{p}", sx(p - 1)) for p in (1, 25, 50, 75, 99)]
     ysteps = [lo + (hi - lo) * i / 4 for i in range(5)]
     _axes(sv, L, T, pw, ph, "percentile", "",
           ticks, [(f"{v:.2f}×", sy(v)) for v in ysteps], W, H)
@@ -362,7 +367,7 @@ def _panel_ratio(qg, qh, W=1010, H=250):
             f'percentile. Values in the table below.">{"".join(sv)}</svg>'), rat
 
 
-def _panel_gap(qg, qh, W=1010, H=230):
+def _panel_gap(qg, qh, W=620, H=290):
     """Cumulative share of the total mean gap, by percentile.
 
     Each percentile contributes (harm(p) - gbx(p)) / n to the difference in
@@ -378,7 +383,7 @@ def _panel_gap(qg, qh, W=1010, H=230):
     sx = lambda i: L + pw * i / (len(d) - 1)
     sy = lambda f: T + ph * (1 - f)
     _axes(sv, L, T, pw, ph, "percentile", "",
-          [(f"p{p}", sx(p - 1)) for p in (1, 25, 50, 75, 90, 99)],
+          [(f"p{p}", sx(p - 1)) for p in (1, 25, 50, 75, 99)],
           [(f"{int(f*100)}%", sy(f)) for f in (0, .25, .5, .75, 1)], W, H)
     sv.append(f'<line x1="{L}" y1="{sy(0):.1f}" x2="{L+pw}" y2="{sy(1):.1f}" '
               f'stroke="#6b7f96" stroke-width="1" stroke-dasharray="4 4"/>')
@@ -392,9 +397,9 @@ def _panel_gap(qg, qh, W=1010, H=230):
               f'stroke-width="2.2" stroke-linejoin="round"/>')
     # how much of the gap sits above p90
     r90 = sum(d[:90]) / tot if tot else 0
-    sv.append(f'<text x="{L+pw-6:.0f}" y="{sy(.42):.1f}" text-anchor="end" '
-              f'fill="#8fa6bf" font-size="10" font-style="italic">below the '
-              f'diagonal &rarr; gap concentrated in the tail</text>')
+    sv.append(f'<text x="{L+pw-6:.0f}" y="{sy(.52):.1f}" text-anchor="end" '
+              f'fill="#8fa6bf" font-size="9.5" font-style="italic">below the '
+              f'diagonal &rarr; tail-concentrated</text>')
     return (f'<svg viewBox="0 0 {W} {H}" width="100%" '
             f'style="max-width:{W}px;display:block" role="img" '
             f'aria-label="Cumulative share of the total mean gap by '
@@ -597,7 +602,7 @@ def rewards_page(CSS, purl, d_from=None, d_to=None):
   {rng}
   <div class="rw-hero">{hero}</div>
 
-  <div class="rw-box">
+  <div class="rw-box wide">
     <h2>Rewards distribution &mdash; {d_from} to {d_to}</h2>
     <div class="cs">Exact ECDF pooled over the selected range: at revenue
       <i>x</i>, the height is the share of that cohort's slots earning at or
@@ -617,8 +622,9 @@ def rewards_page(CSS, purl, d_from=None, d_to=None):
       cannot carry the headline.</div>
   </div>
 
+  <div class="rw-grid">
   <div class="rw-box">
-    <h2>Quantile ratio &mdash; harmonic / gbx at each percentile</h2>
+    <h2>Quantile ratio &mdash; harmonic / gbx</h2>
     <div class="cs">At each percentile <i>p</i>, Harmonic's revenue divided by
       GBX's. Above 1.0 Harmonic leads; the shaded band marks where GBX does.
       This is the panel that says <b>where</b> the two differ rather than by
@@ -630,7 +636,7 @@ def rewards_page(CSS, purl, d_from=None, d_to=None):
   </div>
 
   <div class="rw-box">
-    <h2>Cumulative share of the total mean gap ({ht-gt:.6f} SOL)</h2>
+    <h2>Cumulative share of the mean gap ({ht-gt:.6f} SOL)</h2>
     <div class="cs">The headline gap is the exact difference in trimmed means,
       {ht:.6f} &minus; {gt:.6f}. The curve decomposes it on the p1&ndash;p99
       quantile grid: each percentile contributes (harmonic &minus; gbx), and the
@@ -645,23 +651,35 @@ def rewards_page(CSS, purl, d_from=None, d_to=None):
       difference is 99 sample points and 0.5 mSOL bins, and affects the curve's
       level, not its shape.</div>
   </div>
+  </div>
+
+  <div class="rw-grid">
+  <div class="rw-box">
+    <h2>Where the money goes &mdash; GBX</h2>
+    <div class="cs">Gross inflow to its destinations, per slot. Both diagrams
+      share one scale, so ribbons compare between cohorts as well as within
+      each.</div>
+    {sk_g}
+    <div class="rw-legend">{sk_lg}</div>
+  </div>
 
   <div class="rw-box">
-    <h2>Where the money goes</h2>
-    <div class="cs">{html.escape(meta['sankey_note'])}</div>
-    {sk_g}{sk_h}
-    <div class="rw-legend">{sk_lg}</div>
-    <table class="rw-tbl" style="max-width:520px">
-      <thead><tr><th>SOL per slot</th><th>GBX</th>
-        <th>Agave Harmonic</th></tr></thead>
-      <tbody>{facts}</tbody>
-    </table>
-    <div class="rw-note">Every flow is <b>per slot</b>, and both diagrams share
-      one scale, so ribbons are comparable between the cohorts as well as
-      within each. Harmonic's operators run {Hm['comm_bps']/100:.1f}% MEV
-      commission against GBX's {G['comm_bps']/100:.1f}%, so they keep more of
-      each tip.</div>
+    <h2>Where the money goes &mdash; Agave Harmonic</h2>
+    <div class="cs">Same scale as the panel beside it. Harmonic's operators run
+      {Hm['comm_bps']/100:.1f}% MEV commission against GBX's
+      {G['comm_bps']/100:.1f}%, so a wider share of each tip stays with the
+      validator rather than the stakers.</div>
+    {sk_h}
+    <div class="rw-note" style="margin-top:14px">
+      {html.escape(meta['sankey_note'])}</div>
   </div>
+  </div>
+
+  <table class="rw-tbl" style="max-width:560px">
+    <thead><tr><th>SOL per slot</th><th>GBX</th>
+      <th>Agave Harmonic</th></tr></thead>
+    <tbody>{facts}</tbody>
+  </table>
 
   <table class="rw-tbl">
     <thead><tr><th>day</th><th>GBX slots</th><th>H vals</th><th>H slots</th>
