@@ -157,10 +157,21 @@ REWARDS_CSS = """
   grid-template-columns:repeat(auto-fit,minmax(440px,1fr))}
 .rw-grid>.rw-box{margin-bottom:0}
 .rw-box{background:#0e151d;border:1px solid #1e2937;border-radius:11px;
-  padding:16px 18px 10px;overflow-x:auto;margin-bottom:16px}
+  padding:13px 15px 9px;overflow-x:auto;margin-bottom:16px}
 .rw-box.wide{grid-column:1/-1}
-.rw-box h2{margin:0 0 2px;font-size:14px;font-weight:650;color:#dbe4ee}
-.rw-box .cs{color:#6b7f96;font-size:11.5px;margin-bottom:10px;line-height:1.6}
+.rw-box h2{margin:0 0 6px;font-size:13px;font-weight:650;color:#dbe4ee}
+.rw-box .cs{color:#6b7f96;font-size:10.5px;margin:-3px 0 8px;line-height:1.45}
+details.rw-more{margin:10px 0 0}
+details.rw-more>summary{cursor:pointer;color:#6b7f96;font-size:10.5px;
+  list-style:none;padding:3px 0;user-select:none}
+details.rw-more>summary::-webkit-details-marker{display:none}
+details.rw-more>summary:before{content:"▸ ";color:#5eead4}
+details.rw-more[open]>summary:before{content:"▾ "}
+details.rw-more>summary:hover{color:#5eead4}
+details.rw-more .body{color:#6b7f96;font-size:11px;line-height:1.6;
+  padding:8px 0 2px;border-top:1px solid #1e2937;margin-top:4px}
+.rw-strip{margin:0 28px 14px;color:#6b7f96;font-size:11px;line-height:1.6}
+.rw-strip b{color:#5eead4;font-weight:600}
 .rw-legend{display:flex;gap:16px;flex-wrap:wrap;margin:8px 0 2px;
   padding-top:11px;border-top:1px solid #1e2937}
 .rw-lg{display:flex;align-items:center;gap:7px;color:#9fb2c8;font-size:11.5px}
@@ -226,7 +237,7 @@ def _sankey_flows(P):
                 keep=keep, stake=jn - keep, gross=fee + jg + oth)
 
 
-def _sankey(P, side, title, col, scale_gross, W=620, H=300):
+def _sankey(P, side, title, col, scale_gross, W=620, H=340):
     """Where a cohort's gross inflow ends up, PER SLOT, over the range.
 
     Three columns: source stream -> intermediate -> destination. Ribbon height
@@ -314,7 +325,7 @@ def _sankey(P, side, title, col, scale_gross, W=620, H=300):
             f'below.">{"".join(sv)}</svg>'), facts
 
 
-def _panel_ratio(qg, qh, W=620, H=290):
+def _panel_ratio(qg, qh, W=620, H=340):
     """harmonic(p) / gbx(p) at each percentile.
 
     A ratio rather than two lines because the question is where the cohorts
@@ -367,7 +378,7 @@ def _panel_ratio(qg, qh, W=620, H=290):
             f'percentile. Values in the table below.">{"".join(sv)}</svg>'), rat
 
 
-def _panel_gap(qg, qh, W=620, H=290):
+def _panel_gap(qg, qh, W=620, H=340):
     """Cumulative share of the total mean gap, by percentile.
 
     Each percentile contributes (harm(p) - gbx(p)) / n to the difference in
@@ -446,7 +457,7 @@ def rewards_page(CSS, purl, d_from=None, d_to=None):
     qh = _quantiles(Hm["hist"], Hm["slots"])
 
     # ---------------- panel 1: ECDF
-    W2, H2 = 1010, 400
+    W2, H2 = 1010, 470
     L2, R2, T2, B2 = 66, 132, 16, 46
     pw2, ph2 = W2 - L2 - R2, H2 - T2 - B2
     xmax = max(_pct(G["hist"], G["slots"], .90),
@@ -590,12 +601,25 @@ def rewards_page(CSS, purl, d_from=None, d_to=None):
   <a class="navlink" href="{purl("/reference")}">metrics reference</a>
 </header>
 
-<div class="callout">
-  <b class="rw-ok">Verified against reports.firedancer.io on all
-  {len(all_dates)} days.</b> {html.escape(meta['verification'])}<br><br>
-  <b>Basis.</b> {html.escape(meta['basis'])}<br>
-  <b>Like-for-like.</b> {html.escape(meta['like_note'])}<br>
-  <b>Means.</b> {html.escape(meta.get('trimmed_note',''))}
+<div class="rw-strip">
+  <b>Verified against reports.firedancer.io on all {len(all_dates)} days.</b>
+  Reward = fee + Jito tip net of 6%; means trimmed to p1&ndash;p99;
+  GBX's Titan/Bifrost tips excluded from every comparison.
+  <details class="rw-more" style="display:inline-block;margin-left:6px">
+    <summary>method, caveats and sources</summary>
+    <div class="body">
+      <b>Verification.</b> {html.escape(meta['verification'])}<br>
+      <b>Basis.</b> {html.escape(meta['basis'])}<br>
+      <b>Like-for-like.</b> {html.escape(meta['like_note'])}<br>
+      <b>Means.</b> {html.escape(meta.get('trimmed_note',''))}<br>
+      <b>Money flow.</b> {html.escape(meta['sankey_note'])}<br>
+      <b>Before quoting a number.</b>
+      <ul style="margin:4px 0 0 18px;padding:0">{cav}</ul>
+      <b>Sources.</b> histograms <code>{html.escape(meta['sources']['hist'])}</code>;
+      commission <code>{html.escape(meta['sources']['commission'])}</code>;
+      reference <code>{html.escape(meta['sources']['report'])}</code>.
+    </div>
+  </details>
 </div>
 
 <div class="rw-wrap">
@@ -604,82 +628,52 @@ def rewards_page(CSS, purl, d_from=None, d_to=None):
 
   <div class="rw-box wide">
     <h2>Rewards distribution &mdash; {d_from} to {d_to}</h2>
-    <div class="cs">Exact ECDF pooled over the selected range: at revenue
-      <i>x</i>, the height is the share of that cohort's slots earning at or
-      below <i>x</i>. Markers give p50 and p90 with their SOL values. Hover
-      reads <b>horizontally</b> &mdash; pick a percentile and compare each
-      cohort's SOL at that level, which is the gap that matters.</div>
+    <div class="cs">Share of slots earning at or below <i>x</i>. Hover reads
+      horizontally: pick a percentile, compare SOL.</div>
     <svg viewBox="0 0 {W2} {H2}" width="100%"
          style="max-width:{W2}px;display:block" role="img"
          aria-label="Empirical CDF of per-slot revenue pooled over {d_from} to
          {d_to}.">{''.join(p2)}</svg>
     <div class="rw-legend">{lg}</div>
     {stats}
-    <div class="rw-note">x-axis is framed on p90 &times; 1.6; the tail runs far
-      past it. Means on the cards are trimmed to p1&ndash;p99
-      ({g_kept:,.0f} of {G['slots']:,} GBX slots and {h_kept:,.0f} of
-      {Hm['slots']:,} Harmonic slots kept), so a handful of extreme blocks
-      cannot carry the headline.</div>
   </div>
 
   <div class="rw-grid">
   <div class="rw-box">
     <h2>Quantile ratio &mdash; harmonic / gbx</h2>
-    <div class="cs">At each percentile <i>p</i>, Harmonic's revenue divided by
-      GBX's. Above 1.0 Harmonic leads; the shaded band marks where GBX does.
-      This is the panel that says <b>where</b> the two differ rather than by
-      how much overall.</div>
+    <div class="cs">Above 1.0 Harmonic leads. Rising = the gap widens with
+      block value.</div>
     {ratio_svg}
-    <div class="rw-note">Ratio at p1 {rat[0]:.2f}&times;, p50 {rat[49]:.2f}&times;,
-      p90 {rat[89]:.2f}&times;, p99 {rat[-1]:.2f}&times;. A rising line means the
-      gap widens with block value.</div>
   </div>
 
   <div class="rw-box">
     <h2>Cumulative share of the mean gap ({ht-gt:.6f} SOL)</h2>
-    <div class="cs">The headline gap is the exact difference in trimmed means,
-      {ht:.6f} &minus; {gt:.6f}. The curve decomposes it on the p1&ndash;p99
-      quantile grid: each percentile contributes (harmonic &minus; gbx), and the
-      line is the running share of that total. The dashed diagonal is what an
-      evenly spread gap would look like.</div>
+    <div class="cs">Below the diagonal = concentrated in the tail.
+      p1&ndash;p90 hold {r90*100:.0f}%.</div>
     {gap_svg}
-    <div class="rw-note">Percentiles p1&ndash;p90 account for
-      {r90*100:.0f}% of the gap, so the remaining {100-r90*100:.0f}% comes from
-      the top tenth of slots &mdash; which is why trimming to p1&ndash;p99
-      narrows the gap to {d_mean:+.1f}%. The quantile grid sums to
-      {gap_tot/99:.6f} SOL against the exact {ht-gt:.6f}; the ~{abs((gap_tot/99)/(ht-gt)-1)*100:.0f}%
-      difference is 99 sample points and 0.5 mSOL bins, and affects the curve's
-      level, not its shape.</div>
   </div>
   </div>
 
   <div class="rw-grid">
   <div class="rw-box">
     <h2>Where the money goes &mdash; GBX</h2>
-    <div class="cs">Gross inflow to its destinations, per slot. Both diagrams
-      share one scale, so ribbons compare between cohorts as well as within
-      each.</div>
+    <div class="cs">Per slot. Both panels share one scale.</div>
     {sk_g}
     <div class="rw-legend">{sk_lg}</div>
   </div>
 
   <div class="rw-box">
     <h2>Where the money goes &mdash; Agave Harmonic</h2>
-    <div class="cs">Same scale as the panel beside it. Harmonic's operators run
-      {Hm['comm_bps']/100:.1f}% MEV commission against GBX's
-      {G['comm_bps']/100:.1f}%, so a wider share of each tip stays with the
-      validator rather than the stakers.</div>
+    <div class="cs">MEV commission {Hm['comm_bps']/100:.1f}% vs GBX's
+      {G['comm_bps']/100:.1f}% &mdash; more of each tip stays with the
+      validator.</div>
     {sk_h}
-    <div class="rw-note" style="margin-top:14px">
-      {html.escape(meta['sankey_note'])}</div>
+    <table class="rw-tbl" style="max-width:100%;margin-top:14px">
+      <thead><tr><th>SOL per slot</th><th>GBX</th><th>Harmonic</th></tr></thead>
+      <tbody>{facts}</tbody>
+    </table>
   </div>
   </div>
-
-  <table class="rw-tbl" style="max-width:560px">
-    <thead><tr><th>SOL per slot</th><th>GBX</th>
-      <th>Agave Harmonic</th></tr></thead>
-    <tbody>{facts}</tbody>
-  </table>
 
   <table class="rw-tbl">
     <thead><tr><th>day</th><th>GBX slots</th><th>H vals</th><th>H slots</th>
@@ -687,19 +681,13 @@ def rewards_page(CSS, purl, d_from=None, d_to=None):
       <th>GBX comm</th><th>H comm</th><th>GBX other</th></tr></thead>
     <tbody>{''.join(rows)}</tbody>
   </table>
-  <div class="rw-key">{key}</div>
-  <div class="rw-note">Shaded rows are days GBX led; faded rows fall outside
-    the selected range.</div>
-
-  <div class="rw-note" style="margin-top:22px">
-    <b style="color:#8fa6bf">Read this before quoting a number</b>
-    <ul style="margin:6px 0 0 18px;padding:0">{cav}</ul>
-    <div style="margin-top:10px"><b>Sources.</b>
-      histograms <code>{html.escape(meta['sources']['hist'])}</code>;
-      commission <code>{html.escape(meta['sources']['commission'])}</code>;
-      reference <code>{html.escape(meta['sources']['report'])}</code>.
+  <details class="rw-more">
+    <summary>what each column means</summary>
+    <div class="body"><div class="rw-key" style="border:none;margin:0;padding:0">
+      {key}</div>
+      Shaded rows are days GBX led; faded rows fall outside the selected range.
     </div>
-  </div>
+  </details>
 </div>
 
 <div id="rw-tip"></div>
