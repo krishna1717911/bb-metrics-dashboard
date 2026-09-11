@@ -237,7 +237,7 @@ def _sankey_flows(P):
                 keep=keep, stake=jn - keep, gross=fee + jg + oth)
 
 
-def _sankey(P, side, title, col, scale_gross, W=620, H=340):
+def _sankey(P, side, title, col, scale_gross, W=900, H=430):
     """Where a cohort's gross inflow ends up, PER SLOT, over the range.
 
     Three columns: source stream -> intermediate -> destination. Ribbon height
@@ -318,14 +318,14 @@ def _sankey(P, side, title, col, scale_gross, W=620, H=340):
              ("Jito tips gross / slot", jg), ("Jito 6% cut / slot", jito_cut),
              ("to stakers / slot", stake),
              ("validator keeps / slot", fee + keep + oth)]
-    return (f'<svg viewBox="0 0 {W} {H}" width="100%" '
-            f'style="max-width:{W}px;display:block" role="img" '
+    return (f'<svg viewBox="0 0 {W} {H}" '
+            f'style="width:100%;display:block" role="img" '
             f'aria-label="{title} revenue flow: gross inflow to Jito '
             f'commission, stakers and the validator. Values in the table '
             f'below.">{"".join(sv)}</svg>'), facts
 
 
-def _panel_ratio(qg, qh, W=620, H=340):
+def _panel_ratio(qg, qh, W=900, H=430):
     """harmonic(p) / gbx(p) at each percentile.
 
     A ratio rather than two lines because the question is where the cohorts
@@ -340,7 +340,7 @@ def _panel_ratio(qg, qh, W=620, H=340):
     sx = lambda i: L + pw * i / (len(rat) - 1)
     sy = lambda v: T + ph * (1 - (v - lo) / (hi - lo))
     sv = []
-    ticks = [(f"p{p}", sx(p - 1)) for p in (1, 25, 50, 75, 99)]
+    ticks = [(f"p{p}", sx(p - 1)) for p in (1, 10, 20, 30, 40, 50, 60, 70, 80, 90, 99)]
     ysteps = [lo + (hi - lo) * i / 4 for i in range(5)]
     _axes(sv, L, T, pw, ph, "percentile", "",
           ticks, [(f"{v:.2f}×", sy(v)) for v in ysteps], W, H)
@@ -372,13 +372,13 @@ def _panel_ratio(qg, qh, W=620, H=340):
     sv.append(f'<text x="{sx(len(rat)-1):.1f}" y="{sy(rat[-1])-9:.1f}" '
               f'text-anchor="end" fill="{C_RATIO}" font-size="10.5" '
               f'font-weight="600">{rat[-1]:.2f}× at p99</text>')
-    return (f'<svg viewBox="0 0 {W} {H}" width="100%" '
-            f'style="max-width:{W}px;display:block" role="img" '
+    return (f'<svg viewBox="0 0 {W} {H}" '
+            f'style="width:100%;display:block" role="img" '
             f'aria-label="Ratio of Agave Harmonic to GBX revenue at each '
             f'percentile. Values in the table below.">{"".join(sv)}</svg>'), rat
 
 
-def _panel_gap(qg, qh, W=620, H=340):
+def _panel_gap(qg, qh, W=900, H=430):
     """Cumulative share of the total mean gap, by percentile.
 
     Each percentile contributes (harm(p) - gbx(p)) / n to the difference in
@@ -394,7 +394,7 @@ def _panel_gap(qg, qh, W=620, H=340):
     sx = lambda i: L + pw * i / (len(d) - 1)
     sy = lambda f: T + ph * (1 - f)
     _axes(sv, L, T, pw, ph, "percentile", "",
-          [(f"p{p}", sx(p - 1)) for p in (1, 25, 50, 75, 99)],
+          [(f"p{p}", sx(p - 1)) for p in (1, 10, 25, 50, 75, 90, 99)],
           [(f"{int(f*100)}%", sy(f)) for f in (0, .25, .5, .75, 1)], W, H)
     sv.append(f'<line x1="{L}" y1="{sy(0):.1f}" x2="{L+pw}" y2="{sy(1):.1f}" '
               f'stroke="#6b7f96" stroke-width="1" stroke-dasharray="4 4"/>')
@@ -411,8 +411,8 @@ def _panel_gap(qg, qh, W=620, H=340):
     sv.append(f'<text x="{L+pw-6:.0f}" y="{sy(.52):.1f}" text-anchor="end" '
               f'fill="#8fa6bf" font-size="9.5" font-style="italic">below the '
               f'diagonal &rarr; tail-concentrated</text>')
-    return (f'<svg viewBox="0 0 {W} {H}" width="100%" '
-            f'style="max-width:{W}px;display:block" role="img" '
+    return (f'<svg viewBox="0 0 {W} {H}" '
+            f'style="width:100%;display:block" role="img" '
             f'aria-label="Cumulative share of the total mean gap by '
             f'percentile.">{"".join(sv)}</svg>'), tot, r90
 
@@ -457,8 +457,8 @@ def rewards_page(CSS, purl, d_from=None, d_to=None):
     qh = _quantiles(Hm["hist"], Hm["slots"])
 
     # ---------------- panel 1: ECDF
-    W2, H2 = 1010, 470
-    L2, R2, T2, B2 = 66, 132, 16, 46
+    W2, H2 = 1500, 470
+    L2, R2, T2, B2 = 78, 150, 18, 48
     pw2, ph2 = W2 - L2 - R2, H2 - T2 - B2
     xmax = max(_pct(G["hist"], G["slots"], .90),
                _pct(Hm["hist"], Hm["slots"], .90)) * 1.6 or 0.1
@@ -630,8 +630,8 @@ def rewards_page(CSS, purl, d_from=None, d_to=None):
     <h2>Rewards distribution &mdash; {d_from} to {d_to}</h2>
     <div class="cs">Share of slots earning at or below <i>x</i>. Hover reads
       horizontally: pick a percentile, compare SOL.</div>
-    <svg viewBox="0 0 {W2} {H2}" width="100%"
-         style="max-width:{W2}px;display:block" role="img"
+    <svg viewBox="0 0 {W2} {H2}"
+         style="width:100%;display:block" role="img"
          aria-label="Empirical CDF of per-slot revenue pooled over {d_from} to
          {d_to}.">{''.join(p2)}</svg>
     <div class="rw-legend">{lg}</div>
