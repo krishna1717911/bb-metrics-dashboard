@@ -693,7 +693,10 @@ def rewards_page(CSS, purl, d_from=None, d_to=None):
 <div id="rw-tip"></div>
 <script>
 (function(){{
-  var D={js}, L={L2}, PW={pw2}, T={T2}, PH={ph2}, VB={W2};
+  // VBH is the viewBox HEIGHT. The hover maps a y pixel back into viewBox
+  // units, so it must scale by height/height -- using the viewBox WIDTH here
+  // ran the crosshair {W2}/{H2}x too fast and pinned it to the top of the plot.
+  var D={js}, L={L2}, PW={pw2}, T={T2}, PH={ph2}, VBH={H2};
   var boxes=document.querySelectorAll('.rw-box svg'), svg=boxes[0],
       hit=document.getElementById('rw-hit'),
       cross=document.getElementById('rw-cross'),
@@ -702,7 +705,9 @@ def rewards_page(CSS, purl, d_from=None, d_to=None):
   if(!svg||!hit) return;
   function px(v){{ return L+PW*Math.min(v/D.xmax,1); }}
   hit.addEventListener('mousemove',function(ev){{
-    var r=svg.getBoundingClientRect(), k=VB/r.height;
+    var r=svg.getBoundingClientRect();
+    if(!r.height) return;
+    var k=VBH/r.height;
     var f=Math.min(1,Math.max(0,1-((ev.clientY-r.top)*k-T)/PH));
     var q=Math.min(99,Math.max(1,Math.round(f*100)));
     var y=T+PH*(1-q/100), g=D.gbx[q-1], h=D.harm[q-1];
