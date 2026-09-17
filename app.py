@@ -2902,6 +2902,35 @@ def _perf_relay():
     return out
 
 
+def _perf_reasons():
+    """Why the relay turned each builder's offers away, by reason.
+
+    Counted two ways because they answer different questions: `events` is how
+    many offers were refused, `rounds` how many distinct rounds were affected.
+    They diverge by an order of magnitude -- one builder took 65,990 refusals
+    across 2,275 rounds -- because a builder re-offers all through a round and
+    every rung is refused again. Rounds is the honest denominator for "how
+    often did this stop us"; events shows how hard we kept trying."""
+    out = {}
+    if not (RELAY_URL and RELAY_DS_UID):
+        return out
+    try:
+        _, rows = relay(
+            "SELECT assumeNotNull(builder_id) AS b, reason,"
+            " count() AS events, uniqExact((slot, index_in_slot)) AS rounds"
+            " FROM relay.mini_block_events"
+            f" WHERE timestamp > now() - INTERVAL {PERF_WINDOW_H} HOUR"
+            "   AND event = 'offer_rejected' AND builder_id IS NOT NULL"
+            " GROUP BY b, reason ORDER BY rounds DESC")
+        for b, reason, events, rounds in rows:
+            out.setdefault(b, []).append(
+                {"reason": reason or "(none given)",
+                 "events": ch_int(events), "rounds": ch_int(rounds)})
+    except Exception:
+        pass
+    return out
+
+
 def perf_stats():
     with _perf_lock:
         hit = _perf_cache.get("v")
@@ -2912,12 +2941,14 @@ def perf_stats():
         fx = pool.submit(_perf_influx, "sim-extend")
         fc = pool.submit(_perf_influx, "sim-commit")
         fr = pool.submit(_perf_relay)
+        fw = pool.submit(_perf_reasons)
         def safe(f, d):
             try:
                 return f.result()
             except Exception:
                 return d
         ext, com, rel = safe(fx, {}), safe(fc, {}), safe(fr, {})
+        why = safe(fw, {})
     rows = []
     for d in DEPLOYMENTS:
         host = (d.get("sims") or [""])[0]
@@ -2926,6 +2957,7 @@ def perf_stats():
             "instance": d.get("instance", ""), "host": host,
             "extend": ext.get(host), "commit": com.get(host),
             "relay": rel.get(d.get("relay_builder") or d.get("builder") or ""),
+            "reasons": why.get(d.get("relay_builder") or d.get("builder") or ""),
         })
     out = {"rows": rows, "at": time.time(),
            "hosts_seen": sorted(set(ext) | set(com))}
@@ -2939,6 +2971,25 @@ def _us(v):
         return '<td class="n m dim">&mdash;</td>'
     return (f'<td class="n m">{v/1000:,.2f}</td>' if v >= 1000
             else f'<td class="n m">{v/1000:,.3f}</td>')
+
+
+def _reason_cell(r):
+    """The builder name, opening to why the relay refused its offers."""
+    name = html.escape(r["label"])
+    rows = r.get("reasons") or []
+    if not rows:
+        return name
+    tot = sum(x["rounds"] for x in rows) or 1
+    inner = "".join(
+        f'<tr><td>{html.escape(x["reason"])}</td>'
+        f'<td class="n m">{x["rounds"]:,}</td>'
+        f'<td class="n m dim">{100.0 * x["rounds"] / tot:.1f}%</td>'
+        f'<td class="n m dim">{x["events"]:,}</td></tr>' for x in rows)
+    return (f'{name}<details class="rsn"><summary>{len(rows)} reason'
+            f'{"" if len(rows) == 1 else "s"}</summary>'
+            '<table class="rsntab"><tr><th>reason</th><th class=n>rounds</th>'
+            "<th class=n>share</th><th class=n>offers</th></tr>"
+            + inner + "</table></details>")
 
 
 def perf_stats_html():
@@ -2968,13 +3019,13 @@ def perf_stats_html():
     for r in rows:
         rel = r.get("relay")
         if not rel:
-            wbody += (f'<tr><td class="m">{html.escape(r["label"])}</td>'
+            wbody += (f'<tr><td class="m">{_reason_cell(r)}</td>'
                       '<td class="n m dim" colspan=4>the relay recorded no '
                       "offers from this builder</td></tr>")
             continue
         off, won = rel["offered"], rel["won"]
         rate = (100.0 * won / off) if off else 0.0
-        wbody += (f'<tr><td class="m">{html.escape(r["label"])}</td>'
+        wbody += (f'<tr><td class="m">{_reason_cell(r)}</td>'
                   f'<td class="n m">{won:,}</td>'
                   f'<td class="n m dim">{off:,}</td>'
                   f'<td class="n m"><b>{rate:.2f}%</b></td>'
@@ -2991,7 +3042,13 @@ def perf_stats_html():
             "Wins come from the relay&rsquo;s <code>round_chosen</code>, which is "
             "the only authoritative record of who won; our own "
             "<code>won_by_us</code> is not usable for this, it reads true for "
-            "the mock, which the relay never picks."
+            "the mock, which the relay never picks. Open a builder to see why "
+            "the relay refused its offers: <b>rounds</b> is how many distinct "
+            "rounds carried that refusal, <b>offers</b> how many individual "
+            "rungs were refused. They differ by an order of magnitude because "
+            "a builder re-offers all through a round and every rung is refused "
+            "again, so rounds is the denominator that answers how often a "
+            "reason actually cost us."
             "</div></div>")
 
     stamp = dt.datetime.fromtimestamp(data["at"], dt.UTC).strftime("%H:%M:%S")
@@ -6227,6 +6284,15 @@ details.perfbox>summary span{font-weight:400;font-size:10.5px;color:#61748b}
 .perfh{font-size:11px;color:#cfe0f0;font-weight:600;margin:0 0 5px;
   display:flex;flex-wrap:wrap;align-items:baseline;gap:9px}
 .perfh .dim{font-weight:400;font-size:10.5px}
+details.rsn{margin-top:3px}
+details.rsn>summary{cursor:pointer;color:#60a5fa;font-size:9.5px;
+  text-transform:uppercase;letter-spacing:.05em;list-style:none}
+details.rsn>summary::-webkit-details-marker{display:none}
+details.rsn>summary:hover{color:#93c5fd}
+table.rsntab{border-collapse:collapse;margin:4px 0 2px;font-size:10.5px}
+table.rsntab th{color:#61748b;font-weight:500;text-align:left;
+  padding:1px 10px 1px 0;border-bottom:1px solid #1e2937;white-space:nowrap}
+table.rsntab td{padding:1px 10px 1px 0;white-space:nowrap;color:#8fa3ba}
 .mssec{margin:0 0 14px}
 .msh{display:flex;flex-wrap:wrap;align-items:baseline;gap:12px;margin:12px 0 6px;
   font-size:12px;color:#cfe0f0;font-weight:600}
