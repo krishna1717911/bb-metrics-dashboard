@@ -2838,6 +2838,182 @@ def dhref(q=""):
     return base + ("&" + q if q else "")
 
 
+# ======================================================= performance stats
+# Every builder on one screen: how long the simulator takes, and how often
+# the relay picks us. Deliberately cross-deployment -- the page is otherwise
+# strictly about one builder at a time, and the question "is this one slow"
+# only has meaning against the others.
+PERF_WINDOW_H = 24
+PERF_PCTS = (50, 90, 95, 99)
+_perf_cache = {}
+_perf_lock = threading.Lock()
+PERF_TTL_S = 300
+
+
+def _perf_influx(meas):
+    """count/mean/percentiles of body_us per simulator host, in one query.
+
+    InfluxQL will mix aggregates and selectors in a single GROUP BY, and
+    repeated percentile() calls come back as percentile, percentile_1, ... in
+    the order asked, so the whole table is one round trip per measurement
+    rather than one per host per statistic."""
+    pcts = ", ".join(f"percentile(body_us, {p})" for p in PERF_PCTS)
+    q = (f'SELECT count(body_us), mean(body_us), {pcts} FROM "{meas}" '
+         f"WHERE time > now() - {PERF_WINDOW_H}h GROUP BY \"host_id\"")
+    out = {}
+    for ser in influx_series(q):
+        host = (ser.get("tags") or {}).get("host_id") or ""
+        vals = (ser.get("values") or [[]])[0]
+        cols = ser.get("columns") or []
+        row = dict(zip(cols, vals))
+        got = {"n": row.get("count") or 0, "mean": row.get("mean")}
+        for i, p in enumerate(PERF_PCTS):
+            got[f"p{p}"] = row.get("percentile" if i == 0 else f"percentile_{i}")
+        out[host] = got
+    return out
+
+
+def _perf_relay():
+    """Wins and participation per builder, from the relay.
+
+    round_chosen is the only authoritative record of who won -- our own
+    won_by_us cannot be used here: it reads true on 84 rounds for the mock,
+    which the relay never picks, and it disagreed with the relay 99 to 11 on
+    one Amsterdam day. Rate is wins over rounds we actually bid in, not over
+    every round that existed, so a builder is not punished for rounds it
+    never saw."""
+    out = {}
+    if not (RELAY_URL and RELAY_DS_UID):
+        return out
+    try:
+        _, rows = relay(
+            "SELECT assumeNotNull(builder_id) AS b,"
+            " uniqExactIf((slot, index_in_slot), event = 'round_chosen') AS won,"
+            " uniqExactIf((slot, index_in_slot), event = 'submitted') AS offered,"
+            " uniqExactIf((slot, index_in_slot), event = 'offer_rejected') AS rejected"
+            " FROM relay.mini_block_events"
+            f" WHERE timestamp > now() - INTERVAL {PERF_WINDOW_H} HOUR"
+            "   AND builder_id IS NOT NULL GROUP BY b")
+        for b, won, offered, rejected in rows:
+            out[b] = {"won": ch_int(won), "offered": ch_int(offered),
+                      "rejected": ch_int(rejected)}
+    except Exception:
+        pass
+    return out
+
+
+def perf_stats():
+    with _perf_lock:
+        hit = _perf_cache.get("v")
+        if hit and time.time() - hit[0] < PERF_TTL_S:
+            return hit[1]
+    import concurrent.futures as cf
+    with cf.ThreadPoolExecutor(max_workers=3) as pool:
+        fx = pool.submit(_perf_influx, "sim-extend")
+        fc = pool.submit(_perf_influx, "sim-commit")
+        fr = pool.submit(_perf_relay)
+        def safe(f, d):
+            try:
+                return f.result()
+            except Exception:
+                return d
+        ext, com, rel = safe(fx, {}), safe(fc, {}), safe(fr, {})
+    rows = []
+    for d in DEPLOYMENTS:
+        host = (d.get("sims") or [""])[0]
+        rows.append({
+            "label": d.get("label") or d["name"], "name": d["name"],
+            "instance": d.get("instance", ""), "host": host,
+            "extend": ext.get(host), "commit": com.get(host),
+            "relay": rel.get(d.get("relay_builder") or d.get("builder") or ""),
+        })
+    out = {"rows": rows, "at": time.time(),
+           "hosts_seen": sorted(set(ext) | set(com))}
+    with _perf_lock:
+        _perf_cache["v"] = (time.time(), out)
+    return out
+
+
+def _us(v):
+    if v is None:
+        return '<td class="n m dim">&mdash;</td>'
+    return (f'<td class="n m">{v/1000:,.2f}</td>' if v >= 1000
+            else f'<td class="n m">{v/1000:,.3f}</td>')
+
+
+def perf_stats_html():
+    data = perf_stats()
+    rows = data["rows"]
+    head = ("<tr><th>builder</th><th class=n>calls</th><th class=n>mean</th>"
+            + "".join(f"<th class=n>p{p}</th>" for p in PERF_PCTS)
+            + "</tr>")
+
+    def block(key, title, note):
+        body = ""
+        for r in rows:
+            s = r.get(key)
+            if not s or not s.get("n"):
+                body += (f'<tr><td class="m">{html.escape(r["label"])}</td>'
+                         '<td class="n m dim" colspan=6>no rows in the last '
+                         f'{PERF_WINDOW_H}h</td></tr>')
+                continue
+            body += (f'<tr><td class="m">{html.escape(r["label"])}</td>'
+                     f'<td class="n m dim">{s["n"]:,}</td>' + _us(s["mean"])
+                     + "".join(_us(s.get(f"p{p}")) for p in PERF_PCTS) + "</tr>")
+        return (f'<div class="perfsec"><div class="perfh">{title}'
+                f'<span class="dim">{note}</span></div>'
+                f'<table class="atab">{head}{body}</table></div>')
+
+    wbody = ""
+    for r in rows:
+        rel = r.get("relay")
+        if not rel:
+            wbody += (f'<tr><td class="m">{html.escape(r["label"])}</td>'
+                      '<td class="n m dim" colspan=4>the relay recorded no '
+                      "offers from this builder</td></tr>")
+            continue
+        off, won = rel["offered"], rel["won"]
+        rate = (100.0 * won / off) if off else 0.0
+        wbody += (f'<tr><td class="m">{html.escape(r["label"])}</td>'
+                  f'<td class="n m">{won:,}</td>'
+                  f'<td class="n m dim">{off:,}</td>'
+                  f'<td class="n m"><b>{rate:.2f}%</b></td>'
+                  f'<td class="n m dim">{rel["rejected"]:,}</td></tr>')
+    wins = ('<div class="perfsec"><div class="perfh">win rate'
+            f'<span class="dim">relay round_chosen, last {PERF_WINDOW_H}h</span>'
+            "</div>"
+            '<table class="atab"><tr><th>builder</th><th class=n>rounds won</th>'
+            "<th class=n>rounds bid in</th><th class=n>win rate</th>"
+            "<th class=n>rounds with a rejection</th></tr>" + wbody + "</table>"
+            '<div class="anote">Win rate is rounds won over rounds this builder '
+            "actually submitted an offer in, not over every round that existed "
+            "&mdash; otherwise a builder looks worse for rounds it never saw. "
+            "Wins come from the relay&rsquo;s <code>round_chosen</code>, which is "
+            "the only authoritative record of who won; our own "
+            "<code>won_by_us</code> is not usable for this, it reads true for "
+            "the mock, which the relay never picks."
+            "</div></div>")
+
+    stamp = dt.datetime.fromtimestamp(data["at"], dt.UTC).strftime("%H:%M:%S")
+    extra = [h for h in data["hosts_seen"]
+             if h not in {r["host"] for r in rows}]
+    warn = ("" if not extra else
+            '<div class="anote warn">&#9888; '
+            f'{len(extra)} simulator host{"" if len(extra) == 1 else "s"} wrote '
+            "rows in this window but belong to no configured builder: "
+            + ", ".join(f"<code>{html.escape(h)}</code>" for h in extra)
+            + ". A new builder, or a stale DEPLOY_*_SIM.</div>")
+    return (block("extend", "extend &mdash; sim-extend body_us (ms)",
+                  f"last {PERF_WINDOW_H}h, per simulator host")
+            + block("commit", "commit &mdash; sim-commit body_us (ms)",
+                    f"last {PERF_WINDOW_H}h, per simulator host")
+            + wins + warn
+            + f'<div class="anote">Measured at {stamp} UTC, cached '
+            f"{PERF_TTL_S // 60} min. Times are the simulator&rsquo;s own "
+            "<code>body_us</code>, so no clock alignment is involved and the "
+            "builders are directly comparable.</div>")
+
+
 def host_name(host):
     d = dep()
     if host and host == d["sim"]:
@@ -6036,6 +6212,21 @@ details.around>summary:hover{background:#111c26}
 .depwho .dwk{color:#4d5c70;font-size:9.5px;text-transform:uppercase;
   letter-spacing:.06em;margin:0 2px 0 8px}
 .depwho .dwnone{color:#7a5c2a}
+details.perfbox{margin:0 0 10px;border:1px solid #16212c;border-radius:7px;
+  background:#0b1219}
+details.perfbox>summary{cursor:pointer;padding:7px 12px;font-size:11.5px;
+  color:#cfe0f0;font-weight:600;letter-spacing:.02em;list-style:none;
+  display:flex;align-items:baseline;gap:10px}
+details.perfbox>summary::-webkit-details-marker{display:none}
+details.perfbox>summary::before{content:'\25B8';color:#4d5c70;font-size:10px}
+details.perfbox[open]>summary::before{content:'\25BE'}
+details.perfbox>summary:hover{color:#eafffb}
+details.perfbox>summary span{font-weight:400;font-size:10.5px;color:#61748b}
+.perfbody{padding:2px 12px 10px}
+.perfsec{margin:8px 0 12px}
+.perfh{font-size:11px;color:#cfe0f0;font-weight:600;margin:0 0 5px;
+  display:flex;flex-wrap:wrap;align-items:baseline;gap:9px}
+.perfh .dim{font-weight:400;font-size:10.5px}
 .mssec{margin:0 0 14px}
 .msh{display:flex;flex-wrap:wrap;align-items:baseline;gap:12px;margin:12px 0 6px;
   font-size:12px;color:#cfe0f0;font-weight:600}
@@ -6484,6 +6675,29 @@ TICK_JS = """
 # The links stay real hrefs and the handler still serves the whole page, so
 # with JavaScript off, or if a fetch fails, navigation simply falls back to
 # what it always did.
+PERF_JS = r'''
+(function(){
+  // The panel is collapsed on arrival and its body is fetched the first time
+  // it is opened, once per page: three cross-store queries behind a details
+  // element nobody may open should not be on the critical path of every load.
+  var box = document.getElementById('perfbox');
+  if (!box) return;
+  box.addEventListener('toggle', function(){
+    var body = box.querySelector('.perfbody');
+    if (!box.open || !body || body.dataset.loaded !== '0') return;
+    body.dataset.loaded = '1';
+    body.innerHTML = '<div class="none">loading&hellip;</div>';
+    fetch('/perf' + location.search)
+      .then(function(r){ return r.text(); })
+      .then(function(t){ body.innerHTML = t; })
+      .catch(function(e){
+        body.dataset.loaded = '0';
+        body.innerHTML = '<div class="err">could not load: ' + e + '</div>';
+      });
+  });
+})();
+'''
+
 NAV_JS = r"""
 (function(){
   var view = document.getElementById('view');
@@ -7355,11 +7569,13 @@ def page(sel_win=None, sel_slot=None, sel_round=None, tab="rounds",
   <a class="navlink" href="{purl("/reference")}">metrics reference &mdash; what is bad?</a>
   <a class="navlink" href="{purl("/rewards")}">reward distribution by scheduler</a>
 </header>
+<details class="perfbox" id="perfbox"><summary>performance stats<span>extend &amp; commit timings, win rate &mdash; every builder</span></summary><div class="perfbody" data-loaded="0"><div class="none">opening&hellip;</div></div></details>
 {health_html()}
 {strip}
 <div id="view">{body}</div>
 <script>{TICK_JS.replace("__SERVER_NOW__", f"{dt.datetime.now(dt.UTC).timestamp():.3f}")}</script>
 <script>{NAV_JS}</script>
+<script>{PERF_JS}</script>
 </body></html>"""
 
 
@@ -8367,9 +8583,11 @@ def analysis_page(start, end, threshold, identity):
   <a class="navlink" href="{purl("/")}">back to the slot explorer</a>
   <a class="navlink" href="{purl("/reference")}">metrics reference</a>
 </header>
+<details class="perfbox" id="perfbox"><summary>performance stats<span>extend &amp; commit timings, win rate &mdash; every builder</span></summary><div class="perfbody" data-loaded="0"><div class="none">opening&hellip;</div></div></details>
 {form}
 <main class="awrap">{body}</main>
 <script>{ANALYSIS_JS}</script>
+<script>{PERF_JS}</script>
 <script>{TICK_JS.replace("__SERVER_NOW__", f"{dt.datetime.now(dt.UTC).timestamp():.3f}")}</script>
 </body></html>"""
 
@@ -8482,6 +8700,20 @@ class Handler(BaseHTTPRequestHandler):
                     (qs2.get("to", [""])[0] or None)).encode()
             except Exception as exc:
                 body = f"<pre>{html.escape(str(exc))}</pre>".encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self._remember_deployment()
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if parsed.path == "/perf":
+            try:
+                out = perf_stats_html()
+            except Exception as exc:
+                out = ('<div class="err">performance stats unavailable: '
+                       f"{html.escape(str(exc))[:200]}</div>")
+            body = out.encode()
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self._remember_deployment()
