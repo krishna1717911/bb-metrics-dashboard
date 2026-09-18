@@ -77,9 +77,31 @@ def _pct(h, total, q):
     return 0.0
 
 
+def _pct_smooth(h, total, q):
+    """Percentile interpolated INSIDE the containing bin.
+
+    _pct returns the bin's left edge, so every quantile lands on a 0.5 mSOL
+    lattice -- across p1..p99 that is only ~76 distinct values. A ratio of two
+    such numbers can only sit on a lattice too, which is the sawtooth on the
+    quantile-ratio panel. It is not a display-precision problem: printing more
+    decimals just prints the steps more exactly.
+
+    Interpolating on rank within the bin makes the quantile a continuous
+    function of q, which is also strictly closer to the underlying value than
+    the left edge is.
+    """
+    target, c = q * total, 0
+    for b in sorted(h):
+        n = h[b][0]
+        if n and c + n >= target:
+            return (b + (target - c) / n) * BIN
+        c += n
+    return max(h) * BIN if h else 0.0
+
+
 def _quantiles(h, total, n=99):
     """q[1..n] in SOL -- the grid both comparison panels are computed on."""
-    return [_pct(h, total, i / (n + 1)) for i in range(1, n + 1)]
+    return [_pct_smooth(h, total, i / (n + 1)) for i in range(1, n + 1)]
 
 
 def _trimmed_mean(h, total, lo=TRIM_LO, hi=TRIM_HI):
@@ -320,7 +342,7 @@ def _fig_ecdf(G, Hm, xmax):
         ys = [f * 100 for _, f in pts]
         return dict(type="scatter", mode="lines", name=f'{name} (n={P["slots"]:,})',
                     x=xs, y=ys, line=dict(color=colour, width=2.4),
-                    hovertemplate="%{y:.1f}% of slots at or below %{x:.5f} SOL<extra></extra>")
+                    hovertemplate="%{x:.6f} SOL")
     traces = [tr(Hm, "Agave Harmonic", C_HARM), tr(G, "GBX", C_GBX)]
     for P, colour, nm in ((Hm, C_HARM, "Harmonic"), (G, C_GBX, "GBX")):
         qs = [0.50, 0.90]
@@ -329,13 +351,13 @@ def _fig_ecdf(G, Hm, xmax):
             x=[_pct(P["hist"], P["slots"], q) for q in qs], y=[q * 100 for q in qs],
             marker=dict(color=colour, size=10, line=dict(color="#0e151d", width=2)),
             text=[f"{nm} p{int(q*100)}" for q in qs],
-            hovertemplate="%{text}: %{x:.5f} SOL<extra></extra>"))
+            hovertemplate="%{text}: %{x:.6f} SOL<extra></extra>"))
     lay = dict(LAYOUT, height=430,
                xaxis=dict(AXIS, title="per-slot revenue (SOL) — fee + Jito tip net of 6%",
                           range=[0, xmax]),
                yaxis=dict(AXIS, title="cumulative probability", ticksuffix="%",
-                          range=[0, 100]),
-               hovermode="x unified")
+                          range=[0, 100], hoverformat=".1f"),
+               hovermode="y unified")
     return dict(data=traces, layout=lay, config=CONFIG)
 
 
@@ -345,13 +367,15 @@ def _fig_ratio(qg, qh):
     traces = [
         dict(type="scatter", mode="lines", name="harmonic / gbx", x=ps, y=rat,
              line=dict(color=C_RATIO, width=2.4),
-             hovertemplate="p%{x}: %{y:.3f}×<extra></extra>"),
+             hovertemplate="%{y:.6f}×<extra></extra>"),
         dict(type="scatter", mode="lines", name="parity", x=[1, 99], y=[1, 1],
              line=dict(color="#8fa6bf", width=1.4, dash="solid"), hoverinfo="skip"),
     ]
     lay = dict(LAYOUT, height=330,
-               xaxis=dict(AXIS, title="percentile", tickprefix="p"),
-               yaxis=dict(AXIS, title="harmonic ÷ gbx", ticksuffix="×"),
+               xaxis=dict(AXIS, title="percentile", tickprefix="p",
+                          hoverformat="d"),
+               yaxis=dict(AXIS, title="harmonic ÷ gbx", ticksuffix="×",
+                          hoverformat=".6f"),
                hovermode="x unified", showlegend=False)
     return dict(data=traces, layout=lay, config=CONFIG)
 
@@ -370,11 +394,13 @@ def _fig_gap(qg, qh):
         dict(type="scatter", mode="lines", name="cumulative share", x=ps, y=cum,
              line=dict(color=C_GAP, width=2.4), fill="tozeroy",
              fillcolor="rgba(57,135,229,0.10)",
-             hovertemplate="p1–p%{x} hold %{y:.0f}% of the gap<extra></extra>"),
+             hovertemplate="p1–p%{x} hold %{y:.2f}% of the gap<extra></extra>"),
     ]
     lay = dict(LAYOUT, height=330,
-               xaxis=dict(AXIS, title="percentile", tickprefix="p"),
-               yaxis=dict(AXIS, title="share of the mean gap", ticksuffix="%"),
+               xaxis=dict(AXIS, title="percentile", tickprefix="p",
+                          hoverformat="d"),
+               yaxis=dict(AXIS, title="share of the mean gap", ticksuffix="%",
+                          hoverformat=".2f"),
                hovermode="x unified", showlegend=False)
     return dict(data=traces, layout=lay, config=CONFIG)
 
