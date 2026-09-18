@@ -200,6 +200,14 @@ details.rw-more .body{color:#6b7f96;font-size:11px;line-height:1.6;
 .rw-key div{color:#6b7f96;font-size:11px;line-height:1.55}
 .rw-key b{color:#9fb2c8;font-weight:600}
 .rw-note{color:#6b7f96;font-size:11px;margin-top:9px;line-height:1.65}
+.rw-ctl{display:flex;gap:16px;flex-wrap:wrap;align-items:center;margin:-2px 0 8px}
+.rw-ctl .g{display:flex;gap:4px;align-items:center}
+.rw-ctl .lb{color:#6b7f96;font-size:10px;text-transform:uppercase;
+  letter-spacing:.06em;margin-right:2px}
+.rw-ctl a{color:#8fa6bf;font-size:10.5px;text-decoration:none;padding:3px 9px;
+  border:1px solid #22303f;border-radius:5px}
+.rw-ctl a:hover{border-color:#5eead4;color:#5eead4}
+.rw-ctl a.on{background:#12314d;border-color:#3987e5;color:#7cc0ff;font-weight:650}
 .rw-ok{color:#5eead4}
 form.rw-range{display:flex;gap:9px;align-items:flex-end;flex-wrap:wrap;
   margin:0 0 14px}
@@ -417,6 +425,174 @@ def _panel_gap(qg, qh, W=900, H=430):
             f'percentile.">{"".join(sv)}</svg>'), tot, r90
 
 
+CU_LABELS = ["0-10k", "10-50k", "50-100k", "100-150k", "150-200k",
+             "200-250k", "250-300k", "300-500k", "500k-1m", "1m+"]
+
+# Sequential ramps, one hue per cohort so identity carries over from the other
+# panels. Deliberately NOT a rainbow: height is a magnitude, and a magnitude
+# takes one hue light-to-dark.
+RAMP = {
+    "gbx":  ["#16304d", "#1d4a7a", "#2463a6", "#2f7fd0", "#3987e5", "#63a5ee", "#96c6f6"],
+    "harm": ["#4d2410", "#7a371a", "#a64a23", "#d05c2c", "#d95926", "#ea8354", "#f5b189"],
+}
+
+
+def _pool_cu(days, dates, side):
+    """Sum absolute SOL per (band, bucket) over a date range, then normalise.
+
+    Stored as SOL rather than shares precisely so this is a plain sum -- shares
+    could not be pooled across days any more than percentiles could.
+    """
+    grid = [[0.0] * 10 for _ in range(100)]
+    for d in dates:
+        cu = days[d][side].get("cu")
+        if not cu:
+            continue
+        for p in range(100):
+            for b in range(10):
+                grid[p][b] += cu[p][b]
+    out, totals = [], []
+    for p in range(100):
+        t = sum(grid[p])
+        totals.append(t)
+        out.append([(v / t * 100 if t else 0.0) for v in grid[p]])
+    return out, totals
+
+
+def _panel_cu3d(days, dates, side, col, render, hscale, cam, inspect,
+                W=1010, H=560):
+    """Isometric 3-D field: x = CU bucket, y = reward percentile, z = share.
+
+    Hand-rolled projection rather than a library: the page is stdlib-only and
+    server-rendered, and the grid is small enough (10 x 100) that an SVG of
+    projected marks is cheaper than shipping a 3-D renderer.
+    """
+    grid, totals = _pool_cu(days, dates, side)
+    ramp = RAMP[side]
+    L, T = 92, 74
+    pw, ph = W - L - 130, H - T - 96
+
+    # Unit basis vectors per axis, then auto-fit. Fitting after projection means
+    # no camera can push marks outside the viewBox, which hand-tuned constants
+    # did -- the percentile axis runs 0..99 against the bucket axis's 0..9, so
+    # any shared scale overflows by an order of magnitude.
+    if cam == "over":            # straight down: a plain heatmap
+        ux, uy, vx, vy, zf = 1.0, 0.0, 0.0, 1.0, 0.0
+    elif cam == "along":         # sighting down the percentile axis
+        ux, uy, vx, vy, zf = 1.0, 0.0, 0.06, 0.30, 1.0
+    else:                        # isometric
+        ux, uy, vx, vy, zf = 1.0, -0.42, 0.62, 0.62, 1.0
+
+    zmax = max((v for row in grid for v in row), default=1.0) or 1.0
+    def hgt(v):
+        return ((v / zmax) ** 0.5 if hscale == "sqrt" else v / zmax)
+
+    # raw projection in arbitrary units: bucket index 0..9, percentile 0..99
+    def raw(b, p, v):
+        bb, pp = b / 9.0, p / 99.0
+        return (bb * ux + pp * vx, bb * uy + pp * vy - hgt(v) * zf * 0.55)
+
+    xs, ys = [], []
+    for pp in range(100):
+        for bb in range(10):
+            for vv in (0.0, grid[pp][bb]):
+                x, y = raw(bb, pp, vv)
+                xs.append(x); ys.append(y)
+    fx0, fx1 = min(xs), max(xs)
+    fy0, fy1 = min(ys), max(ys)
+    sxf = pw / (fx1 - fx0) if fx1 > fx0 else 1.0
+    syf = ph / (fy1 - fy0) if fy1 > fy0 else 1.0
+    ox, oy = L + 34, T
+
+    def proj(b, p, v):
+        x, y = raw(b, p, v)
+        return (ox + (x - fx0) * sxf, oy + (y - fy0) * syf)
+    def colour(v):
+        return ramp[min(len(ramp) - 1, int(hgt(v) * len(ramp)))]
+
+    sv = []
+    # floor grid
+    for b in range(11):
+        ax_, ay_ = proj(min(b, 9), 0, 0); bx_, by_ = proj(min(b, 9), 99, 0)
+        sv.append(f'<line x1="{ax_:.1f}" y1="{ay_:.1f}" x2="{bx_:.1f}" y2="{by_:.1f}" '
+                  f'stroke="#1a2431" stroke-width="1"/>')
+    for p in range(0, 100, 10):
+        ax_, ay_ = proj(0, p, 0); bx_, by_ = proj(9, p, 0)
+        sv.append(f'<line x1="{ax_:.1f}" y1="{ay_:.1f}" x2="{bx_:.1f}" y2="{by_:.1f}" '
+                  f'stroke="#1a2431" stroke-width="1"/>')
+
+    # painter's algorithm: draw the rows that project highest on screen first,
+    # so nearer rows overlap them. Derived from the projection rather than the
+    # basis vectors, so it stays correct under every camera.
+    order = sorted(range(100), key=lambda p: proj(0, p, 0)[1])
+    if render == "surface":
+        for p in order[:-1]:
+            q = p + 1
+            if q > 99:
+                continue
+            for b in range(9):
+                a_ = proj(b, p, grid[p][b]); b_ = proj(b + 1, p, grid[p][b + 1])
+                c_ = proj(b + 1, q, grid[q][b + 1]); d_ = proj(b, q, grid[q][b])
+                m = (grid[p][b] + grid[p][b + 1] + grid[q][b] + grid[q][b + 1]) / 4
+                sv.append(f'<polygon points="{a_[0]:.1f},{a_[1]:.1f} {b_[0]:.1f},{b_[1]:.1f} '
+                          f'{c_[0]:.1f},{c_[1]:.1f} {d_[0]:.1f},{d_[1]:.1f}" '
+                          f'fill="{colour(m)}" fill-opacity="0.85" '
+                          f'stroke="{colour(m)}" stroke-width="0.4"/>')
+    elif render == "ribbons":
+        for b in range(10):
+            pts = " ".join(f"{x:.1f},{y:.1f}" for x, y in
+                           (proj(b, p, grid[p][b]) for p in range(100)))
+            base = " ".join(f"{x:.1f},{y:.1f}" for x, y in
+                            (proj(b, p, 0) for p in range(99, -1, -1)))
+            sv.append(f'<polygon points="{pts} {base}" fill="{colour(zmax*0.45)}" '
+                      f'fill-opacity="0.14"/>')
+            sv.append(f'<polyline points="{pts}" fill="none" stroke="{colour(zmax*0.8)}" '
+                      f'stroke-width="1.8" stroke-linejoin="round"/>')
+    else:                                    # points
+        for p in order:
+            for b in range(10):
+                v = grid[p][b]
+                x, y = proj(b, p, v)
+                r = 1.6 + 4.4 * ((v / zmax) ** 0.5)
+                sv.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="{r:.1f}" '
+                          f'fill="{colour(v)}" fill-opacity="0.82"/>')
+
+    # the inspected percentile, drawn over everything
+    ip = max(1, min(100, inspect)) - 1
+    pts = " ".join(f"{x:.1f},{y:.1f}" for x, y in
+                   (proj(b, ip, grid[ip][b]) for b in range(10)))
+    sv.append(f'<polyline points="{pts}" fill="none" stroke="#e8eef6" '
+              f'stroke-width="2.2" stroke-linejoin="round"/>')
+    for b in range(10):
+        x, y = proj(b, ip, grid[ip][b])
+        sv.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="3" fill="#e8eef6"/>')
+
+    # axes
+    for b in range(10):
+        x, y = proj(b, 0, 0)
+        y += 16
+        sv.append(f'<text x="{x:.1f}" y="{y:.1f}" fill="#6b7f96" font-size="9.5" '
+                  f'text-anchor="end" transform="rotate(-38 {x:.1f} {y:.1f})">'
+                  f'{CU_LABELS[b]}</text>')
+    for p in range(0, 100, 20):
+        x, y = proj(9, p, 0)
+        x += 14
+        sv.append(f'<text x="{x:.1f}" y="{y+4:.1f}" fill="#6b7f96" '
+                  f'font-size="9.5">p{p+1}</text>')
+    sv.append(f'<text x="{L-46}" y="{T+ph/2:.0f}" fill="#8fa6bf" font-size="11" '
+              f'transform="rotate(-90 {L-46} {T+ph/2:.0f})" text-anchor="middle">'
+              f'share of percentile (%)</text>')
+    mid_x, _ = proj(5, 50, 0)
+    sv.append(f'<text x="{mid_x:.0f}" y="{H-14}" fill="#8fa6bf" font-size="11" '
+              f'text-anchor="middle">compute units</text>')
+    sv.append(f'<text x="{W-70}" y="{H-52}" fill="#8fa6bf" font-size="11" '
+              f'text-anchor="middle">reward percentile</text>')
+    return (f'<svg viewBox="0 0 {W} {H}" style="width:100%;display:block" role="img" '
+            f'aria-label="Three-dimensional field: compute-unit bucket against reward '
+            f'percentile, height is that bucket\'s share of the percentile. Values in '
+            f'the table below.">{"".join(sv)}</svg>'), grid, totals
+
+
 COL_KEY = [
     ("day", "the report's own slot range for that date, not a UTC calendar day"),
     ("GBX slots", "blocks the 11 GBX validators produced that day"),
@@ -433,7 +609,7 @@ COL_KEY = [
 ]
 
 
-def rewards_page(CSS, purl, d_from=None, d_to=None):
+def rewards_page(CSS, purl, d_from=None, d_to=None, opts=None):
     with open(REWARDS_JSON) as fh:
         D = json.load(fh)
     meta, days = D["meta"], D["days"]
@@ -445,6 +621,16 @@ def rewards_page(CSS, purl, d_from=None, d_to=None):
     if d_from > d_to:
         d_from, d_to = d_to, d_from
     dates = [d for d in all_dates if d_from <= d <= d_to]
+
+    o = opts or {}
+    cu_side = o.get("cu") if o.get("cu") in ("gbx", "harm") else "gbx"
+    render = o.get("render") if o.get("render") in ("surface", "ribbons", "points") else "points"
+    hscale = o.get("hscale") if o.get("hscale") in ("linear", "sqrt") else "linear"
+    cam = o.get("cam") if o.get("cam") in ("iso", "along", "over") else "iso"
+    try:
+        inspect = max(1, min(100, int(o.get("insp") or 99)))
+    except ValueError:
+        inspect = 99
 
     G, Hm = _pool(days, dates, "gbx"), _pool(days, dates, "harm")
     gt, g_kept = _trimmed_mean(G["hist"], G["slots"])
@@ -500,6 +686,10 @@ def rewards_page(CSS, purl, d_from=None, d_to=None):
 
     ratio_svg, rat = _panel_ratio(qg, qh)
     gap_svg, gap_tot, r90 = _panel_gap(qg, qh)
+
+    cu_svg, cu_grid, cu_tot = _panel_cu3d(days, dates, cu_side,
+                                          C_GBX if cu_side == "gbx" else C_HARM,
+                                          render, hscale, cam, inspect)
 
     sg_max = max(_sankey_flows(G)["gross"], _sankey_flows(Hm)["gross"])
     sk_g, f_g = _sankey(G, "gbx", "GBX", C_GBX, sg_max)
@@ -582,6 +772,39 @@ def rewards_page(CSS, purl, d_from=None, d_to=None):
             f'<td>{g["comm_bps"]/100:.1f}%</td><td>{h["comm_bps"]/100:.1f}%</td>'
             f'<td>{g["other"]/max(g["slots"],1)/1e9:.6f}</td></tr>')
 
+
+    # one link per option; the panel is server-rendered so state lives in the URL
+    def ctl(name, cur, opts_):
+        qs = lambda k, v: (f'{base}&from={d_from}&to={d_to}&cu={cu_side}'
+                           f'&render={render}&hscale={hscale}&cam={cam}&insp={inspect}'
+                           ).replace(f'&{k}={{"cu":cu_side,"render":render,"hscale":hscale,'
+                                     f'"cam":cam}}[k]', f'&{k}={v}')
+        out = []
+        for val, lab in opts_:
+            cur_vals = dict(cu=cu_side, render=render, hscale=hscale, cam=cam)
+            cur_vals[name] = val
+            href = (f'{base}&from={d_from}&to={d_to}&cu={cur_vals["cu"]}'
+                    f'&render={cur_vals["render"]}&hscale={cur_vals["hscale"]}'
+                    f'&cam={cur_vals["cam"]}&insp={inspect}')
+            out.append(f'<a class="{"on" if val == cur else ""}" href="{href}">{lab}</a>')
+        return "".join(out)
+
+    cu_ctl = (
+        f'<div class="rw-ctl">'
+        f'<span class="g"><span class="lb">cohort</span>'
+        f'{ctl("cu", cu_side, [("gbx","GBX"),("harm","Agave Harmonic")])}</span>'
+        f'<span class="g"><span class="lb">render</span>'
+        f'{ctl("render", render, [("surface","Surface"),("ribbons","Ribbons"),("points","Points")])}</span>'
+        f'<span class="g"><span class="lb">height</span>'
+        f'{ctl("hscale", hscale, [("linear","Linear"),("sqrt","Square root")])}</span>'
+        f'<span class="g"><span class="lb">camera</span>'
+        f'{ctl("cam", cam, [("iso","Isometric"),("along","Along percentile"),("over","Overhead")])}</span>'
+        f'</div>')
+    insp_row = "".join(
+        f'<td>{cu_grid[inspect-1][b]:.1f}%</td>' for b in range(10))
+    cu_slots = sum(days[d][cu_side]["slots"] for d in dates)
+    cu_side_label = 'GBX' if cu_side == 'gbx' else 'Agave Harmonic'
+
     key = "".join(f'<div><b>{k}</b> &mdash; {v}</div>' for k, v in COL_KEY)
     js = json.dumps({"gbx": qg, "harm": qh, "xmax": xmax})
     cav = "".join(f"<li>{html.escape(c)}</li>" for c in meta["caveats"])
@@ -652,6 +875,24 @@ def rewards_page(CSS, purl, d_from=None, d_to=None):
       p1&ndash;p90 hold {r90*100:.0f}%.</div>
     {gap_svg}
   </div>
+  </div>
+
+  <div class="rw-box wide">
+    <h2>Where compute goes, percentile by percentile</h2>
+    <div class="cs">Each reward percentile's priority fee split across ten
+      compute-unit bins. Height is that bin's share of the percentile, so every
+      slice sums to 100%. Aggregated over every slot in the band, not the one
+      slot at the cut.</div>
+    {cu_ctl}
+    {cu_svg}
+    <table class="rw-tbl" style="margin-top:4px">
+      <thead><tr><th>p{inspect} &mdash; the highlighted slice</th>
+        {"".join(f"<th>{l}</th>" for l in CU_LABELS)}</tr></thead>
+      <tbody><tr><td>share of priority fee</td>{insp_row}</tr></tbody>
+    </table>
+    <div class="rw-note">{cu_side_label}, {len(dates)} day{"s" if len(dates)!=1 else ""},
+      {cu_slots:,} slots &mdash; about {cu_slots//100:,} per percentile band.
+      {html.escape(meta.get('cu_note',''))}</div>
   </div>
 
   <div class="rw-grid">

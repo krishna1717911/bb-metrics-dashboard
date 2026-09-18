@@ -8760,10 +8760,11 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/rewards":
             try:
                 qs2 = urllib.parse.parse_qs(parsed.query)
+                one = lambda k: (qs2.get(k, [""])[0] or None)
                 body = rewards.rewards_page(
-                    CSS, purl,
-                    (qs2.get("from", [""])[0] or None),
-                    (qs2.get("to", [""])[0] or None)).encode()
+                    CSS, purl, one("from"), one("to"),
+                    {k: one(k) for k in
+                     ("cu", "render", "hscale", "cam", "insp")}).encode()
             except Exception as exc:
                 body = f"<pre>{html.escape(str(exc))}</pre>".encode()
             self.send_response(200)
