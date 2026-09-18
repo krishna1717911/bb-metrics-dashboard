@@ -208,6 +208,12 @@ details.rw-more .body{color:#6b7f96;font-size:11px;line-height:1.6;
   border:1px solid #22303f;border-radius:5px}
 .rw-ctl a:hover{border-color:#5eead4;color:#5eead4}
 .rw-ctl a.on{background:#12314d;border-color:#3987e5;color:#7cc0ff;font-weight:650}
+.rw-zoom{display:flex;gap:6px;align-items:center;color:#4d5c70;font-size:10px;
+  margin:4px 0 0}
+.rw-zoom b{color:#6b7f96;font-weight:600}
+.rw-zoom button{background:#0e151d;border:1px solid #22303f;border-radius:5px;
+  color:#8fa6bf;font:10px ui-monospace,Menlo,monospace;padding:2px 8px;cursor:pointer}
+.rw-zoom button:hover{border-color:#5eead4;color:#5eead4}
 .rw-ok{color:#5eead4}
 form.rw-range{display:flex;gap:9px;align-items:flex-end;flex-wrap:wrap;
   margin:0 0 14px}
@@ -380,8 +386,8 @@ def _panel_ratio(qg, qh, W=900, H=430):
     sv.append(f'<text x="{sx(len(rat)-1):.1f}" y="{sy(rat[-1])-9:.1f}" '
               f'text-anchor="end" fill="{C_RATIO}" font-size="10.5" '
               f'font-weight="600">{rat[-1]:.2f}× at p99</text>')
-    return (f'<svg viewBox="0 0 {W} {H}" '
-            f'style="width:100%;display:block" role="img" '
+    return (f'<svg viewBox="0 0 {W} {H}" data-zoom="1" '
+            f'style="width:100%;display:block;cursor:grab" role="img" '
             f'aria-label="Ratio of Agave Harmonic to GBX revenue at each '
             f'percentile. Values in the table below.">{"".join(sv)}</svg>'), rat
 
@@ -419,8 +425,8 @@ def _panel_gap(qg, qh, W=900, H=430):
     sv.append(f'<text x="{L+pw-6:.0f}" y="{sy(.52):.1f}" text-anchor="end" '
               f'fill="#8fa6bf" font-size="9.5" font-style="italic">below the '
               f'diagonal &rarr; tail-concentrated</text>')
-    return (f'<svg viewBox="0 0 {W} {H}" '
-            f'style="width:100%;display:block" role="img" '
+    return (f'<svg viewBox="0 0 {W} {H}" data-zoom="1" '
+            f'style="width:100%;display:block;cursor:grab" role="img" '
             f'aria-label="Cumulative share of the total mean gap by '
             f'percentile.">{"".join(sv)}</svg>'), tot, r90
 
@@ -428,17 +434,30 @@ def _panel_gap(qg, qh, W=900, H=430):
 CU_LABELS = ["0-10k", "10-50k", "50-100k", "100-150k", "150-200k",
              "200-250k", "250-300k", "300-500k", "500k-1m", "1m+"]
 
-# Sequential ramps, one hue per cohort so identity carries over from the other
-# panels. Deliberately NOT a rainbow: height is a magnitude, and a magnitude
-# takes one hue light-to-dark.
-RAMP = {
-    "gbx":  ["#16304d", "#1d4a7a", "#2463a6", "#2f7fd0", "#3987e5", "#63a5ee", "#96c6f6"],
-    "harm": ["#4d2410", "#7a371a", "#a64a23", "#d05c2c", "#d95926", "#ea8354", "#f5b189"],
-}
+# Viridis. Perceptually uniform and monotone in lightness, so height and colour
+# agree instead of competing -- a jet/turbo ramp reverses lightness mid-scale
+# and invents banding that is not in the data.
+VIRIDIS = ["#440154", "#472d7b", "#3b528b", "#2c728e", "#21918c",
+           "#27ad81", "#5ec962", "#aadc32", "#fde725"]
+
+
+def _lerp_hex(a, b, t):
+    ar, ag, ab = int(a[1:3], 16), int(a[3:5], 16), int(a[5:7], 16)
+    br, bg, bb = int(b[1:3], 16), int(b[3:5], 16), int(b[5:7], 16)
+    return "#%02x%02x%02x" % (round(ar + (br - ar) * t),
+                              round(ag + (bg - ag) * t),
+                              round(ab + (bb - ab) * t))
+
+
+def _viridis(f):
+    f = max(0.0, min(1.0, f))
+    x = f * (len(VIRIDIS) - 1)
+    i = min(int(x), len(VIRIDIS) - 2)
+    return _lerp_hex(VIRIDIS[i], VIRIDIS[i + 1], x - i)
 
 
 def _pool_cu(days, dates, side):
-    """Sum absolute SOL per (band, bucket) over a date range, then normalise.
+    """Sum absolute SOL per (band, bucket) over a range, then normalise.
 
     Stored as SOL rather than shares precisely so this is a plain sum -- shares
     could not be pooled across days any more than percentiles could.
@@ -459,138 +478,48 @@ def _pool_cu(days, dates, side):
     return out, totals
 
 
-def _panel_cu3d(days, dates, side, col, render, hscale, cam, inspect,
-                W=1010, H=560):
-    """Isometric 3-D field: x = CU bucket, y = reward percentile, z = share.
+def _panel_cu3d(days, dates, side, render, hscale, inspect, W=1180, H=680):
+    """Container + data for the orbiting compute-unit field.
 
-    Hand-rolled projection rather than a library: the page is stdlib-only and
-    server-rendered, and the grid is small enough (10 x 100) that an SVG of
-    projected marks is cheaper than shipping a 3-D renderer.
+    The projection is done in the browser (see the CU3D module), not here:
+    dragging re-projects every frame, and keeping a second copy of the maths
+    server-side would be two implementations drifting apart. Python's job is to
+    pool the bands over the selected range and hand over the grid.
     """
     grid, totals = _pool_cu(days, dates, side)
-    ramp = RAMP[side]
-    L, T = 92, 74
-    pw, ph = W - L - 130, H - T - 96
-
-    # Unit basis vectors per axis, then auto-fit. Fitting after projection means
-    # no camera can push marks outside the viewBox, which hand-tuned constants
-    # did -- the percentile axis runs 0..99 against the bucket axis's 0..9, so
-    # any shared scale overflows by an order of magnitude.
-    if cam == "over":            # straight down: a plain heatmap
-        ux, uy, vx, vy, zf = 1.0, 0.0, 0.0, 1.0, 0.0
-    elif cam == "along":         # sighting down the percentile axis
-        ux, uy, vx, vy, zf = 1.0, 0.0, 0.06, 0.30, 1.0
-    else:                        # isometric
-        ux, uy, vx, vy, zf = 1.0, -0.42, 0.62, 0.62, 1.0
-
     zmax = max((v for row in grid for v in row), default=1.0) or 1.0
-    def hgt(v):
-        return ((v / zmax) ** 0.5 if hscale == "sqrt" else v / zmax)
+    ramp = [[int(c[1:3], 16), int(c[3:5], 16), int(c[5:7], 16)] for c in VIRIDIS]
+    data = {
+        "grid": [[round(v, 4) for v in row] for row in grid],
+        "zmax": round(zmax, 4),
+        "labels": CU_LABELS,
+        "ramp": ramp,
+        "sqrt": hscale == "sqrt",
+        "render": render,
+        "insp": max(1, min(100, inspect)),
+        "az0": 0.62, "el0": 0.60,
+    }
+    key = []
+    kx, ky = W - 74, 58
+    for i in range(48):
+        key.append(f'<rect x="{kx}" y="{ky + (47-i)*3.4:.1f}" width="11" height="3.6" '
+                   f'fill="{_viridis(i/47)}"/>')
+    key.append(f'<text x="{kx+16}" y="{ky+6}" fill="#6b7f96" font-size="9">'
+               f'{zmax:.0f}%</text>')
+    key.append(f'<text x="{kx+16}" y="{ky+47*3.4+6:.0f}" fill="#6b7f96" '
+               f'font-size="9">0%</text>')
+    svg = (f'<svg viewBox="0 0 {W} {H}" style="width:100%;display:block;cursor:grab" '
+           f'role="img" aria-label="Compute-unit bucket against reward percentile, '
+           f'height is that bucket\'s share of the percentile\'s priority fee. '
+           f'Orbit with the mouse. Values in the table below.">'
+           f'<g id="cu3d"></g>{"".join(key)}'
+           f'<text x="{W/2:.0f}" y="{H-16}" fill="#8fa6bf" font-size="11" '
+           f'text-anchor="middle">compute units &rarr; &middot; reward percentile '
+           f'&rarr; &middot; height = share of that percentile</text></svg>'
+           f'<noscript><div class="rw-note">This panel is drawn in the browser so '
+           f'it can be orbited; the numbers are in the table below.</div></noscript>')
+    return svg, grid, totals, data
 
-    # raw projection in arbitrary units: bucket index 0..9, percentile 0..99
-    def raw(b, p, v):
-        bb, pp = b / 9.0, p / 99.0
-        return (bb * ux + pp * vx, bb * uy + pp * vy - hgt(v) * zf * 0.55)
-
-    xs, ys = [], []
-    for pp in range(100):
-        for bb in range(10):
-            for vv in (0.0, grid[pp][bb]):
-                x, y = raw(bb, pp, vv)
-                xs.append(x); ys.append(y)
-    fx0, fx1 = min(xs), max(xs)
-    fy0, fy1 = min(ys), max(ys)
-    sxf = pw / (fx1 - fx0) if fx1 > fx0 else 1.0
-    syf = ph / (fy1 - fy0) if fy1 > fy0 else 1.0
-    ox, oy = L + 34, T
-
-    def proj(b, p, v):
-        x, y = raw(b, p, v)
-        return (ox + (x - fx0) * sxf, oy + (y - fy0) * syf)
-    def colour(v):
-        return ramp[min(len(ramp) - 1, int(hgt(v) * len(ramp)))]
-
-    sv = []
-    # floor grid
-    for b in range(11):
-        ax_, ay_ = proj(min(b, 9), 0, 0); bx_, by_ = proj(min(b, 9), 99, 0)
-        sv.append(f'<line x1="{ax_:.1f}" y1="{ay_:.1f}" x2="{bx_:.1f}" y2="{by_:.1f}" '
-                  f'stroke="#1a2431" stroke-width="1"/>')
-    for p in range(0, 100, 10):
-        ax_, ay_ = proj(0, p, 0); bx_, by_ = proj(9, p, 0)
-        sv.append(f'<line x1="{ax_:.1f}" y1="{ay_:.1f}" x2="{bx_:.1f}" y2="{by_:.1f}" '
-                  f'stroke="#1a2431" stroke-width="1"/>')
-
-    # painter's algorithm: draw the rows that project highest on screen first,
-    # so nearer rows overlap them. Derived from the projection rather than the
-    # basis vectors, so it stays correct under every camera.
-    order = sorted(range(100), key=lambda p: proj(0, p, 0)[1])
-    if render == "surface":
-        for p in order[:-1]:
-            q = p + 1
-            if q > 99:
-                continue
-            for b in range(9):
-                a_ = proj(b, p, grid[p][b]); b_ = proj(b + 1, p, grid[p][b + 1])
-                c_ = proj(b + 1, q, grid[q][b + 1]); d_ = proj(b, q, grid[q][b])
-                m = (grid[p][b] + grid[p][b + 1] + grid[q][b] + grid[q][b + 1]) / 4
-                sv.append(f'<polygon points="{a_[0]:.1f},{a_[1]:.1f} {b_[0]:.1f},{b_[1]:.1f} '
-                          f'{c_[0]:.1f},{c_[1]:.1f} {d_[0]:.1f},{d_[1]:.1f}" '
-                          f'fill="{colour(m)}" fill-opacity="0.85" '
-                          f'stroke="{colour(m)}" stroke-width="0.4"/>')
-    elif render == "ribbons":
-        for b in range(10):
-            pts = " ".join(f"{x:.1f},{y:.1f}" for x, y in
-                           (proj(b, p, grid[p][b]) for p in range(100)))
-            base = " ".join(f"{x:.1f},{y:.1f}" for x, y in
-                            (proj(b, p, 0) for p in range(99, -1, -1)))
-            sv.append(f'<polygon points="{pts} {base}" fill="{colour(zmax*0.45)}" '
-                      f'fill-opacity="0.14"/>')
-            sv.append(f'<polyline points="{pts}" fill="none" stroke="{colour(zmax*0.8)}" '
-                      f'stroke-width="1.8" stroke-linejoin="round"/>')
-    else:                                    # points
-        for p in order:
-            for b in range(10):
-                v = grid[p][b]
-                x, y = proj(b, p, v)
-                r = 1.6 + 4.4 * ((v / zmax) ** 0.5)
-                sv.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="{r:.1f}" '
-                          f'fill="{colour(v)}" fill-opacity="0.82"/>')
-
-    # the inspected percentile, drawn over everything
-    ip = max(1, min(100, inspect)) - 1
-    pts = " ".join(f"{x:.1f},{y:.1f}" for x, y in
-                   (proj(b, ip, grid[ip][b]) for b in range(10)))
-    sv.append(f'<polyline points="{pts}" fill="none" stroke="#e8eef6" '
-              f'stroke-width="2.2" stroke-linejoin="round"/>')
-    for b in range(10):
-        x, y = proj(b, ip, grid[ip][b])
-        sv.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="3" fill="#e8eef6"/>')
-
-    # axes
-    for b in range(10):
-        x, y = proj(b, 0, 0)
-        y += 16
-        sv.append(f'<text x="{x:.1f}" y="{y:.1f}" fill="#6b7f96" font-size="9.5" '
-                  f'text-anchor="end" transform="rotate(-38 {x:.1f} {y:.1f})">'
-                  f'{CU_LABELS[b]}</text>')
-    for p in range(0, 100, 20):
-        x, y = proj(9, p, 0)
-        x += 14
-        sv.append(f'<text x="{x:.1f}" y="{y+4:.1f}" fill="#6b7f96" '
-                  f'font-size="9.5">p{p+1}</text>')
-    sv.append(f'<text x="{L-46}" y="{T+ph/2:.0f}" fill="#8fa6bf" font-size="11" '
-              f'transform="rotate(-90 {L-46} {T+ph/2:.0f})" text-anchor="middle">'
-              f'share of percentile (%)</text>')
-    mid_x, _ = proj(5, 50, 0)
-    sv.append(f'<text x="{mid_x:.0f}" y="{H-14}" fill="#8fa6bf" font-size="11" '
-              f'text-anchor="middle">compute units</text>')
-    sv.append(f'<text x="{W-70}" y="{H-52}" fill="#8fa6bf" font-size="11" '
-              f'text-anchor="middle">reward percentile</text>')
-    return (f'<svg viewBox="0 0 {W} {H}" style="width:100%;display:block" role="img" '
-            f'aria-label="Three-dimensional field: compute-unit bucket against reward '
-            f'percentile, height is that bucket\'s share of the percentile. Values in '
-            f'the table below.">{"".join(sv)}</svg>'), grid, totals
 
 
 COL_KEY = [
@@ -687,9 +616,8 @@ def rewards_page(CSS, purl, d_from=None, d_to=None, opts=None):
     ratio_svg, rat = _panel_ratio(qg, qh)
     gap_svg, gap_tot, r90 = _panel_gap(qg, qh)
 
-    cu_svg, cu_grid, cu_tot = _panel_cu3d(days, dates, cu_side,
-                                          C_GBX if cu_side == "gbx" else C_HARM,
-                                          render, hscale, cam, inspect)
+    cu_svg, cu_grid, cu_tot, cu_data = _panel_cu3d(
+        days, dates, cu_side, render, hscale, inspect)
 
     sg_max = max(_sankey_flows(G)["gross"], _sankey_flows(Hm)["gross"])
     sk_g, f_g = _sankey(G, "gbx", "GBX", C_GBX, sg_max)
@@ -798,7 +726,10 @@ def rewards_page(CSS, purl, d_from=None, d_to=None, opts=None):
         f'<span class="g"><span class="lb">height</span>'
         f'{ctl("hscale", hscale, [("linear","Linear"),("sqrt","Square root")])}</span>'
         f'<span class="g"><span class="lb">camera</span>'
-        f'{ctl("cam", cam, [("iso","Isometric"),("along","Along percentile"),("over","Overhead")])}</span>'
+        f'<a data-cam="0.62,0.60" class="on">Isometric</a>'
+        f'<a data-cam="1.57,0.32">Along percentile</a>'
+        f'<a data-cam="0.00,1.50">Overhead</a>'
+        f'<a data-cam="0.00,0.10">Front</a></span>'
         f'</div>')
     insp_row = "".join(
         f'<td>{cu_grid[inspect-1][b]:.1f}%</td>' for b in range(10))
@@ -807,6 +738,7 @@ def rewards_page(CSS, purl, d_from=None, d_to=None, opts=None):
 
     key = "".join(f'<div><b>{k}</b> &mdash; {v}</div>' for k, v in COL_KEY)
     js = json.dumps({"gbx": qg, "harm": qh, "xmax": xmax})
+    cu_data_json = json.dumps(cu_data, separators=(',', ':'))
     cav = "".join(f"<li>{html.escape(c)}</li>" for c in meta["caveats"])
     facts = "".join(
         f'<tr><td>{n}</td><td>{a:.6f}</td><td>{b:.6f}</td></tr>'
@@ -853,11 +785,12 @@ def rewards_page(CSS, purl, d_from=None, d_to=None, opts=None):
     <h2>Rewards distribution &mdash; {d_from} to {d_to}</h2>
     <div class="cs">Share of slots earning at or below <i>x</i>. Hover reads
       horizontally: pick a percentile, compare SOL.</div>
-    <svg viewBox="0 0 {W2} {H2}"
-         style="width:100%;display:block" role="img"
+    <svg viewBox="0 0 {W2} {H2}" data-zoom="1"
+         style="width:100%;display:block;cursor:crosshair" role="img"
          aria-label="Empirical CDF of per-slot revenue pooled over {d_from} to
          {d_to}.">{''.join(p2)}</svg>
     <div class="rw-legend">{lg}</div>
+    <div class="rw-zoom"><b>scroll</b> zoom &middot; <b>drag</b> pan &middot; <b>double-click</b> reset<button type="button">reset</button></div>
     {stats}
   </div>
 
@@ -867,6 +800,7 @@ def rewards_page(CSS, purl, d_from=None, d_to=None, opts=None):
     <div class="cs">Above 1.0 Harmonic leads. Rising = the gap widens with
       block value.</div>
     {ratio_svg}
+    <div class="rw-zoom"><b>scroll</b> zoom &middot; <b>drag</b> pan &middot; <b>double-click</b> reset<button type="button">reset</button></div>
   </div>
 
   <div class="rw-box">
@@ -874,6 +808,7 @@ def rewards_page(CSS, purl, d_from=None, d_to=None, opts=None):
     <div class="cs">Below the diagonal = concentrated in the tail.
       p1&ndash;p90 hold {r90*100:.0f}%.</div>
     {gap_svg}
+    <div class="rw-zoom"><b>scroll</b> zoom &middot; <b>drag</b> pan &middot; <b>double-click</b> reset<button type="button">reset</button></div>
   </div>
   </div>
 
@@ -885,6 +820,8 @@ def rewards_page(CSS, purl, d_from=None, d_to=None, opts=None):
       slot at the cut.</div>
     {cu_ctl}
     {cu_svg}
+    <div class="rw-zoom"><b>drag</b> orbit &middot; <b>shift+drag</b> pan &middot;
+      <b>scroll</b> zoom &middot; <b>double-click</b> reset</div>
     <table class="rw-tbl" style="margin-top:4px">
       <thead><tr><th>p{inspect} &mdash; the highlighted slice</th>
         {"".join(f"<th>{l}</th>" for l in CU_LABELS)}</tr></thead>
@@ -933,11 +870,256 @@ def rewards_page(CSS, purl, d_from=None, d_to=None, opts=None):
 
 <div id="rw-tip"></div>
 <script>
+var CU3D={cu_data_json};
+// ---- the compute-unit field, projected in the browser so it can be orbited.
+// The projection lives here rather than in Python because dragging has to
+// re-project every frame; keeping a second copy server-side would be two
+// implementations of the same maths drifting apart.
 (function(){{
-  // VBH is the viewBox HEIGHT. The hover maps a y pixel back into viewBox
-  // units, so it must scale by height/height -- using the viewBox WIDTH here
-  // ran the crosshair {W2}/{H2}x too fast and pinned it to the top of the plot.
-  var D={js}, L={L2}, PW={pw2}, T={T2}, PH={ph2}, VBH={H2};
+  var host = document.getElementById('cu3d');
+  if (!host) return;
+  var D = CU3D;                       // {{grid:[100][10], zmax, labels, sqrt, render}}
+  var W = 1180, H = 680;
+  var st = {{az: D.az0, el: D.el0, zoom: 1, ox: 0, oy: 0}};
+
+  function project(bx, by, bz){{
+    // bx,by,bz all in [0,1]. Centre, spin about the vertical, then tilt.
+    var x = bx - 0.5, y = by - 0.5, z = bz;
+    var ca = Math.cos(st.az), sa = Math.sin(st.az);
+    var rx = x * ca - y * sa, ry = x * sa + y * ca;
+    var ce = Math.cos(st.el), se = Math.sin(st.el);
+    return [rx, ry * se - z * ce];
+  }}
+  function hgt(v){{ return D.sqrt ? Math.sqrt(v / D.zmax) : v / D.zmax; }}
+
+  // fit: project the unit cube's corners so the frame never clips as it spins
+  function fit(){{
+    var xs = [], ys = [];
+    for (var i = 0; i < 8; i++){{
+      var p = project(i & 1, (i >> 1) & 1, (i >> 2) & 1);
+      xs.push(p[0]); ys.push(p[1]);
+    }}
+    var x0 = Math.min.apply(null, xs), x1 = Math.max.apply(null, xs);
+    var y0 = Math.min.apply(null, ys), y1 = Math.max.apply(null, ys);
+    var pad = 96;
+    var sx = (W - pad * 2) / (x1 - x0), sy = (H - pad * 2) / (y1 - y0);
+    var s = Math.min(sx, sy) * st.zoom;
+    return {{s: s, cx: W / 2 - (x0 + x1) / 2 * s + st.ox,
+                  cy: H / 2 - (y0 + y1) / 2 * s + st.oy}};
+  }}
+  var F;
+  function P(b, p, v){{
+    var q = project(b / 9, p / 99, hgt(v));
+    return [F.cx + q[0] * F.s, F.cy + q[1] * F.s];
+  }}
+  function S(b, p, v){{ var q = P(b, p, v); return q[0].toFixed(1) + ',' + q[1].toFixed(1); }}
+
+  function viridis(f){{
+    var C = D.ramp;
+    f = Math.max(0, Math.min(1, f));
+    var x = f * (C.length - 1), i = Math.min(Math.floor(x), C.length - 2), t = x - i;
+    function ch(a, b){{ return Math.round(a + (b - a) * t); }}
+    var a = C[i], b = C[i + 1];
+    return 'rgb(' + ch(a[0],b[0]) + ',' + ch(a[1],b[1]) + ',' + ch(a[2],b[2]) + ')';
+  }}
+
+  function draw(){{
+    F = fit();
+    var g = D.grid, out = [];
+    // floor
+    out.push('<polygon points="' + S(0,0,0) + ' ' + S(9,0,0) + ' ' + S(9,99,0) +
+             ' ' + S(0,99,0) + '" fill="#0b131c" fill-opacity="0.72" ' +
+             'stroke="#243242" stroke-width="1"/>');
+    // the two walls furthest from the camera, so they sit behind the data
+    var back = Math.cos(st.az) >= 0 ? 99 : 0, side = Math.sin(st.az) >= 0 ? 0 : 9;
+    out.push('<polygon points="' + S(0,back,0) + ' ' + S(9,back,0) + ' ' +
+             S(9,back,1) + ' ' + S(0,back,1) + '" fill="#0a1017" ' +
+             'fill-opacity="0.55" stroke="#1e2b39" stroke-width="1"/>');
+    out.push('<polygon points="' + S(side,0,0) + ' ' + S(side,99,0) + ' ' +
+             S(side,99,1) + ' ' + S(side,0,1) + '" fill="#0a1017" ' +
+             'fill-opacity="0.4" stroke="#1e2b39" stroke-width="1"/>');
+    for (var k = 1; k <= 4; k++){{
+      var hv = k / 4;
+      out.push('<line x1="' + P(0,back,0)[0].toFixed(1) + '" y1="' +
+               (P(0,back,0)[1] - (P(0,back,0)[1]-P(0,back,D.zmax)[1])*hv).toFixed(1) +
+               '" x2="' + P(9,back,0)[0].toFixed(1) + '" y2="' +
+               (P(9,back,0)[1] - (P(9,back,0)[1]-P(9,back,D.zmax)[1])*hv).toFixed(1) +
+               '" stroke="#1a2431" stroke-width="0.8"/>');
+    }}
+    for (var b = 0; b < 10; b++)
+      out.push('<line x1="'+P(b,0,0)[0].toFixed(1)+'" y1="'+P(b,0,0)[1].toFixed(1)+
+               '" x2="'+P(b,99,0)[0].toFixed(1)+'" y2="'+P(b,99,0)[1].toFixed(1)+
+               '" stroke="#1a2431" stroke-width="0.7"/>');
+    for (var p = 0; p < 100; p += 10)
+      out.push('<line x1="'+P(0,p,0)[0].toFixed(1)+'" y1="'+P(0,p,0)[1].toFixed(1)+
+               '" x2="'+P(9,p,0)[0].toFixed(1)+'" y2="'+P(9,p,0)[1].toFixed(1)+
+               '" stroke="#1a2431" stroke-width="0.7"/>');
+
+    // painter's order, recomputed each frame because rotating changes what is behind
+    var ord = [];
+    for (var i = 0; i < 100; i++) ord.push(i);
+    ord.sort(function(a,b){{ return P(0,a,0)[1] - P(0,b,0)[1]; }});
+
+    if (D.render === 'surface'){{
+      for (var oi = 0; oi < ord.length; oi++){{
+        var pp = ord[oi]; if (pp >= 99) continue; var qq = pp + 1;
+        for (var bb = 0; bb < 9; bb++){{
+          var m = (g[pp][bb]+g[pp][bb+1]+g[qq][bb]+g[qq][bb+1])/4, c = viridis(hgt(m));
+          out.push('<polygon points="'+S(bb,pp,g[pp][bb])+' '+S(bb+1,pp,g[pp][bb+1])+
+                   ' '+S(bb+1,qq,g[qq][bb+1])+' '+S(bb,qq,g[qq][bb])+'" fill="'+c+
+                   '" fill-opacity="0.92" stroke="'+c+'" stroke-width="0.5"/>');
+        }}
+      }}
+    }} else if (D.render === 'ribbons'){{
+      for (var bb2 = 9; bb2 >= 0; bb2--){{
+        var top = [], base = [], mv = 0;
+        for (var p2 = 0; p2 < 100; p2++){{ top.push(S(bb2,p2,g[p2][bb2])); mv += g[p2][bb2]; }}
+        for (var p3 = 99; p3 >= 0; p3--) base.push(S(bb2,p3,0));
+        var c2 = viridis(hgt(mv/100));
+        out.push('<polygon points="'+top.join(' ')+' '+base.join(' ')+'" fill="'+c2+
+                 '" fill-opacity="0.22"/>');
+        out.push('<polyline points="'+top.join(' ')+'" fill="none" stroke="'+c2+
+                 '" stroke-width="2" stroke-linejoin="round"/>');
+      }}
+    }} else {{
+      for (var oi2 = 0; oi2 < ord.length; oi2++){{
+        var p4 = ord[oi2];
+        for (var b4 = 0; b4 < 10; b4++){{
+          var v = g[p4][b4], f = hgt(v), a = P(b4,p4,v), fl = P(b4,p4,0);
+          out.push('<line x1="'+a[0].toFixed(1)+'" y1="'+a[1].toFixed(1)+'" x2="'+
+                   fl[0].toFixed(1)+'" y2="'+fl[1].toFixed(1)+'" stroke="'+viridis(f)+
+                   '" stroke-width="0.6" opacity="0.26"/>');
+          out.push('<circle cx="'+a[0].toFixed(1)+'" cy="'+a[1].toFixed(1)+'" r="'+
+                   (1.5+5*Math.pow(f,0.6)).toFixed(2)+'" fill="'+viridis(f)+
+                   '" fill-opacity="0.9" stroke="#0b131c" stroke-width="0.5"/>');
+        }}
+      }}
+    }}
+    // inspected slice
+    var ip = D.insp - 1, sl = [];
+    for (var b5 = 0; b5 < 10; b5++) sl.push(S(b5,ip,g[ip][b5]));
+    out.push('<polyline points="'+sl.join(' ')+'" fill="none" stroke="#fff" '+
+             'stroke-width="2.4" stroke-linejoin="round" opacity="0.95"/>');
+    for (var b6 = 0; b6 < 10; b6++){{
+      var a6 = P(b6,ip,g[ip][b6]);
+      out.push('<circle cx="'+a6[0].toFixed(1)+'" cy="'+a6[1].toFixed(1)+
+               '" r="3.4" fill="#fff" stroke="#0b131c" stroke-width="1"/>');
+    }}
+    // axis labels, placed just outside the floor so they follow the spin
+    for (var b7 = 0; b7 < 10; b7++){{
+      var t7 = P(b7, -6, 0);
+      out.push('<text x="'+t7[0].toFixed(1)+'" y="'+t7[1].toFixed(1)+
+               '" fill="#6b7f96" font-size="10" text-anchor="middle">'+D.labels[b7]+'</text>');
+    }}
+    for (var p8 = 9; p8 < 100; p8 += 15){{
+      var t8 = P(10.6, p8, 0);
+      out.push('<text x="'+t8[0].toFixed(1)+'" y="'+t8[1].toFixed(1)+
+               '" fill="#6b7f96" font-size="10" text-anchor="middle">p'+(p8+1)+'</text>');
+    }}
+    host.innerHTML = out.join('');
+  }}
+
+  var frame = null;
+  function redraw(){{ if (!frame) frame = requestAnimationFrame(function(){{ frame=null; draw(); }}); }}
+
+  var svg = host.ownerSVGElement, drag = null;
+  svg.addEventListener('mousedown', function(ev){{
+    drag = {{x: ev.clientX, y: ev.clientY, az: st.az, el: st.el,
+            ox: st.ox, oy: st.oy, shift: ev.shiftKey}};
+    svg.style.cursor = 'grabbing'; ev.preventDefault();
+  }});
+  window.addEventListener('mousemove', function(ev){{
+    if (!drag) return;
+    var dx = ev.clientX - drag.x, dy = ev.clientY - drag.y;
+    if (drag.shift){{ st.ox = drag.ox + dx; st.oy = drag.oy + dy; }}
+    else {{
+      st.az = drag.az + dx * 0.010;                       // spin
+      st.el = Math.max(0.05, Math.min(1.5, drag.el - dy * 0.006));  // tilt, clamped
+    }}
+    redraw();
+  }});
+  window.addEventListener('mouseup', function(){{
+    if (drag){{ drag = null; svg.style.cursor = 'grab'; }}
+  }});
+  svg.addEventListener('wheel', function(ev){{
+    ev.preventDefault();
+    st.zoom = Math.max(0.45, Math.min(6, st.zoom * (ev.deltaY < 0 ? 1.12 : 1/1.12)));
+    redraw();
+  }}, {{passive:false}});
+  svg.addEventListener('dblclick', function(){{
+    st.az = D.az0; st.el = D.el0; st.zoom = 1; st.ox = 0; st.oy = 0; redraw();
+  }});
+  document.querySelectorAll('[data-cam]').forEach(function(btn){{
+    btn.addEventListener('click', function(){{
+      var v = btn.dataset.cam.split(',');
+      st.az = parseFloat(v[0]); st.el = parseFloat(v[1]);
+      st.zoom = 1; st.ox = 0; st.oy = 0; redraw();
+      document.querySelectorAll('[data-cam]').forEach(function(o){{ o.classList.remove('on'); }});
+      btn.classList.add('on');
+    }});
+  }});
+  draw();
+}})();
+
+
+// Pan/zoom for every chart marked data-zoom. Works on the viewBox rather than a
+// CSS transform so strokes and text keep their weight as you zoom in, and so
+// the hover maths below can stay in user units.
+(function(){{
+  document.querySelectorAll('svg[data-zoom]').forEach(function(svg){{
+    var vb = svg.viewBox.baseVal;
+    var home = {{x: vb.x, y: vb.y, w: vb.width, h: vb.height}};
+    function set(x, y, w, h){{
+      var minW = home.w / 40, maxW = home.w * 1.6;
+      w = Math.max(minW, Math.min(maxW, w));
+      h = w * home.h / home.w;
+      x = Math.max(home.x - home.w, Math.min(home.x + home.w * 1.6 - w, x));
+      y = Math.max(home.y - home.h, Math.min(home.y + home.h * 1.6 - h, y));
+      svg.setAttribute('viewBox', x + ' ' + y + ' ' + w + ' ' + h);
+    }}
+    function pos(ev){{
+      var r = svg.getBoundingClientRect(), v = svg.viewBox.baseVal;
+      return {{x: v.x + (ev.clientX - r.left) / r.width * v.width,
+               y: v.y + (ev.clientY - r.top) / r.height * v.height}};
+    }}
+    svg.addEventListener('wheel', function(ev){{
+      ev.preventDefault();
+      var v = svg.viewBox.baseVal, p = pos(ev);
+      var k = ev.deltaY < 0 ? 0.84 : 1 / 0.84;          // zoom about the cursor
+      set(p.x - (p.x - v.x) * k, p.y - (p.y - v.y) * k, v.width * k, v.height * k);
+    }}, {{passive: false}});
+    var drag = null;
+    svg.addEventListener('mousedown', function(ev){{
+      if (ev.button !== 0) return;
+      drag = {{sx: ev.clientX, sy: ev.clientY,
+               vx: svg.viewBox.baseVal.x, vy: svg.viewBox.baseVal.y}};
+      svg.style.cursor = 'grabbing';
+    }});
+    window.addEventListener('mousemove', function(ev){{
+      if (!drag) return;
+      var r = svg.getBoundingClientRect(), v = svg.viewBox.baseVal;
+      set(drag.vx - (ev.clientX - drag.sx) / r.width * v.width,
+          drag.vy - (ev.clientY - drag.sy) / r.height * v.height, v.width, v.height);
+    }});
+    window.addEventListener('mouseup', function(){{
+      if (drag) {{ drag = null; svg.style.cursor = svg.dataset.grab || 'grab'; }}
+    }});
+    svg.addEventListener('dblclick', function(){{
+      svg.setAttribute('viewBox', home.x+' '+home.y+' '+home.w+' '+home.h);
+    }});
+    var box = svg.closest('.rw-box');
+    if (box) {{
+      var bar = box.querySelector('.rw-zoom button');
+      if (bar) bar.addEventListener('click', function(){{
+        svg.setAttribute('viewBox', home.x+' '+home.y+' '+home.w+' '+home.h);
+      }});
+    }}
+  }});
+}})();
+
+// ECDF hover. Reads the live viewBox so it stays correct after a zoom or pan.
+(function(){{
+  var D={js}, L={L2}, PW={pw2}, T={T2}, PH={ph2};
   var boxes=document.querySelectorAll('.rw-box svg'), svg=boxes[0],
       hit=document.getElementById('rw-hit'),
       cross=document.getElementById('rw-cross'),
@@ -946,10 +1128,11 @@ def rewards_page(CSS, purl, d_from=None, d_to=None, opts=None):
   if(!svg||!hit) return;
   function px(v){{ return L+PW*Math.min(v/D.xmax,1); }}
   hit.addEventListener('mousemove',function(ev){{
-    var r=svg.getBoundingClientRect();
+    var r=svg.getBoundingClientRect(), v=svg.viewBox.baseVal;
     if(!r.height) return;
-    var k=VBH/r.height;
-    var f=Math.min(1,Math.max(0,1-((ev.clientY-r.top)*k-T)/PH));
+    // screen -> user units through the CURRENT viewBox, not the authored one
+    var uy = v.y + (ev.clientY - r.top) / r.height * v.height;
+    var f=Math.min(1,Math.max(0,1-(uy-T)/PH));
     var q=Math.min(99,Math.max(1,Math.round(f*100)));
     var y=T+PH*(1-q/100), g=D.gbx[q-1], h=D.harm[q-1];
     cross.setAttribute('y1',y); cross.setAttribute('y2',y);
