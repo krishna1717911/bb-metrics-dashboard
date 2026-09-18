@@ -336,20 +336,23 @@ CONFIG = dict(displaylogo=False, responsive=True,
 
 def _fig_ecdf(G, Hm, xmax):
     """Both cohorts' ECDFs. Hover is unified on x so the two are read together."""
-    def tr(P, name, colour):
+    def tr(P, name, colour, z):
         pts = _curve(P["hist"], P["slots"], xmax)
         xs = [x for x, _ in pts]
         ys = [f * 100 for _, f in pts]
         return dict(type="scatter", mode="lines", name=f'{name} (n={P["slots"]:,})',
-                    x=xs, y=ys, line=dict(color=colour, width=2.4),
+                    x=xs, y=ys, line=dict(color=colour, width=2.4), zorder=z,
                     hovertemplate="%{x:.6f} SOL")
-    traces = [tr(Hm, "Agave Harmonic", C_HARM), tr(G, "GBX", C_GBX)]
-    for P, colour, nm in ((Hm, C_HARM, "Harmonic"), (G, C_GBX, "GBX")):
+    # GBX first: it leads the legend and the unified hover. zorder keeps it
+    # painted above Harmonic, which is the only reason it used to be added last.
+    traces = [tr(G, "GBX", C_GBX, 2), tr(Hm, "Agave Harmonic", C_HARM, 1)]
+    for P, colour, nm in ((G, C_GBX, "GBX"), (Hm, C_HARM, "Harmonic")):
         qs = [0.50, 0.90]
         traces.append(dict(
             type="scatter", mode="markers", showlegend=False,
             x=[_pct(P["hist"], P["slots"], q) for q in qs], y=[q * 100 for q in qs],
             marker=dict(color=colour, size=10, line=dict(color="#0e151d", width=2)),
+            zorder=3 if colour == C_GBX else 2,
             text=[f"{nm} p{int(q*100)}" for q in qs],
             hovertemplate="%{text}: %{x:.6f} SOL<extra></extra>"))
     lay = dict(LAYOUT, height=430,
