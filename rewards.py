@@ -5,6 +5,17 @@ Kept out of app.py deliberately: a self-contained feature over a static
 rewards_daily.json, where app.py is already 8k lines several people edit.
 app.py needs only the route and the nav link.
 
+Two sources, deliberately split. The per-day SCALARS (slots, fee, Jito gross
+and net, other-provider tips, tipped-slot counts, MEV commission, validator
+counts) come from ClickHouse -- block_builder.reward_percentiles_daily, read
+with a read-only login, configured through REWARDS_CH_* and never committed.
+The HISTOGRAMS and the compute-unit grid stay in rewards_daily.json because
+that table does not carry them: it stores 100 percentiles a day, and
+percentiles cannot be pooled across days. If the table ever gains a histogram
+and a CU table, _pool and _pool_cu are the only two places that need changing.
+With REWARDS_CH_URL unset, or if the query fails, everything falls back to the
+JSON and the page says so.
+
 The data is per-day 0.5 mSOL histograms carrying both a slot count and an exact
 SOL sum per bin. Histograms are what make an arbitrary date range exact: bin
 counts and sums add across days, percentiles do not. Every curve, percentile
@@ -22,12 +33,72 @@ Regenerating the data is an offline step (Dune + reports.firedancer.io + kobe);
 nothing here queries anything at request time.
 """
 
+import base64
 import html
 import json
 import os
+import urllib.request
 
 REWARDS_JSON = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                             "rewards_daily.json")
+
+# Read-only ClickHouse holding the per-day scalars. Credentials come from the
+# environment only -- this repo is public, so nothing here may carry one.
+REWARDS_CH_URL = os.environ.get("REWARDS_CH_URL", "")
+REWARDS_CH_USER = os.environ.get("REWARDS_CH_USER", "")
+REWARDS_CH_PASS = os.environ.get("REWARDS_CH_PASS", "")
+REWARDS_CH_DB = os.environ.get("REWARDS_CH_DB", "block_builder")
+REWARDS_CH_TABLE = os.environ.get("REWARDS_CH_TABLE", "reward_percentiles_daily")
+
+_COHORT = {"gbx": "gbx", "harmonic": "harm"}
+
+
+def _db_scalars(lo, hi):
+    """Per-day scalars from ClickHouse, keyed (day, side). None if unavailable.
+
+    The table repeats its aggregates across each day's 100 percentile rows, so
+    one value per (day, cohort) is taken. FINAL collapses the ReplacingMergeTree
+    duplicates a re-pull of the same day leaves behind.
+
+    Lamports out, because the histograms in the JSON are lamports and _pool adds
+    the two together. total_reward_sol is already the like-for-like figure
+    (fee + Jito net, Titan/Bifrost excluded), matching the `like` the JSON holds.
+    """
+    if not REWARDS_CH_URL:
+        return None
+    sql = (
+        "SELECT block_date, cohort, any(slots_led), any(validators), "
+        "any(slots_with_jito_tips), any(slots_with_other_tips), "
+        "any(total_fee_sol), any(total_jito_gross_sol), any(total_jito_net_sol), "
+        "any(total_other_sol), any(total_reward_sol), any(mev_commission_pct) "
+        f"FROM {REWARDS_CH_DB}.{REWARDS_CH_TABLE} FINAL "
+        f"WHERE block_date BETWEEN '{lo}' AND '{hi}' "
+        "GROUP BY block_date, cohort FORMAT TSV")
+    req = urllib.request.Request(REWARDS_CH_URL, data=sql.encode(), method="POST")
+    if REWARDS_CH_USER:
+        tok = base64.b64encode(
+            f"{REWARDS_CH_USER}:{REWARDS_CH_PASS}".encode()).decode()
+        req.add_header("Authorization", "Basic " + tok)
+    try:
+        with urllib.request.urlopen(req, timeout=15) as fh:
+            body = fh.read().decode()
+    except Exception:
+        return None
+    out = {}
+    for line in body.splitlines():
+        f = line.split("\t")
+        if len(f) != 12:
+            continue
+        side = _COHORT.get(f[1])
+        if not side:
+            continue
+        out[(f[0], side)] = dict(
+            slots=int(f[2]), validators=int(f[3]),
+            with_jito=int(f[4]), with_other=int(f[5]),
+            fee=float(f[6]) * 1e9, jito_gross=float(f[7]) * 1e9,
+            jito_net=float(f[8]) * 1e9, other=float(f[9]) * 1e9,
+            like=float(f[10]) * 1e9, comm_bps=float(f[11]) * 100.0)
+    return out or None
 
 BIN = 0.0005          # SOL per histogram bucket
 TRIM_LO, TRIM_HI = 0.01, 0.99
@@ -41,27 +112,58 @@ C_RATIO = "#c98500"
 C_GAP = "#3987e5"
 
 
-def _pool(days, dates, side):
+def _source_line(G, Hm, n_days):
+    """One sentence on where this render's numbers actually came from."""
+    want = n_days * 2
+    got = G["db_days"] + Hm["db_days"]
+    where = f"{REWARDS_CH_DB}.{REWARDS_CH_TABLE}"
+    if not REWARDS_CH_URL:
+        return ("Scalars and histograms both from rewards_daily.json "
+                "(REWARDS_CH_URL unset, so ClickHouse was not consulted).")
+    if got == 0:
+        return (f"ClickHouse ({where}) was unreachable or had no rows for this "
+                "range, so every figure fell back to rewards_daily.json.")
+    head = (f"Per-day scalars from ClickHouse {where} "
+            f"({got} of {want} cohort-days)")
+    if got < want:
+        head += f"; the remaining {want - got} fell back to rewards_daily.json"
+    return (head + ". Histograms and the compute-unit grid come from "
+            "rewards_daily.json: that table stores percentiles, which cannot "
+            "be pooled across days.")
+
+
+def _pool(days, dates, side, scalars=None):
     """Sum a cohort's histograms and totals over a date range.
 
     Exact: both bin counts and per-bin SOL sums add. This is the whole reason
     the source is histograms rather than per-day percentiles.
+
+    The histogram always comes from the JSON -- ClickHouse does not carry one.
+    The scalars come from `scalars` (ClickHouse) when that day is present, and
+    from the JSON otherwise, so a day the table has not been loaded with still
+    renders. Both are the same quantities, so the numbers do not move; the
+    per-day source is recorded in out["db_days"] for the footer.
     """
     h, out = {}, dict(slots=0, fee=0.0, jito_gross=0.0, jito_net=0.0,
                       other=0.0, like=0.0, with_jito=0, with_other=0,
-                      comm_num=0.0, vals=0)
+                      comm_num=0.0, vals=0, db_days=0)
     for d in dates:
         e = days[d][side]
         for b, c, sm in zip(e["bins"], e["counts"], e["sums"]):
             r = h.setdefault(b, [0, 0.0])
             r[0] += c
             r[1] += sm
+        src = (scalars or {}).get((d, side))
+        if src:
+            out["db_days"] += 1
+        else:
+            src = e
         for k in ("slots", "with_jito", "with_other"):
-            out[k] += e[k]
+            out[k] += src[k]
         for k in ("fee", "jito_gross", "jito_net", "other", "like"):
-            out[k] += e[k]
-        out["comm_num"] += e["comm_bps"] * e["slots"]
-        out["vals"] = max(out["vals"], e.get("validators", 11))
+            out[k] += src[k]
+        out["comm_num"] += src["comm_bps"] * src["slots"]
+        out["vals"] = max(out["vals"], src.get("validators", 11))
     out["hist"] = h
     out["comm_bps"] = out["comm_num"] / out["slots"] if out["slots"] else 0
     return out
@@ -531,7 +633,9 @@ def rewards_page(CSS, purl, d_from=None, d_to=None, opts=None):
     except ValueError:
         inspect = 99
 
-    G, Hm = _pool(days, dates, "gbx"), _pool(days, dates, "harm")
+    scalars = _db_scalars(dates[0], dates[-1]) if dates else None
+    G = _pool(days, dates, "gbx", scalars)
+    Hm = _pool(days, dates, "harm", scalars)
     gt, g_kept = _trimmed_mean(G["hist"], G["slots"])
     ht, h_kept = _trimmed_mean(Hm["hist"], Hm["slots"])
     gmed = _pct(G["hist"], G["slots"], .50)
@@ -676,6 +780,7 @@ def rewards_page(CSS, purl, d_from=None, d_to=None, opts=None):
       <b>Compute mix.</b> {html.escape(meta.get('cu_note',''))}<br>
       <b>Before quoting a number.</b>
       <ul style="margin:4px 0 0 18px;padding:0">{cav}</ul>
+      <b>Live source.</b> {html.escape(_source_line(G, Hm, len(dates)))}<br>
       <b>Sources.</b> histograms <code>{html.escape(meta['sources']['hist'])}</code>;
       commission <code>{html.escape(meta['sources']['commission'])}</code>;
       compute mix <code>{html.escape(meta['sources'].get('cu',''))}</code>;
