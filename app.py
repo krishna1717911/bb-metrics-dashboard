@@ -30,6 +30,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import rewards
+import winrate
 
 # ------------------------------------------------------------------- clients
 
@@ -2929,6 +2930,20 @@ def _perf_reasons():
     except Exception:
         pass
     return out
+
+
+def winrate_html():
+    """The full per-builder win-rate table for the main page.
+
+    Our own builder_ids come from the configured deployments; winrate.py also
+    marks anything carrying the house prefix, because the fleet is wider than
+    what this dashboard instruments.
+    """
+    if not (RELAY_URL and RELAY_DS_UID):
+        return ('<div class="none">win rates need the relay: set RELAY_URL '
+                "and RELAY_DS_UID</div>")
+    ours = [d.get("relay_builder") for d in DEPLOYMENTS if d.get("relay_builder")]
+    return winrate.render(winrate.cached(lambda sql: relay(sql), our_builders=ours))
 
 
 def perf_stats():
@@ -6741,6 +6756,30 @@ TICK_JS = """
 # The links stay real hrefs and the handler still serves the whole page, so
 # with JavaScript off, or if a fetch fails, navigation simply falls back to
 # what it always did.
+WINRATE_JS = r'''
+(function(){
+  // Open on arrival, but still fetched rather than inlined: three relay queries
+  // behind a Grafana proxy should not hold up the rest of the page, and the
+  // result is cached server-side so reopening is free.
+  var box = document.getElementById('winratebox');
+  if (!box) return;
+  function load(){
+    var body = box.querySelector('.winratebody');
+    if (!box.open || !body || body.dataset.loaded !== '0') return;
+    body.dataset.loaded = '1';
+    fetch('/winrate' + location.search)
+      .then(function(r){ return r.text(); })
+      .then(function(t){ body.innerHTML = t; })
+      .catch(function(e){
+        body.dataset.loaded = '0';
+        body.innerHTML = '<div class="err">could not load: ' + e + '</div>';
+      });
+  }
+  box.addEventListener('toggle', load);
+  load();
+})();
+'''
+
 PERF_JS = r'''
 (function(){
   // The panel is collapsed on arrival and its body is fetched the first time
@@ -7622,7 +7661,7 @@ def page(sel_win=None, sel_slot=None, sel_round=None, tab="rounds",
     return f"""<!doctype html><html><head><meta charset="utf-8">
 <title>simbench{title}</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<style>{CSS}</style></head><body>
+<style>{CSS}{winrate.CSS}</style></head><body>
 <header>
   <h1>sim<span>bench</span></h1>
   <div class="sub">block-builder slot explorer</div>
@@ -7636,12 +7675,14 @@ def page(sel_win=None, sel_slot=None, sel_round=None, tab="rounds",
   <a class="navlink" href="{purl("/rewards")}">reward distribution by scheduler</a>
 </header>
 <details class="perfbox" id="perfbox"><summary>performance stats<span>extend &amp; commit timings, win rate &mdash; every builder</span></summary><div class="perfbody" data-loaded="0"><div class="none">opening&hellip;</div></div></details>
+<details class="perfbox" id="winratebox" open><summary>win rate &mdash; last {winrate.WINDOW_H}h<span>every builder the relay sees, with tail rounds and contested denominators</span></summary><div class="winratebody" data-loaded="0"><div class="none">loading&hellip;</div></div></details>
 {health_html()}
 {strip}
 <div id="view">{body}</div>
 <script>{TICK_JS.replace("__SERVER_NOW__", f"{dt.datetime.now(dt.UTC).timestamp():.3f}")}</script>
 <script>{NAV_JS}</script>
 <script>{PERF_JS}</script>
+<script>{WINRATE_JS}</script>
 </body></html>"""
 
 
@@ -8767,6 +8808,20 @@ class Handler(BaseHTTPRequestHandler):
                      ("cu", "render", "hscale", "cam", "insp")}).encode()
             except Exception as exc:
                 body = f"<pre>{html.escape(str(exc))}</pre>".encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self._remember_deployment()
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if parsed.path == "/winrate":
+            try:
+                out = winrate_html()
+            except Exception as exc:
+                out = ('<div class="err">win rates unavailable: '
+                       f"{html.escape(str(exc))[:200]}</div>")
+            body = out.encode()
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self._remember_deployment()
