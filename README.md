@@ -722,6 +722,41 @@ rounds, extends, the simulator's DAG, the shred path, our logs — because for
 this builder none of it was ever written. Those tabs say exactly that instead of
 rendering an empty frame that reads as a fault.
 
+## Validator comparison — `/econ/validator-comparison`
+
+One of our GBX validators against one other validator of similar stake, per
+day: SOL per leader slot, slot-time normalised, from the Firedancer daily
+report, with our GBX builder tips added on ours. Clicking a day opens two
+panels about the validator we are comparing against.
+
+**Our egress to it, by api key.** What our router paid to land transactions
+in its slots that day, split by the api key that sent them, biggest first — a
+bar per key, the table beneath. The lane follows the other validator's
+client: Harmonic → `harmonic`, JitoBAM → `jito_bam`, Jito → `jito`, Rakurai →
+`rakurai`. Source is the quant ClickHouse, `db_sync.inbound_transactions_enriched`.
+Two de-duplications are load-bearing: the table is a ReplacingMergeTree that
+holds 2–5 unmerged versions of a row, so each signature is collapsed to one
+row first (summed raw, the ingress side reads ~3× high while the egress side
+does not); and one egress payment covers several transactions, so its tip is
+shared across them pro rata before being summed by key. Done that way the
+keys add up to `landing.validator_landing_daily` — the rollup the Landing API
+shows partner validators — which is read alongside as the check. Only the
+first eight characters of a key leave the server.
+
+**The per-slot uplift**, under the bars: what our validator's figure for that
+day becomes if that egress had landed on it instead, spread over its own
+leader slots and scaled by the same slot-time factor as its GBX tips — once
+for this one validator, once for every validator we reached through that
+lane. It is an upper bound: it assumes the flow lands with us at the same
+tip.
+
+**Its biggest priority-fee payers**, from Dune, as before.
+
+Needs `QUANT_CH_*` in the environment; without it the egress panel says so and
+the rest of the page is unchanged. A snapshot carries whichever panels were
+opened, and remembers the other validator's client so a day opened later in
+the viewer can still resolve its lane.
+
 ## Metrics reference — `/reference`
 
 A page documenting every metric: what it measures, its source field, the amber

@@ -611,7 +611,19 @@ COL_KEY = [
 ]
 
 
-def rewards_page(CSS, purl, d_from=None, d_to=None, opts=None):
+def rewards_page(CSS, purl, d_from=None, d_to=None, opts=None,
+                 paths=None):
+    # The page moved under /econ when the dashboard was split into
+    # sections. app.py owns the URL map, so it hands the paths in
+    # rather than this module keeping a second copy that can drift.
+    paths = paths or {}
+    P_HOME = paths.get("home", "/")
+    P_SELF = paths.get("self", "/rewards")
+    P_REF = paths.get("reference", "/reference")
+    # Rendered by app.py's crumb_html so this page's trail cannot drift from
+    # the other six. It builds its own document rather than going through
+    # shell() because of the Plotly tag and its own stylesheet.
+    CRUMB = paths.get("crumb", "")
     with open(REWARDS_JSON) as fh:
         D = json.load(fh)
     meta, days = D["meta"], D["days"]
@@ -695,14 +707,18 @@ def rewards_page(CSS, purl, d_from=None, d_to=None, opts=None):
     opts_html = lambda sel: "".join(
         f'<option value="{d}"{" selected" if d == sel else ""}>{d}</option>'
         for d in all_dates)
-    dep_val = purl("/rewards").partition("dep=")[2]
-    base = purl("/rewards")
+    # No builder in this page's own links. The comparison is GBX against Agave
+    # Harmonic -- two cohorts of validators, neither of them a deployment of
+    # ours -- so nothing here reads the instance, and carrying one described
+    # nothing on screen. (The old code looked for `dep=`, which purl stopped
+    # emitting when the parameter became `instance=`, so the hidden field it
+    # fed had been empty for a while.)
+    base = P_SELF + "?"
     quick = "".join(
-        f'<a href="{base}&from={all_dates[max(0,len(all_dates)-n)]}'
+        f'<a href="{base}from={all_dates[max(0,len(all_dates)-n)]}'
         f'&to={all_dates[-1]}">{lab}</a>'
         for n, lab in ((7, "last 7d"), (14, "last 14d"), (len(all_dates), "all")))
-    rng = (f'<form class="rw-range" method="get" action="/rewards">'
-           f'<input type="hidden" name="dep" value="{html.escape(dep_val)}">'
+    rng = (f'<form class="rw-range" method="get" action="{P_SELF}">'
            f'<label>from<select name="from">{opts_html(d_from)}</select></label>'
            f'<label>to<select name="to">{opts_html(d_to)}</select></label>'
            f'<button type="submit">apply</button>'
@@ -713,7 +729,7 @@ def rewards_page(CSS, purl, d_from=None, d_to=None, opts=None):
         for val, lab in choices:
             cv = dict(cu=cu_side, render=render, hscale=hscale)
             cv[name] = val
-            href = (f'{base}&from={d_from}&to={d_to}&cu={cv["cu"]}'
+            href = (f'{base}from={d_from}&to={d_to}&cu={cv["cu"]}'
                     f'&render={cv["render"]}&hscale={cv["hscale"]}&insp={inspect}')
             out.append(f'<a class="{"on" if val == cur else ""}" href="{href}">{lab}</a>')
         return "".join(out)
@@ -761,9 +777,9 @@ def rewards_page(CSS, purl, d_from=None, d_to=None, opts=None):
   <h1>sim<span>bench</span></h1>
   <div class="sub">GBX vs Agave Harmonic &mdash; per-slot revenue,
     {d_from} to {d_to}</div>
-  <a class="navlink" href="{purl("/")}">&larr; back to slots</a>
-  <a class="navlink" href="{purl("/reference")}">metrics reference</a>
+  <a class="navlink" href="{purl(P_REF)}">metrics reference</a>
 </header>
+{CRUMB}
 
 <div class="rw-strip">
   <b>Verified against reports.firedancer.io on all {len(all_dates)} days.</b>

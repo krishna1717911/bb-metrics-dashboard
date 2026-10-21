@@ -1,0 +1,12 @@
+builder_id,deployed_at,branch,description
+ASTRALANE_AMS_2,2026-10-13 13:44:37,main,Merge #114 codex/explicit-early-child. Commit 4354acb.
+ASTRALANE_FRA_1,2026-10-13 13:44:36,main,Merge #114 codex/explicit-early-child. Commit 4354acb.
+ASTRALANE_JP_1,2026-10-13 13:41:12,main,Merge #114 codex/explicit-early-child. Commit 4354acb.
+ASTRALANE_AMS_1,2026-10-13 13:28:18,main,Merge #114 codex/explicit-early-child. Commit 4354acb.
+ASTRALANE_FRA_MOCK_1,2026-10-13 10:33:30,main,Merge #114 codex/explicit-early-child. Commit 4354acb.
+ASTRALANE_AMS_MOCK,2026-10-12 17:36:21,main,Merge #115 codex/winner-impact-replay-20261012. Commit 8d7b106.
+ASTRALANE_AMS_MOCK,2026-10-12 17:32:24,codex/named-build-reprobe-20260913,Allow scheduler worker CPUs outside the startup affinity mask. Commit 25e68a5. Replaced after four minutes.
+ASTRALANE_AMS_1,2026-10-10 07:26:51,codex/refs-only-offers-20260930,Clear connector-known orders on handshake. Commit cfa28ed.
+ASTRALANE_AMS_2,2026-10-10 07:26:51,codex/refs-only-offers-20260930,Clear connector-known orders on handshake. Commit cfa28ed.
+ASTRALANE_AMS_MOCK,2026-10-10 07:26:51,codex/refs-only-offers-20260930,Clear connector-known orders on handshake. Commit cfa28ed.
+ASTRALANE_FRA_1,2026-10-09 13:37:31,codex/refs-only-offers-20260930,Clear connector-known orders on handshake. Commit cfa28ed.

@@ -14,8 +14,10 @@ ClickHouse is read, for the produced-slot list.
 """
 
 import argparse
+import csv
 import base64
 import datetime as dt
+import hmac
 import html
 import json
 import os
@@ -31,6 +33,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import rewards
 import winrate
+import health
+import valcomp
+import accuracy
 
 # ------------------------------------------------------------------- clients
 
@@ -49,6 +54,15 @@ CH_DB = os.environ.get("CH_DB", "block_builder")
 CH_BUILDER = os.environ.get("CH_BUILDER", "")
 # instance_id as it appears in bifrost_events / otel ServiceName
 CH_INSTANCE = os.environ.get("CH_INSTANCE", "")
+
+# The quant ClickHouse: db_sync.inbound_transactions_enriched and the landing
+# rollup, i.e. where "what did we pay that validator, and who sent it" lives.
+# Only the validator comparison's per-day drill-down reads it. Optional --
+# left blank, that panel says so and the rest of the page is unaffected.
+QUANT_CH_URL = os.environ.get("QUANT_CH_URL", "")
+QUANT_CH_USER = os.environ.get("QUANT_CH_USER", "")
+QUANT_CH_PASS = os.environ.get("QUANT_CH_PASS", "")
+QUANT_CH_DB = os.environ.get("QUANT_CH_DB", "db_sync")
 
 # ClickStack: otel structured logs. A separate cluster from block_builder.
 # Optional -- without it the health header keeps its InfluxDB and ClickHouse
@@ -133,20 +147,52 @@ def _tsv(field):
 
 
 def ch_conf():
-    """This deployment's ClickHouse, or the global one."""
-    own = (dep().get("ch") or {}) if DEPLOYMENTS else {}
-    return (own.get("url") or CH_URL, own.get("user") or CH_USER,
-            own.get("pass") or CH_PASS, own.get("db") or CH_DB)
+    """The ClickHouse every builder is read from.
+
+    There used to be a per-builder override here, because the mock shipped to
+    its own cluster. It does not any more: that store has had 0 rows for 7
+    days while the mock writes 1.5M events a day to the main one, so the
+    override only ever pointed the mock's pages at an empty database."""
+    return CH_URL, CH_USER, CH_PASS, CH_DB
 
 
-def clickhouse(sql):
-    """-> (columns, rows). No CTEs: bb_read is readonly=1 and WITH needs a temp table."""
-    url, user, password, db = ch_conf()
+def _ch_error(exc):
+    """Turn an HTTPError from a ClickHouse endpoint into the message it
+    actually carries.
+
+    ClickHouse answers a bad (or throttled) query with HTTP 500 and the
+    reason in the BODY, which urllib discards -- so every failure reaches
+    the page as the uninformative "HTTP Error 500: Internal Server Error".
+    Through gattaca_relay.q it is worse: the real cause is nested inside a
+    DB::HTTPException that wraps the remote server's body, so the useful
+    line is the LAST DB::Exception in the text, not the first.
+
+    Returns a RuntimeError ready to raise; falls back to the body, then to
+    the original exception, when it is not a ClickHouse error at all.
+    """
+    try:
+        body = exc.read().decode("utf-8", "replace")
+    except Exception:
+        body = ""
+    hits = list(re.finditer(r"Code: \d+\. DB::(?:Exception|HTTPException): ",
+                            body))
+    if hits:
+        msg = body[hits[-1].start():]
+        msg = re.split(r"\s*\(version ", msg)[0].strip().rstrip("':")
+        return RuntimeError(msg[:400])
+    return RuntimeError((body.strip() or str(exc))[:400])
+
+
+def _ch_query(url, user, password, db, sql, settings=None):
     qs = urllib.parse.urlencode({"user": user, "password": password,
                                  "database": db,
-                                 "query": sql + " FORMAT TabSeparatedWithNames"})
-    with urllib.request.urlopen(url + "?" + qs, timeout=120) as resp:
-        text = resp.read().decode()
+                                 "query": sql + " FORMAT TabSeparatedWithNames",
+                                 **(settings or {})})
+    try:
+        with urllib.request.urlopen(url + "?" + qs, timeout=120) as resp:
+            text = resp.read().decode()
+    except urllib.error.HTTPError as exc:
+        raise _ch_error(exc) from None
     # split on the RAW separators first: an escaped tab or newline inside a
     # value is the two-character sequence, so it survives this untouched
     lines = [ln for ln in text.split("\n") if ln]
@@ -156,26 +202,89 @@ def clickhouse(sql):
             [[_tsv(v) for v in ln.split("\t")] for ln in lines[1:]])
 
 
+def clickhouse(sql):
+    """-> (columns, rows). No CTEs: bb_read is readonly=1 and WITH needs a temp table."""
+    return _ch_query(*ch_conf(), sql)
+
+
+def clickhouse_main(sql):
+    """The SAME query, against the store named in CH_URL, with no deployment
+    indirection at all.
+
+    ch_conf() resolves through dep(), and on a page that is not about one
+    deployment dep() falls back to a year-long cookie. So the health page --
+    which is keyed by instance_id and names no deployment anywhere on screen
+    -- was quietly pointed at whichever store the visitor's cookie last
+    held. With dep=mock that is the mock's own ClickHouse, which holds no
+    recent events, and the page reported "no instance has written an event"
+    about a store it never named. Exactly the class of bug the explicit
+    ?dep= work existed to kill, reintroduced one level down in the stack."""
+    return _ch_query(CH_URL, CH_USER, CH_PASS, CH_DB, sql)
+
+
+def clickhouse_quant(sql):
+    """The quant store, for the validator comparison's egress drill-down.
+    Table names in the SQL are fully qualified, so QUANT_CH_DB only sets
+    the session default."""
+    if not QUANT_CH_URL:
+        raise RuntimeError("QUANT_CH_URL is not configured on this dashboard")
+    # The read-only login's profile caps execution at 30 s; a readonly=2
+    # user may still raise it per query, and a busy day on a big validator
+    # needs the headroom. Harmless on a login without the cap.
+    return _ch_query(QUANT_CH_URL, QUANT_CH_USER, QUANT_CH_PASS, QUANT_CH_DB,
+                     sql, settings={"max_execution_time": "120"})
+
+
+_ds_uid = [None]            # resolved lazily, see _relay_uid
+
+
+def _relay_auth():
+    return base64.b64encode(f"{RELAY_USER}:{RELAY_PASS}".encode()).decode()
+
+
+def _relay_uid(force=False):
+    """The Grafana datasource uid, resolved from the server if need be.
+
+    The configured uid went stale on 2026-10-16: the datasource was
+    recreated as `ag1brnspa86bka` and every query started answering
+    HTTP 404 {"message":"Data source not found"} -- which reads exactly
+    like the host being down, and is not. There is only ever one
+    datasource on that Grafana, so asking it is unambiguous and means a
+    recreated datasource self-heals instead of taking the page with it.
+    """
+    if _ds_uid[0] and not force:
+        return _ds_uid[0]
+    if RELAY_DS_UID and not force:
+        _ds_uid[0] = RELAY_DS_UID
+        return _ds_uid[0]
+    req = urllib.request.Request(
+        RELAY_URL.rstrip("/") + "/api/datasources",
+        headers={"Authorization": "Basic " + _relay_auth(),
+                 "User-Agent": "simbench/1.0"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        found = json.load(resp)
+    pick = next((d for d in found if d.get("isDefault")), None) or (
+        found[0] if found else None)
+    if not pick:
+        raise RuntimeError("that Grafana lists no datasource at all")
+    _ds_uid[0] = pick["uid"]
+    return _ds_uid[0]
+
+
 def relay(sql):
     """-> (columns, rows) from the relay ClickHouse via Grafana's datasource
     proxy. Cloudflare fronts that host and rejects a default urllib
     user-agent with a 403 "error code 1010" that reads like an auth failure,
     hence the explicit header."""
-    if not (RELAY_URL and RELAY_DS_UID):
-        raise RuntimeError("RELAY_URL / RELAY_DS_UID not configured")
-    body = json.dumps({"queries": [{
-        "refId": "A", "format": 1,
-        "datasource": {"type": "grafana-clickhouse-datasource",
-                       "uid": RELAY_DS_UID},
-        "rawSql": sql}], "from": "now-24h", "to": "now"}).encode()
-    token = base64.b64encode(f"{RELAY_USER}:{RELAY_PASS}".encode()).decode()
-    req = urllib.request.Request(
-        RELAY_URL.rstrip("/") + "/api/ds/query", data=body,
-        headers={"Content-Type": "application/json",
-                 "Authorization": "Basic " + token,
-                 "User-Agent": "simbench/1.0"})
-    with urllib.request.urlopen(req, timeout=90) as resp:
-        payload = json.load(resp)
+    if not RELAY_URL:
+        raise RuntimeError("RELAY_URL not configured")
+    try:
+        payload = _relay_post(sql, _relay_uid())
+    except urllib.error.HTTPError as exc:
+        # a stale uid is a 404 with a body saying so -- re-resolve once
+        if exc.code != 404:
+            raise
+        payload = _relay_post(sql, _relay_uid(force=True))
     result = payload.get("results", {}).get("A", {})
     if result.get("error"):
         raise RuntimeError(result["error"][:200])
@@ -187,13 +296,96 @@ def relay(sql):
             list(zip(*frame["data"]["values"])))
 
 
+def _relay_post(sql, uid):
+    body = json.dumps({"queries": [{
+        "refId": "A", "format": 1,
+        "datasource": {"type": "grafana-clickhouse-datasource", "uid": uid},
+        "rawSql": sql}], "from": "now-24h", "to": "now"}).encode()
+    req = urllib.request.Request(
+        RELAY_URL.rstrip("/") + "/api/ds/query", data=body,
+        headers={"Content-Type": "application/json",
+                 "Authorization": "Basic " + _relay_auth(),
+                 "User-Agent": "simbench/1.0"})
+    with urllib.request.urlopen(req, timeout=90) as resp:
+        return json.load(resp)
+
+
 def otel_conf():
-    """This deployment's ClickStack, or the global one. The mock builder ships
-    to its own, on a different host and database from production."""
-    own = (dep().get("otel") or {}) if DEPLOYMENTS else {}
-    return (own.get("url") or OTEL_URL, own.get("user") or OTEL_USER,
-            own.get("pass") or OTEL_PASS, own.get("db") or OTEL_DB,
-            own.get("service") or OTEL_SERVICE)
+    """The ClickStack, with this builder's ServiceName.
+
+    Same story as ch_conf: the mock's separate cluster is empty, and its
+    logs arrive in the main one under its own ServiceName."""
+    own = dep().get("otel") or {}
+    return (OTEL_URL, OTEL_USER, OTEL_PASS, OTEL_DB,
+            own.get("service") or dep().get("instance") or OTEL_SERVICE)
+
+
+def _otel_query(url, user, password, db, sql):
+    qs = urllib.parse.urlencode({"user": user, "password": password,
+                                 "database": db})
+    req = urllib.request.Request(url + "?" + qs,
+                                 data=(sql + " FORMAT TabSeparated").encode())
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            text = resp.read().decode()
+    except urllib.error.HTTPError as exc:
+        raise _ch_error(exc) from None
+    return [ln.split("\t") for ln in text.split("\n") if ln]
+
+
+def gattaca(sql):
+    """Relay SQL, through the proxy view on the otel cluster.
+
+    `gattaca_relay.q` is a parameterised view that forwards arbitrary SQL to
+    the relay's own ClickHouse with credentials baked in, so the same otel
+    login reaches both otel_logs and the relay tables. Faster than the
+    Grafana datasource proxy and, unlike it, window functions work.
+
+    It sees FEWER relay tables than Grafana does -- mini_block_events (the
+    dead v1), health_info, registered_searchers and _migrations are not in
+    the grant -- so relay() stays on Grafana for those.
+
+    Single quotes double up inside the parameter, the same escaping any
+    ClickHouse string literal needs."""
+    if not OTEL_URL:
+        raise RuntimeError("OTEL_URL not configured")
+    inner = sql.replace("'", "''")
+    body = (f"SELECT * FROM gattaca_relay.q(sql='{inner}') "
+            "FORMAT TabSeparatedWithNames")
+    qs = urllib.parse.urlencode({"user": OTEL_USER, "password": OTEL_PASS,
+                                 "database": OTEL_DB})
+    req = urllib.request.Request(OTEL_URL + "?" + qs, data=body.encode())
+    try:
+        with urllib.request.urlopen(req, timeout=180) as resp:
+            # Some relay columns are FixedString(64) raw bytes, not text, so
+            # the response is not necessarily valid UTF-8. base58Encode()
+            # them in the query; this keeps a stray byte from killing the
+            # whole read.
+            text = resp.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as exc:
+        raise _ch_error(exc) from None
+    lines = [ln for ln in text.split("\n") if ln]
+    if not lines:
+        return [], []
+
+    def field(raw):
+        # TSV spells SQL NULL as a literal \N, and _tsv() has no mapping for
+        # N so it would hand back the string "N" -- which every caller then
+        # feeds to int(x or 0) and crashes on. Grafana returned None here,
+        # and callers were written against that, so match it.
+        return None if raw == "\\N" else _tsv(raw)
+
+    return ([_tsv(c) for c in lines[0].split("\t")],
+            [[field(v) for v in ln.split("\t")] for ln in lines[1:]])
+
+
+def otel_main(sql):
+    """ClickStack without the deployment indirection -- see clickhouse_main.
+    The relay panel reads every relay, so it must not follow a cookie to the
+    mock's own cluster, where none of them appear."""
+    if not OTEL_URL:
+        raise RuntimeError("OTEL_URL not configured")
+    return _otel_query(OTEL_URL, OTEL_USER, OTEL_PASS, OTEL_DB, sql)
 
 
 def otel(sql):
@@ -201,13 +393,7 @@ def otel(sql):
     url, user, password, db, service = otel_conf()
     if not (url and service):
         raise RuntimeError("OTEL_URL / OTEL_SERVICE not configured")
-    qs = urllib.parse.urlencode({"user": user, "password": password,
-                                 "database": db})
-    req = urllib.request.Request(url + "?" + qs,
-                                 data=(sql + " FORMAT TabSeparated").encode())
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        text = resp.read().decode()
-    return [ln.split("\t") for ln in text.split("\n") if ln]
+    return _otel_query(url, user, password, db, sql)
 
 
 TRUEISH = {"1", "true", "True"}
@@ -749,6 +935,17 @@ def copy_btn(value):
             f'role="button" tabindex="0" title="copy {html.escape(str(value))}"'
             f'>copy</span>')
 
+
+
+def copy_val(value, cls=""):
+    """The VALUE as the copy control: no separate button.
+
+    `.cp` is opacity:0 until a `.chip`/`.hascp`/`tr` ancestor is hovered, so
+    on a plain card row it was invisible and looked broken. Here the number
+    is the affordance -- it changes colour on hover and copies on click."""
+    v = html.escape(str(value), quote=True)
+    return (f'<span class="cpv{" " + cls if cls else ""}" data-c="{v}" '
+            f'role="button" tabindex="0" title="click to copy {v}">{v}</span>')
 
 def cold_why(w):
     """Why this window is marked cold, in its own numbers.
@@ -2789,40 +2986,172 @@ def _build_deployments():
     return out
 
 
-DEPLOYMENTS = _build_deployments()
-# Where a URL that names no builder goes. A request is never answered under an
-# unstated deployment: it is redirected to one that says so.
-DEFAULT_DEP = os.environ.get("DEFAULT_DEP", "mock")
-DEPLOY_BY_NAME = {d["name"]: d for d in DEPLOYMENTS}
+_CONFIGURED = _build_deployments()
+
+# Which builder the slot explorer opens on, matching the health page.
+DEFAULT_INSTANCE = "ASTRALANE_AMS_2"
+
+# The picker is driven by instance_id read from ClickHouse, not by the
+# DEPLOYMENTS list in .env. That list could only ever name four builders, so
+# ASTRALANE_FRA_1 -- the busiest instance in the store -- had no page at all.
+# A configured entry still supplies what the data cannot: the simulator
+# host_id, the leader identities, the relay builder id. An instance with no
+# entry gets a bundle with those blank, and the panels that need them say so
+# rather than rendering someone else's numbers.
+_inst_cache = {"at": 0.0, "v": None}
+_inst_lock = threading.Lock()
+INSTANCE_TTL_S = 300
+
+
+def _synth(inst):
+    return {"name": inst, "label": inst, "builder": inst, "instance": inst,
+            "sim": "", "sims": [], "leaders": [], "leader0": "",
+            "relay_builder": inst, "analysis_identity": "",
+            "source": "ours", "ch": {}, "otel": {"service": inst},
+            "configured": False}
+
+
+def instance_registry():
+    """instance_id -> its bundle, config first, then whatever is writing.
+
+    Cached for INSTANCE_TTL_S. A ClickHouse blink must not empty the picker,
+    so a failed or empty lookup keeps the previous answer, falling back to
+    the configured list."""
+    now = time.monotonic()
+    with _inst_lock:
+        hit = _inst_cache["v"]
+        if hit and now - _inst_cache["at"] < INSTANCE_TTL_S:
+            return hit
+    # Config is matched to the data case-INSENSITIVELY. DEPLOY_MOCK_INSTANCE
+    # is `astralane_ams_mock`, which is how the mock's own retired store
+    # spelled it; the live rows say ASTRALANE_AMS_MOCK. Matched exactly, the
+    # picker showed both -- one with the simulator mapping and no data, one
+    # with 64M events and "no config". Merging gives the real id the
+    # configured fields.
+    cfg = {d["instance"].lower(): d for d in _CONFIGURED if d.get("instance")}
+    by_inst, used = {}, set()
+    try:
+        _, rows = _ch_query(CH_URL, CH_USER, CH_PASS, CH_DB,
+                            "SELECT instance_id FROM bifrost_events "
+                            "WHERE ts > now() - INTERVAL 24 HOUR "
+                            "  AND instance_id LIKE 'ASTRALANE%' "
+                            "GROUP BY instance_id ORDER BY instance_id")
+        for r in rows:
+            inst = r[0] if r else ""
+            if not inst:
+                continue
+            hit = cfg.get(inst.lower())
+            if hit:
+                used.add(inst.lower())
+                by_inst[inst] = dict(hit, instance=inst, configured=True)
+            else:
+                by_inst[inst] = _synth(inst)
+    except Exception:
+        pass
+    # A configured builder that has gone quiet still gets an entry, so its
+    # history stays reachable.
+    for low, d in cfg.items():
+        if low not in used and d["instance"] not in by_inst:
+            by_inst[d["instance"]] = dict(d, configured=True)
+    if not by_inst:
+        return hit or {d["instance"] or d["name"]: dict(d, configured=True)
+                       for d in _CONFIGURED}
+    out = dict(sorted(by_inst.items()))
+    with _inst_lock:
+        _inst_cache.update(at=now, v=out)
+    return out
+
+
+def instances():
+    return list(instance_registry().values())
 
 
 def dep():
-    """The deployment this request is about."""
-    return getattr(_active, "d", None) or DEPLOYMENTS[0]
+    """The builder this request is about."""
+    d = getattr(_active, "d", None)
+    if d:
+        return d
+    reg = instance_registry()
+    return reg.get(DEFAULT_INSTANCE) or next(iter(reg.values()))
 
 
-def set_dep(name):
-    _active.d = DEPLOY_BY_NAME.get(name or "") or DEPLOYMENTS[0]
+def set_dep(inst):
+    reg = instance_registry()
+    _active.d = (reg.get(inst or "") or reg.get(DEFAULT_INSTANCE)
+                 or next(iter(reg.values())))
     return _active.d
+
+
+def known_instance(inst):
+    return inst in instance_registry()
 
 
 def dkey():
     """Cache-key fragment. Every per-slot and per-range cache holds rows for
-    ONE deployment; without this in the key, switching would serve Tokyo's
+    ONE builder; without this in the key, switching would serve Tokyo's
     slots under Amsterdam's name."""
-    return dep()["name"]
+    return dep()["instance"] or dep()["name"]
 
 
+# ------------------------------------------------------------------ paths
+#
+# Every page's URL in one place. They used to be string literals scattered
+# through the link builders, which is why moving the slot explorer off "/"
+# was previously impossible without hunting them down.
+#
+# The shape is <section>/<page>: the two sections are the two questions the
+# dashboard answers -- how the builder behaves, and what it is worth.
+HOME_PATH = "/"
 REF_PATH = "/reference"
+
+HEALTH_PATH = "/tech/health"
+ACCURACY_PATH = "/tech/accuracy"
+DEPLOYHIST_PATH = "/tech/deployments"
+SLOTS_PATH = "/tech/slots"
+RANGE_PATH = "/tech/slots/range"
+
+VALCOMP_PATH = "/econ/validator-comparison"
+SNAPSHOT_PATH = VALCOMP_PATH + "/snapshots"
+REWARDS_PATH = "/econ/rewards"
+
+# Where the old flat URLs go. Bookmarks and anything that linked the
+# dashboard before the split keep working, and land on the page that now
+# owns that content rather than on a 404.
+# Pages keyed by something other than the deployment. They opt out of the
+# ?dep= redirect so their own query parameter survives.
+# Pages keyed by something other than the builder. They opt out of the
+# ?instance= redirect, and nav_href() links to them without one.
+#
+# The test is simply whether the renderer reads the instance at all. The
+# index, the deployment log, the validator comparison and the reward
+# distribution never do -- the index is a list of links, the others are about
+# the whole fleet or about two cohorts of validators that are not deployments
+# of ours -- so a builder name in their address bar described nothing on the
+# page, which is the same invisible-state problem the explicit parameter
+# exists to solve, just pointing the other way.
+DEP_FREE_PATHS = {HEALTH_PATH, ACCURACY_PATH, ACCURACY_PATH + '/slot',
+                  HOME_PATH, DEPLOYHIST_PATH, VALCOMP_PATH,
+                  ACCURACY_PATH + '/export.csv',
+                  '/tech/offer-timelines', '/tech/offer-timelines/slot',
+                  '/api/accuracy/export', '/api/accuracy/status',
+                  SNAPSHOT_PATH,
+                  REWARDS_PATH,
+                  '/api/valcomp/status'}
+
+LEGACY_PATHS = {
+    "/analysis": RANGE_PATH,
+    "/rewards": REWARDS_PATH,
+    "/index.html": HOME_PATH,
+}
 
 
 def purl(path):
-    """A cross-page link (/, /analysis, /reference) naming this deployment.
+    """A cross-page link naming this builder.
 
     The nav bar used to drop it: stepping from the slot explorer to the range
-    analysis handed the deployment back to the cookie, so the two pages could
-    disagree about which builder you were reading."""
-    return path + "?dep=" + urllib.parse.quote(dep()["name"])
+    report handed the builder back to the cookie, so the two pages could
+    disagree about which one you were reading."""
+    return path + "?instance=" + urllib.parse.quote(dkey())
 
 
 def dhref(q=""):
@@ -2834,7 +3163,7 @@ def dhref(q=""):
     the cookie happened to hold. That is how a mock reading once got read as
     Amsterdam's. The URL is now always the whole truth about what is on
     screen, which also makes it shareable and back-button safe."""
-    base = "/?dep=" + urllib.parse.quote(dep()["name"])
+    base = SLOTS_PATH + "?instance=" + urllib.parse.quote(dkey())
     q = q.lstrip("?&")
     return base + ("&" + q if q else "")
 
@@ -2942,7 +3271,7 @@ def winrate_html():
     if not (RELAY_URL and RELAY_DS_UID):
         return ('<div class="none">win rates need the relay: set RELAY_URL '
                 "and RELAY_DS_UID</div>")
-    ours = [d.get("relay_builder") for d in DEPLOYMENTS if d.get("relay_builder")]
+    ours = [d.get("relay_builder") for d in instances() if d.get("relay_builder")]
     return winrate.render(winrate.cached(lambda sql: relay(sql), our_builders=ours))
 
 
@@ -2965,7 +3294,7 @@ def perf_stats():
         ext, com, rel = safe(fx, {}), safe(fc, {}), safe(fr, {})
         why = safe(fw, {})
     rows = []
-    for d in DEPLOYMENTS:
+    for d in instances():
         host = (d.get("sims") or [""])[0]
         rows.append({
             "label": d.get("label") or d["name"], "name": d["name"],
@@ -3094,23 +3423,31 @@ def host_name(host):
 
 
 def deploy_selector(path, params):
-    """The switch itself. Only rendered when there is more than one."""
-    if len(DEPLOYMENTS) < 2:
+    """The builder picker.
+
+    A dropdown over every instance writing events, not a fixed row of chips
+    over the four names someone put in .env. It stays a GET form carrying
+    the other parameters, because unlike the health page a slot link has to
+    name its builder -- a slot belongs to one of them, and a bare link would
+    be answered under whichever the cookie last held, which is the bug the
+    explicit parameter exists to prevent."""
+    reg = instance_registry()
+    if len(reg) < 2:
         return ""
-    here = dep()["name"]
-    out = []
-    for d in DEPLOYMENTS:
-        q = dict(params)
-        q["dep"] = d["name"]
-        # A slot belongs to one deployment, so carrying it across would land
-        # on an empty page; the switch goes to that deployment's own strip.
-        q.pop("slot", None)
-        q.pop("win", None)
-        q.pop("round", None)
-        href = path + "?" + urllib.parse.urlencode(
-            {k: v for k, v in q.items() if v})
-        out.append(f'<a class="depchip{" on" if d["name"] == here else ""}" '
-                   f'href="{html.escape(href)}">{html.escape(d["label"])}</a>')
+    here = dkey()
+    opts = []
+    for inst, d in reg.items():
+        tag = "" if d.get("configured") else " \u00b7 no config"
+        opts.append(f'<option value="{html.escape(inst)}"'
+                    f'{" selected" if inst == here else ""}>'
+                    f"{html.escape(inst)}{tag}</option>")
+    # A slot belongs to one builder, so carrying it across would land on an
+    # empty page; switching goes to that builder's own strip.
+    hidden = "".join(
+        f'<input type="hidden" name="{html.escape(k)}" '
+        f'value="{html.escape(str(v))}">'
+        for k, v in (params or {}).items()
+        if v and k not in ("slot", "win", "round", "instance"))
     d = dep()
     sims = d.get("sims") or []
     # The two identities every number on the page is filtered by. They were
@@ -3128,11 +3465,17 @@ def deploy_selector(path, params):
                           for h in sims))
     else:
         who += ('<span class="dwk">simulator</span>'
-                '<span class="dwnone">none &mdash; this builder writes no '
-                "InfluxDB rows we read</span>")
+                '<span class="dwnone">none mapped &mdash; the panels that '
+                "read InfluxDB cannot be filtered for this builder</span>")
     who += "</div>"
-    return ('<div class="depsel"><span>builder</span>' + "".join(out)
-            + "</div>" + who)
+    return (f'<form class="depsel" method="get" action="{path}">'
+            "<span>builder</span>"
+            '<select name="instance" onchange="this.form.submit()">'
+            + "".join(opts) + "</select>" + hidden
+            + '<noscript><button type="submit">go</button></noscript>'
+            "</form>" + who)
+
+
 # measurement -> (row label, sort key). The timestamp IS the datum for all four.
 SHRED_STAGES = [("shred_insert_is_full", "slot complete"),
                 ("bank_frozen", "bank frozen")]
@@ -3660,7 +4003,12 @@ def _offers_table(data, ours):
             + "".join(rows) + "</table></details>")
 
 OFFERS_JS = r"""
-(function(){
+// Defined, then called -- not a bare IIFE. The accuracy page injects its
+// slot panel with innerHTML, and a <script> that arrives that way never
+// executes, so that page loads this once and re-invokes it after each
+// expansion. The slot explorer still gets the immediate call below, so
+// its behaviour is unchanged.
+window.__renderOffers = function(){
   var el = document.getElementById('offdata');
   if(!el) return;
   var D = JSON.parse(el.textContent);
@@ -3911,8 +4259,16 @@ OFFERS_JS = r"""
     });
     all.appendChild(b);
   });
-  window.addEventListener('resize', function(){ cards.forEach(function(c){ c._draw(); }); });
-})();
+  // one listener for the life of the page, however many times we re-render
+  window.__offCards = cards;
+  if (!window.__offResized){
+    window.__offResized = true;
+    window.addEventListener('resize', function(){
+      (window.__offCards || []).forEach(function(c){ c._draw(); });
+    });
+  }
+};
+window.__renderOffers();
 """
 
 # ------------------------------------------------ one fetch per slot, cached
@@ -5391,7 +5747,7 @@ def missing_html(slot, data):
                        f'{dt.datetime.fromtimestamp(recv / 1000, dt.UTC).strftime("%H:%M:%S.%f")[:-3]}'
                        "</td>") if recv else '<td class="m dim">&mdash;</td>'
             aslot = it.get("approx_slot")
-            aslot_td = (f'<td class="n m dim">{aslot:,}</td>' if aslot
+            aslot_td = (f'<td class="n m dim">{copy_val(aslot)}</td>' if aslot
                         else '<td class="n m dim">&mdash;</td>')
             flag = ('<td class="m bad">yes</td>' if it["dropped"]
                     else '<td class="m dim">no</td>')
@@ -5872,7 +6228,49 @@ body{margin:0;background:#0b1016;color:#dbe4ee;
 header{padding:20px 28px 14px;display:flex;gap:16px;align-items:baseline;
   border-bottom:1px solid #1e2937}
 h1{margin:0;font-size:17px;font-weight:650;letter-spacing:-.01em}
+h1 a{color:inherit;text-decoration:none}
 h1 span{color:#5eead4}
+
+/* ---- the index, and the breadcrumb every page under it carries ---- */
+.crumb{padding:11px 28px;border-bottom:1px solid #1e2937;font-size:12px;
+  color:#6b7f96;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.crumb a{color:#5eead4;text-decoration:none}
+.crumb a:hover{text-decoration:underline}
+.crumb b{color:#cfe0f0;font-weight:600}
+.crumb span.sect{color:#8fa6bf}
+.crumb .caside{margin-left:auto}
+.idx{padding:10px 28px 56px;max-width:1180px}
+.idxsec{margin-top:30px}
+.idxsec h2{margin:0;font-size:14px;font-weight:650;color:#dbe4ee;
+  letter-spacing:.01em;text-transform:uppercase}
+.idxlede{margin:5px 0 16px;color:#6b7f96;font-size:12.5px;max-width:70ch}
+.idxgrid{display:grid;gap:10px;
+  grid-template-columns:repeat(auto-fill,minmax(248px,1fr))}
+.card{display:block;padding:13px 16px;border:1px solid #22303f;border-radius:10px;
+  background:#0e151d;text-decoration:none;color:inherit;transition:.12s}
+.card:hover{border-color:#5eead4;background:#101a23}
+.cardh{font-size:13.5px;font-weight:600;color:#5eead4;display:flex;gap:9px;
+  align-items:center;flex-wrap:wrap}
+.card.pending .cardh{color:#8fa6bf}
+.card.pending:hover{border-color:#3b4b5e}
+.soon{font-size:9.5px;text-transform:uppercase;letter-spacing:.04em;
+  color:#fbbf24;border:1px solid #78350f;background:#2a1f06;
+  border-radius:4px;padding:1px 6px;font-weight:600}
+.idxutil{margin-top:34px;padding-top:16px;border-top:1px solid #1e2937;
+  font-size:12px;color:#6b7f96;display:flex;gap:12px;align-items:center}
+.idxutil span{text-transform:uppercase;font-size:10px;letter-spacing:.04em}
+.idxutil a{color:#5eead4;text-decoration:none}
+.idxutil a:hover{text-decoration:underline}
+.scaffold{margin:26px 28px;padding:20px 22px;max-width:70ch;
+  border:1px dashed #3b4b5e;border-radius:10px;background:#0e151d}
+.scafh{font-size:10px;text-transform:uppercase;letter-spacing:.05em;
+  color:#fbbf24;font-weight:650}
+.scaffold p{margin:9px 0 0;color:#8fa6bf;font-size:12.5px;line-height:1.6}
+.scafp{margin-top:18px;font-size:11px;text-transform:uppercase;
+  letter-spacing:.04em;color:#6b7f96;font-weight:600}
+.scaflist{margin:8px 0 0;padding-left:19px;color:#8fa6bf;font-size:12.5px;
+  line-height:1.65}
+.scaflist li{margin:4px 0}
 .sub{color:#6b7f96;font-size:12.5px}
 form.jump{margin-left:auto}
 form.jump input{background:#0e151d;border:1px solid #22303f;border-radius:6px;
@@ -5960,6 +6358,10 @@ a.navlink:hover{background:#0f766e22;border-color:#5eead4}
 .age{font-variant-numeric:tabular-nums}
 
 /* copy-on-hover; hidden until the row is hovered or the control is focused */
+.cpv{cursor:pointer;border-radius:3px;transition:color .1s}
+.cpv:hover,.cpv:focus{color:#5eead4;outline:none}
+.cpv.ok{color:#5eead4;background:#0f766e33}
+.cpv.fail{color:#fca5a5}
 .cp{opacity:0;margin-left:7px;padding:0 5px;border:1px solid #2b3a4b;border-radius:4px;
   color:#6b7f96;font:9.5px/1.7 ui-sans-serif,sans-serif;text-transform:uppercase;
   letter-spacing:.05em;cursor:pointer;vertical-align:1px;
@@ -6267,6 +6669,10 @@ details.around>summary:hover{background:#111c26}
 .ctip i{width:9px;height:3px;border-radius:2px;display:inline-block}
 .ctip .g{color:#8fa3ba;margin-top:2px}
 /* deployment selector */
+.depsel select{background:#0e151d;border:1px solid #22303f;border-radius:6px;
+  color:#cfe0f0;padding:5px 10px;font:11.5px ui-monospace,Menlo,monospace;
+  min-width:230px}
+.depsel select:focus{outline:none;border-color:#5eead4}
 .depsel{display:flex;align-items:center;gap:5px;margin-left:auto;
   padding-right:14px}
 .depsel span{color:#4d5c70;font-size:10px;text-transform:uppercase;
@@ -6566,6 +6972,70 @@ tr.shredgrp .basis{display:inline;margin-left:8px}
 # trusted on its own -- a machine several minutes off would show ages that
 # disagree with the server's own numbers -- so we take the server's timestamp
 # once at load and carry the difference as a fixed offset.
+# Copy-on-hover, for every page. This used to live inside TICK_JS, which
+# only the slot pages load -- so a copy control rendered anywhere else was
+# inert, and the markup gave no sign of it. shell() now includes this on all
+# of them.
+COPY_JS = r"""
+(function(){
+  function flash(el, cls, label){
+    var was = el.textContent;
+    el.textContent = label; el.classList.add(cls);
+    setTimeout(function(){ el.textContent = was; el.classList.remove(cls); }, 1100);
+  }
+  function legacy(text){
+    var ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.cssText = 'position:fixed;top:-1000px;opacity:0';
+    document.body.appendChild(ta); ta.select();
+    var ok = false;
+    try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
+    document.body.removeChild(ta);
+    return ok;
+  }
+  function fallback(el, text){          // one attempt, one verdict
+    var ok = legacy(text);
+    flash(el, ok ? 'ok' : 'fail', ok ? 'copied' : 'failed');
+  }
+  function flashVal(el, cls){      // the value IS the control: keep the
+    el.classList.add(cls);        // text, say it worked with colour
+    setTimeout(function(){ el.classList.remove(cls); }, 900);
+  }
+  function copy(el){
+    var text = el.dataset.c;
+    if (el.classList.contains('cpv')){
+      var done = function(ok){ flashVal(el, ok ? 'ok' : 'fail'); };
+      if (navigator.clipboard && window.isSecureContext){
+        navigator.clipboard.writeText(text).then(
+          function(){ done(true); }, function(){ done(legacy(text)); });
+      } else { done(legacy(text)); }
+      return;
+    }
+    if (navigator.clipboard && window.isSecureContext){
+      navigator.clipboard.writeText(text).then(
+        function(){ flash(el, 'ok', 'copied'); },
+        function(){ fallback(el, text); });
+    } else {
+      fallback(el, text);
+    }
+  }
+  document.addEventListener('click', function(ev){
+    var el = ev.target.closest('.cp, .cpv');
+    if (!el) return;
+    ev.preventDefault(); ev.stopPropagation();
+    copy(el);
+  });
+  document.addEventListener('keydown', function(ev){
+    if (ev.key !== 'Enter' && ev.key !== ' ') return;
+    var el = ev.target.closest && ev.target.closest('.cp, .cpv');
+    if (!el) return;
+    ev.preventDefault(); ev.stopPropagation();
+    copy(el);
+  });
+})();
+"""
+
+
 TICK_JS = """
 (function(){
   var skew = __SERVER_NOW__ * 1000 - Date.now();   // server clock minus ours
@@ -6697,53 +7167,6 @@ TICK_JS = """
   });
 })();
 
-// Copy-on-hover. The controls sit inside chip anchors, so the click must be
-// swallowed or copying would also navigate. navigator.clipboard needs a secure
-// context -- localhost qualifies, a bare LAN IP does not -- hence the fallback.
-(function(){
-  function flash(el, cls, label){
-    var was = el.textContent;
-    el.textContent = label; el.classList.add(cls);
-    setTimeout(function(){ el.textContent = was; el.classList.remove(cls); }, 1100);
-  }
-  function legacy(text){
-    var ta = document.createElement('textarea');
-    ta.value = text;
-    ta.style.cssText = 'position:fixed;top:-1000px;opacity:0';
-    document.body.appendChild(ta); ta.select();
-    var ok = false;
-    try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
-    document.body.removeChild(ta);
-    return ok;
-  }
-  function fallback(el, text){          // one attempt, one verdict
-    var ok = legacy(text);
-    flash(el, ok ? 'ok' : 'fail', ok ? 'copied' : 'failed');
-  }
-  function copy(el){
-    var text = el.dataset.c;
-    if (navigator.clipboard && window.isSecureContext){
-      navigator.clipboard.writeText(text).then(
-        function(){ flash(el, 'ok', 'copied'); },
-        function(){ fallback(el, text); });
-    } else {
-      fallback(el, text);
-    }
-  }
-  document.addEventListener('click', function(ev){
-    var el = ev.target.closest('.cp');
-    if (!el) return;
-    ev.preventDefault(); ev.stopPropagation();
-    copy(el);
-  });
-  document.addEventListener('keydown', function(ev){
-    if (ev.key !== 'Enter' && ev.key !== ' ') return;
-    var el = ev.target.closest && ev.target.closest('.cp');
-    if (!el) return;
-    ev.preventDefault(); ev.stopPropagation();
-    copy(el);
-  });
-})();
 """
 
 
@@ -6782,12 +7205,17 @@ WINRATE_JS = r'''
 
 PERF_JS = r'''
 (function(){
-  // The panel is collapsed on arrival and its body is fetched the first time
-  // it is opened, once per page: three cross-store queries behind a details
-  // element nobody may open should not be on the critical path of every load.
+  // The body is fetched rather than inlined: three cross-store queries should
+  // not be on the critical path of every load.
+  //
+  // load() is bound to toggle AND called once, so the panel works whether it
+  // is rendered collapsed or open. It used to bind toggle only, which was
+  // right while this lived collapsed on the slot explorer and silently wrong
+  // the moment the health page rendered it open -- no toggle event ever
+  // fires for a box that arrives open, so it sat on "opening..." forever.
   var box = document.getElementById('perfbox');
   if (!box) return;
-  box.addEventListener('toggle', function(){
+  function load(){
     var body = box.querySelector('.perfbody');
     if (!box.open || !body || body.dataset.loaded !== '0') return;
     body.dataset.loaded = '1';
@@ -6799,7 +7227,9 @@ PERF_JS = r'''
         body.dataset.loaded = '0';
         body.innerHTML = '<div class="err">could not load: ' + e + '</div>';
       });
-  });
+  }
+  box.addEventListener('toggle', load);
+  load();
 })();
 '''
 
@@ -7521,7 +7951,7 @@ def reference_page():
 <header>
   <h1>sim<span>bench</span></h1>
   <div class="sub">metrics reference &mdash; what each number means and when it is bad</div>
-  <a class="navlink" href="{purl("/")}">&larr; back to slots</a>
+  <a class="navlink" href="{nav_href(HOME_PATH)}">&larr; all metrics</a>
 </header>
 <div class="callout">
   <b>Thresholds marked PROVISIONAL are inferences, not agreed limits.</b>
@@ -7658,32 +8088,19 @@ def page(sel_win=None, sel_slot=None, sel_round=None, tab="rounds",
         return body
     title = f" &middot; slot {sel_slot}" if sel_slot else \
             f" &middot; window {sel_win}" if sel_win else ""
-    return f"""<!doctype html><html><head><meta charset="utf-8">
-<title>simbench{title}</title>
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<style>{CSS}{winrate.CSS}</style></head><body>
-<header>
-  <h1>sim<span>bench</span></h1>
-  <div class="sub">block-builder slot explorer</div>
-  <form class="jump" method="get" action="/">
-    <input name="slot" inputmode="numeric" pattern="[0-9]*" placeholder="go to slot"
-           aria-label="go to slot" />
-  </form>
-  {deploy_selector("/", {})}
-  <a class="navlink" href="{purl("/analysis")}">range analysis</a>
-  <a class="navlink" href="{purl("/reference")}">metrics reference &mdash; what is bad?</a>
-  <a class="navlink" href="{purl("/rewards")}">reward distribution by scheduler</a>
-</header>
-<details class="perfbox" id="perfbox"><summary>performance stats<span>extend &amp; commit timings, win rate &mdash; every builder</span></summary><div class="perfbody" data-loaded="0"><div class="none">opening&hellip;</div></div></details>
-<details class="perfbox" id="winratebox" open><summary>win rate &mdash; last {winrate.WINDOW_H}h<span>every builder the relay sees, with tail rounds and contested denominators</span></summary><div class="winratebody" data-loaded="0"><div class="none">loading&hellip;</div></div></details>
-{health_html()}
-{strip}
-<div id="view">{body}</div>
-<script>{TICK_JS.replace("__SERVER_NOW__", f"{dt.datetime.now(dt.UTC).timestamp():.3f}")}</script>
-<script>{NAV_JS}</script>
-<script>{PERF_JS}</script>
-<script>{WINRATE_JS}</script>
-</body></html>"""
+    # The health probe and the two cross-builder boxes used to sit above this
+    # strip. They are not about a slot, so they moved to the health page; what
+    # is left here is the slot explorer and nothing else.
+    now_s = f"{dt.datetime.now(dt.UTC).timestamp():.3f}"
+    scripts = (f'<script>{TICK_JS.replace("__SERVER_NOW__", now_s)}</script>'
+               f"<script>{NAV_JS}</script>")
+    aside = (f'<a href="{html.escape(purl(RANGE_PATH))}">range report '
+             "&rarr;</a>")
+    return shell(f'{strip}<div id="view">{body}</div>',
+                 title=title, here="slots",
+                 subtitle="one slot, end to end",
+                 sel_path=SLOTS_PATH, sel_params={}, jump=True,
+                 scripts=scripts, aside=aside)
 
 
 # ============================================================== /analysis
@@ -8638,7 +9055,10 @@ def analysis_page(start, end, threshold, identity):
         options = (f'<option value="{html.escape(picked)}" selected>'
                    f"{html.escape(short_id(picked))}</option>") + options
     form = (
-        '<form class="aform" method="get" action="/analysis">'
+        f'<form class="aform" method="get" action="{RANGE_PATH}">'
+        # method=get rebuilds the query string from the fields alone, so
+        # without this the deployment falls out of the URL on every submit.
+        f'<input type="hidden" name="dep" value="{html.escape(dep()["name"])}">'
         '<label>from<input name="start" value="' + html.escape(start) + '" '
         'placeholder="-24h or 2026-08-21"></label>'
         '<label>to<input name="end" value="' + html.escape(end or "") + '" '
@@ -8678,42 +9098,635 @@ def analysis_page(start, end, threshold, identity):
                 (5, "Reward per miniblock &mdash; our best offer against the "
                     "winning bid",
                  analysis_chart_html(rep["gap"]))))
+    now_s = f"{dt.datetime.now(dt.UTC).timestamp():.3f}"
+    scripts = (f"<script>{ANALYSIS_JS}</script>"
+               f'<script>{TICK_JS.replace("__SERVER_NOW__", now_s)}</script>')
+    return shell(f'{form}<main class="awrap">{body}</main>',
+                 here="slots", leaf="range report",
+                 subtitle="range report, many slots at once",
+                 sel_path=RANGE_PATH,
+                 sel_params={"start": start, "end": end or "",
+                             "threshold": f"{threshold:g}"},
+                 scripts=scripts)
+
+# ================================================== the index and its pages
+#
+# PAGES is the single source of truth for what this dashboard offers. The
+# home index, the breadcrumb and the router all read it, so a page cannot be
+# advertised in the nav and 404, nor answer a route nothing links to.
+#
+# `ready: False` means the route exists and is named but has no query behind
+# it yet. It renders a scaffold that says exactly that. An empty table would
+# have been the lazier option and it lies -- it reads as "no data in this
+# window" when the truth is "nobody has written this page".
+
+SECTIONS = [
+    ("tech", "Tech",
+     "How the builder behaves — what it is connected to, how right it "
+     "is, what it has been running, and what happened in one slot."),
+    ("econ", "Economics",
+     "What the builder is worth — against other clients, against a "
+     "named validator, and in absolute reward terms."),
+]
+
+PAGES = [
+    dict(id="health", section="tech", path=HEALTH_PATH,
+         title="connector & relay health",
+         blurb="Is the builder connected, and is the relay grading it? The "
+               "live probe, extend and commit timings, win rate across every "
+               "builder the relay sees, and per-connector eligibility.",
+         ready=True),
+    dict(id="offertl", section="tech", path="/tech/offer-timelines",
+         title="offer timelines",
+         blurb="Every builder's bidding for a slot, as a race \u2014 time "
+               "down the spine, one column per builder, one bullet per "
+               "offer, against when the relay opened the round.",
+         ready=True),
+    dict(id="accuracy", section="tech", path=ACCURACY_PATH,
+         title="builder accuracy",
+         blurb="How close what we offered is to what actually won — "
+               "orders we never offered, ordering we got wrong, and reward "
+               "left on the table.",
+         ready=True,
+         plan=["Winner refs that appear in no offer of ours for that round, "
+               "split by whether we ever saw the order at all.",
+               "Ordering accuracy: how much of the winner's execution order "
+               "we reproduced, against the prefix-reuse baseline.",
+               "Reward gap per round — winner reward against our best "
+               "offer, and what the gap is made of.",
+               "Per-connector and per-builder breakdown, so a bad connector "
+               "does not read as a bad builder."]),
+    dict(id="deployments", section="tech", path=DEPLOYHIST_PATH,
+         title="builder deployment history",
+         blurb="What has been running where, and since when — builder, "
+               "deploy time, run id, and the branch it was built from. Read "
+               "from deployments.json, which is maintained by hand.",
+         ready=True,
+         plan=["A timeline per instance: run_id, first and last event, and "
+               "the gaps between runs.",
+               "Build/version per run, so a change in behaviour can be tied "
+               "to a deploy rather than guessed at.",
+               "Before/after on the headline metrics across a cutover.",
+               "The instances that exist in ClickHouse but in no config — "
+               "today that is FRA_1 and the city-client hosts."]),
+    dict(id="slots", section="tech", path=SLOTS_PATH,
+         title="per slot analysis",
+         blurb="One slot, end to end: every auction round, what we offered "
+               "against what won, the simulator's DAG, the shred path, and "
+               "the logs. Plus the range report over a window of slots.",
+         ready=True),
+
+    dict(id="valcomp", section="econ", path=VALCOMP_PATH,
+         title="specific val comparison",
+         blurb="One of our validators against the comparable ones on other "
+               "Agave block-building clients, matched on stake. Firedancer-"
+               "run clients are never offered.",
+         ready=True,
+         plan=["Pick a validator by identity or vote account.",
+               "Its own per-epoch reward history, split by stream.",
+               "The counterfactual on the other clients at the same stake "
+               "and the same epochs.",
+               "Commission handled explicitly — Stakewiz reports bps, "
+               "the FD report and Trillium report percent."]),
+    dict(id="rewards", section="econ", path=REWARDS_PATH,
+         title="gbx reward numbers",
+         blurb="The reward distribution by scheduler: where the lamports "
+               "actually sit across the last 30 days, with the compute-unit "
+               "field and the per-day scalars.",
+         ready=True),
+]
+
+PAGE_BY_ID = {p["id"]: p for p in PAGES}
+SECTION_LABEL = {sid: label for sid, label, _ in SECTIONS}
+
+
+def crumb_html(here, leaf="", aside=""):
+    """all metrics > Section > page [> leaf], plus an optional side link.
+
+    `leaf` is for a sub-view that lives under a page rather than beside it --
+    the range report under per-slot analysis. It demotes the page title to a
+    link so the hierarchy stays walkable. `aside` is a sibling link and is
+    deliberately NOT part of the trail; putting it in the trail is what made
+    the range report read as its own grandchild."""
+    p = PAGE_BY_ID.get(here) if here else None
+    if not p:
+        return ""
+    sep = "<span>&rsaquo;</span>"
+    title = html.escape(p["title"])
+    if leaf:
+        title = f'<a href="{html.escape(nav_href(p["path"]))}">{title}</a>'
+        tail = f"{sep}<b>{html.escape(leaf)}</b>"
+    else:
+        title = f"<b>{title}</b>"
+        tail = ""
+    return (f'<nav class="crumb"><a href="{html.escape(nav_href(HOME_PATH))}">'
+            f"all metrics</a>{sep}"
+            f'<span class="sect">{html.escape(SECTION_LABEL[p["section"]])}</span>'
+            f"{sep}{title}{tail}"
+            + (f'<span class="caside">{aside}</span>' if aside else "")
+            + "</nav>")
+
+
+def shell(body, *, title="", subtitle="", here=None, sel_path=None,
+          sel_params=None, jump=False, scripts="", leaf="", aside="",
+          extra_css=""):
+    """The chrome every page shares.
+
+    Pulled out of page() during the split. It used to be inlined there, which
+    is why the other three pages each grew their own slightly different
+    header and their own slightly different set of nav links."""
+    p = PAGE_BY_ID.get(here) if here else None
+    doc_title = ("simbench" + (f" · {p['title']}" if p else "")
+                 + (f" · {leaf}" if leaf else "") + title)
+    crumb = crumb_html(here, leaf, aside)
+    jump_form = ""
+    if jump:
+        jump_form = (f'<form class="jump" method="get" action="{SLOTS_PATH}">'
+                     '<input name="slot" inputmode="numeric" pattern="[0-9]*" '
+                     'placeholder="go to slot" aria-label="go to slot" />'
+                     f'<input type="hidden" name="dep" value="{html.escape(dep()["name"])}" />'
+                     "</form>")
+    sel = ""
+    if sel_path:
+        sel = deploy_selector(sel_path, sel_params or {})
     return f"""<!doctype html><html><head><meta charset="utf-8">
-<title>simbench &middot; analysis</title>
+<title>{html.escape(doc_title)}</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<style>{CSS}</style></head><body>
+<style>{CSS}{winrate.CSS}{extra_css}</style></head><body>
 <header>
-  <h1>sim<span>bench</span></h1>
-  <div class="sub">range analysis</div>
-  {deploy_selector("/analysis", {"start": start, "end": end or "",
-                                 "threshold": f"{threshold:g}"})}
-  <a class="navlink" href="{purl("/")}">back to the slot explorer</a>
-  <a class="navlink" href="{purl("/reference")}">metrics reference</a>
+  <h1><a href="{html.escape(nav_href(HOME_PATH))}">sim<span>bench</span></a></h1>
+  <div class="sub">{subtitle}</div>
+  {jump_form}
+  {sel}
 </header>
-<details class="perfbox" id="perfbox"><summary>performance stats<span>extend &amp; commit timings, win rate &mdash; every builder</span></summary><div class="perfbody" data-loaded="0"><div class="none">opening&hellip;</div></div></details>
-{form}
-<main class="awrap">{body}</main>
-<script>{ANALYSIS_JS}</script>
-<script>{PERF_JS}</script>
-<script>{TICK_JS.replace("__SERVER_NOW__", f"{dt.datetime.now(dt.UTC).timestamp():.3f}")}</script>
+{crumb}
+{body}
+{scripts}
+<script>{COPY_JS}</script>
 </body></html>"""
+
+
+def nav_href(path):
+    """A link to a page, carrying ?dep= only if that page is keyed by it.
+
+    Without this the index hung a stale ?dep= on the health page, which is
+    keyed by instance_id and simply ignores it -- a parameter in the address
+    bar that nothing on screen reflects is the exact confusion the explicit
+    ?dep= work existed to remove."""
+    return path if path in DEP_FREE_PATHS else purl(path)
+
+
+def home_page():
+    """The index. Every metric the dashboard can show, in two sections."""
+    secs = []
+    for sid, label, lede in SECTIONS:
+        cards = []
+        for p in PAGES:
+            if p["section"] != sid:
+                continue
+            tag = ("" if p["ready"]
+                   else '<span class="soon">not built yet</span>')
+            # Title only. The blurbs are kept in PAGES -- they are the
+            # written record of what each page is for -- but the index
+            # reads better as a list of names than as seven paragraphs.
+            cards.append(
+                f'<a class="card{"" if p["ready"] else " pending"}" '
+                f'href="{html.escape(nav_href(p["path"]))}" '
+                f'title="{html.escape(p["blurb"])}">'
+                f'<div class="cardh">{html.escape(p["title"])}{tag}</div>'
+                "</a>")
+        secs.append(f'<section class="idxsec"><h2>{html.escape(label)}</h2>'
+                    f'<p class="idxlede">{html.escape(lede)}</p>'
+                    f'<div class="idxgrid">{"".join(cards)}</div></section>')
+    util = ('<div class="idxutil"><span>reference</span>'
+            f'<a href="{html.escape(purl(REF_PATH))}">metrics reference '
+            "&mdash; what counts as bad?</a></div>")
+    return shell(f'<div class="idx">{"".join(secs)}{util}</div>',
+                 subtitle="block-builder metrics",
+                 sel_path=HOME_PATH, sel_params={})
+
+
+def scaffold_html(p):
+    """What an unbuilt page says. Deliberately not an empty table."""
+    plan = "".join(f"<li>{html.escape(x)}</li>" for x in p.get("plan", []))
+    body = ('<div class="scaffold"><div class="scafh">not built yet</div>'
+            "<p>This page is routed and named, but nothing queries for it "
+            "yet. It is listed on the index so the shape of the dashboard is "
+            "visible before every page behind it is.</p>")
+    if plan:
+        body += ('<div class="scafp">What belongs here</div>'
+                 f'<ul class="scaflist">{plan}</ul>')
+    return body + "</div>"
+
+
+def otel_or_explain(sql):
+    """otel, with its one expected failure said in English.
+
+    Both documented logins for 100.94.215.48:8124 -- `readonly_user` and
+    `relay_analyst` -- stopped authenticating on 2026-10-17, so every
+    otel-backed card fails identically. Left raw, that is a ClickHouse
+    stack dump repeated once per builder; the panic cards are caught
+    already, they just had nothing useful to print.
+
+    The relay panel used to need this too and no longer does -- it reads
+    mini_block_events_v2 now. Panic history has no second source: the
+    panic text only ever existed in otel_logs, and CLAUDE.md notes the
+    panic outruns the event sink, so bifrost_events never sees it.
+    """
+    try:
+        return otel_main(sql)
+    except Exception as exc:
+        if "Authentication failed" in str(exc) or "AUTHENTICATION" in str(exc):
+            raise RuntimeError(
+                "otel is unreachable - both logins for the ClickStack host "
+                "were retired on 2026-10-17, and panic text exists nowhere "
+                "else. Needs a new credential.") from None
+        raise
+
+
+def health_page():
+    """Connector & relay health.
+
+    The one page that is NOT about a deployment. It is keyed by instance_id
+    straight from ClickHouse, so every builder writing rows is reachable --
+    including the ones no .env knows about. health.py holds the queries, the
+    thresholds and the two instance maps.
+    """
+    # The *_main helpers deliberately, so no cookie can move this page's
+    # data to another store behind the user's back.
+    # relay(), not gattaca: the gattaca_relay.q proxy died with the
+    # relay_analyst credential (rotated 2026-10-17). The Grafana datasource
+    # reads mini_block_events_v2 directly and is the only live path to the
+    # relay's own store.
+    body = health.body(clickhouse_main, influx_series, otel_or_explain, relay,
+                       SOLANA_RPC, HEALTH_PATH)
+    return shell(body, here="health",
+                 subtitle="connector &amp; relay health",
+                 extra_css=health.CSS)
+
+
+ACCURACY_PATH_SLOT = ACCURACY_PATH + "/slot"
+ACCURACY_EXPORT = ACCURACY_PATH + "/export.csv"
+OFFERTL_PATH = "/tech/offer-timelines"
+OFFERTL_PATH_SLOT = OFFERTL_PATH + "/slot"
+# Our own builders, for highlighting a win in a table full of Titan's.
+OURS_RE = re.compile(r"^ASTRALANE", re.I)
+
+
+def accuracy_page(qs):
+    """Builder accuracy: who won each round, and did its contents land."""
+    r = accuracy.parse_range(qs)
+    # Same validator filter as the offer timelines: the region's connectors
+    # over this window, named where the Firedancer report knows them.
+    conns = []
+    if not r["err"]:
+        try:
+            conns = accuracy.connectors_in(relay, r, region=r["region"])
+        except Exception:
+            conns = []
+    names = _validator_names()
+    if r["connector"]:
+        r["connector_label"] = names.get(r["connector"]) or ""
+    body = accuracy.form_html(r, ACCURACY_PATH, region=True,
+                              connectors=[(c, names.get(c) or "", n)
+                                          for c, n in conns])
+    if r["err"]:
+        body += accuracy.table_html(r, [], 0, 0, OURS_RE)
+    else:
+        try:
+            rows, shown, total = accuracy.rounds(relay, r,
+                                                 region=r["region"],
+                                                 connector=r["connector"])
+            body += accuracy.stale_banner(accuracy.relay_tx_lag(relay))
+            body += accuracy.table_html(r, rows, shown, total, OURS_RE)
+        except Exception as exc:
+            body += ('<div class="herr" style="margin:20px 28px">the relay '
+                     f"could not be read: {html.escape(str(exc)[:300])}</div>")
+    return shell(body, here="accuracy", subtitle="builder accuracy",
+                 extra_css=accuracy.CSS,
+                 # OFFERS_JS defines window.__renderOffers; the fragment
+                 # handler re-invokes it after each expansion
+                 scripts=(f"<script>{accuracy.ACCURACY_JS}</script>"
+                          f"<script>{OFFERS_JS}</script>"))
+
+
+def accuracy_slot_html(qs):
+    """The expansion for one slot: the winners' contents against the block."""
+    try:
+        slot = int((qs.get("slot", [""])[0] or "0").strip())
+    except ValueError:
+        slot = 0
+    if slot <= 0:
+        return '<div class="dmeta">not a slot</div>'
+    r = accuracy.parse_range({"mode": ["slot"], "slot": [str(slot)]})
+    rows, _, _ = accuracy.rounds(
+        relay, r, region=(qs.get("region", [""])[0] or "all").strip())
+    if not rows:
+        return ('<div class="dmeta">the relay recorded no chosen round for '
+                "this slot</div>")
+    # Only build what the metric selector asked for. The landing half costs
+    # a block fetch plus two annotation lookups, the diff half costs two
+    # more relay reads -- doing both when one is on screen is pure waste.
+    metric = (qs.get("metric", [""])[0] or accuracy.LANDING).strip()
+    if metric not in accuracy.METRICS:
+        metric = accuracy.LANDING
+    body, sigs, rew = "", None, None
+    if metric in (accuracy.SELECTION, accuracy.BOTH):
+        # one fetch, not two: transactionDetails=accounts carries the
+        # signatures as well, so it answers "did it land" and "what did it
+        # pay" together
+        try:
+            rew = accuracy.block_rewards(SOLANA_RPC, slot)
+            sigs = set(rew) or None
+        except Exception:
+            rew = None
+    if metric in (accuracy.LANDING, accuracy.BOTH):
+        d = accuracy.slot_detail(relay, clickhouse_main, SOLANA_RPC, slot,
+                                 rows, sigs)
+        sigs = d.get("block_sigs")
+        body += accuracy.detail_html(d)
+    if metric in (accuracy.SELECTION, accuracy.BOTH):
+        try:
+            sel = accuracy.slot_selection(relay, clickhouse_main,
+                                          SOLANA_RPC, slot, rows, sigs, rew)
+            # Orders the block could not price (they did not land) get
+            # their fee and tip from the relay packet log's bytes. Optional:
+            # without RELAYER_URL, or a packet it never saw, the cell stays
+            # blank exactly as before.
+            try:
+                accuracy.price_from_packets(relayer, sel,
+                                            accuracy._chunk_window(rows))
+            except Exception:
+                pass
+            body += accuracy.selection_html(sel, slot)
+        except Exception as exc:
+            body += ('<div class="dmeta aqcap">the selection diff could not '
+                     f"be built: {html.escape(str(exc)[:200])}</div>")
+    return body
+
+
+def _validator_names():
+    """leader identity -> name, from valcomp's cached Firedancer report."""
+    try:
+        return {v.get("leader"): v.get("name") or ""
+                for v in valcomp.fd_report().get("validators") or []}
+    except Exception:
+        return {}
+
+
+def offer_timeline_page(qs):
+    """Every builder's bidding, slot by slot. Its own page rather than a
+    mode of builder accuracy: it asks a different question (who OFFERED,
+    not who won) off a different key, and it is the only view here that
+    is about the auction rather than the block."""
+    r = accuracy.parse_range(qs)
+    # The validator filter lists the connectors the region's relays opened
+    # rounds for in this window, named from the Firedancer report where it
+    # knows them. Both lookups are best-effort: without them the page is
+    # the same page with an emptier dropdown.
+    conns = []
+    if not r["err"]:
+        try:
+            conns = accuracy.connectors_in(relay, r, region=r["region"])
+        except Exception:
+            conns = []
+    names = _validator_names()
+    opts = [(c, names.get(c) or "", n) for c, n in conns]
+    if r["connector"]:
+        r["connector_label"] = names.get(r["connector"]) or ""
+    body = accuracy.form_html(r, OFFERTL_PATH, metric=False, region=True,
+                              connectors=opts)
+    if r["err"]:
+        body += accuracy.timeline_table_html(r, [], 0, 0, OURS_RE)
+    else:
+        try:
+            slots, shown, total = accuracy.timeline_slots(
+                relay, r, region=r["region"], connector=r["connector"])
+            body += accuracy.timeline_table_html(r, slots, shown, total,
+                                                 OURS_RE)
+        except Exception as exc:
+            body += ('<div class="herr" style="margin:20px 28px">the relay '
+                     f"could not be read: {html.escape(str(exc)[:300])}</div>")
+    return shell(body, here="offertl", subtitle="offer timelines",
+                 extra_css=accuracy.CSS,
+                 scripts=(f"<script>{accuracy.ACCURACY_JS}</script>"
+                          f"<script>{OFFERS_JS}</script>"))
+
+
+def offer_timeline_slot_html(qs):
+    try:
+        slot = int((qs.get("slot", [""])[0] or "0").strip())
+    except ValueError:
+        slot = 0
+    if slot <= 0:
+        return '<div class="dmeta">not a slot</div>'
+    reg = (qs.get("region", [""])[0] or "all").strip()
+    return accuracy.timeline_html(
+        accuracy.slot_timeline(relay, slot,
+                               accuracy.slot_window(relay, slot), region=reg))
+
+
+def accuracy_export_start(qs):
+    """Kick off a whole-range scan for unlanded winner orders.
+
+    `relay` all the way down. That used to be a quota argument; it is now
+    the only option -- gattaca_relay.q went with the relay_analyst
+    credential on 2026-10-17 and nothing else reaches the relay's store.
+    """
+    r = accuracy.parse_range(qs)
+    if r["err"]:
+        return {"error": r["err"]}
+    kind = (qs.get("kind", ["misses"])[0] or "misses").strip()
+    if kind not in accuracy.SCANS:
+        return {"error": f"unknown export kind {kind!r}"}
+    return {"job": accuracy.start_export(relay, clickhouse_main, SOLANA_RPC,
+                                         r, kind),
+            "kind": kind, "label": r["label"]}
+
+
+def accuracy_export_status(qs):
+    return accuracy.export_status((qs.get("job", [""])[0] or "").strip())
+
+
+DEPLOY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "deployments.csv")
+DEPLOY_COLS = ["builder_id", "deployed_at", "branch", "description"]
+# The API writes every column except this one: a deployer knows what it
+# shipped, not why. Descriptions stay a human edit to the file.
+DEPLOY_API_COLS = ["builder_id", "deployed_at", "branch"]
+DEPLOY_PUBLIC_URL = os.environ.get(
+    "DEPLOY_PUBLIC_URL", "http://astralane-box:8899").rstrip("/")
+DEPLOY_REPO = os.environ.get("DEPLOY_REPO",
+                             "https://github.com/Astralane/block-builder")
+# Set this and the endpoint requires it as X-Deploy-Token. Left unset the
+# endpoint is open to anything that can reach the port, which the page says
+# out loud rather than leaving to be discovered.
+DEPLOY_API_TOKEN = os.environ.get("DEPLOY_API_TOKEN", "")
+_deploy_lock = threading.Lock()
+
+
+def deployment_rows():
+    """Every deployment, newest first. Re-read on each request.
+
+    Deliberately not cached: CI appends to this file between requests, and
+    a deploy log you have to restart a server to see is one nobody trusts."""
+    with open(DEPLOY_FILE, newline="", encoding="utf-8") as fh:
+        rows = [dict(r) for r in csv.DictReader(fh)]
+    rows = [r for r in rows if (r.get("builder_id") or "").strip()]
+    rows.sort(key=lambda r: str(r.get("deployed_at") or ""), reverse=True)
+    return rows
+
+
+def deployment_append(rec):
+    """Append one deployment. Returns the row as written.
+
+    Under a lock and opened in append mode, because two pipelines finishing
+    together is the normal case, not the edge one."""
+    row = {k: str(rec.get(k, "") or "").replace("\r", " ").replace("\n", " ")
+           for k in DEPLOY_COLS}
+    with _deploy_lock:
+        fresh = not os.path.exists(DEPLOY_FILE) or os.path.getsize(DEPLOY_FILE) == 0
+        with open(DEPLOY_FILE, "a", newline="", encoding="utf-8") as fh:
+            w = csv.DictWriter(fh, fieldnames=DEPLOY_COLS)
+            if fresh:
+                w.writeheader()
+            w.writerow(row)
+    return row
+
+
+def branch_link(branch):
+    if not branch:
+        return "&mdash;"
+    url = f"{DEPLOY_REPO.rstrip('/')}/tree/{urllib.parse.quote(branch)}"
+    return (f'<a href="{html.escape(url)}" target="_blank" rel="noopener">'
+            f"{html.escape(branch)}</a>")
+
+
+def _deploy_row(r, first=False):
+    desc = r.get("description") or ""
+    return (f'<tr{" class=now" if first else ""}>'
+            f'<td class="m">{html.escape(str(r.get("deployed_at") or "")) or "&mdash;"}</td>'
+            f'<td class="m">{branch_link(r.get("branch", ""))}</td>'
+            f'<td class="dnote">{html.escape(desc) if desc else chr(38) + "mdash;"}</td>'
+            "</tr>")
+
+
+def deployments_page():
+    """Builder deployment history, one expandable block per builder.
+
+    Collapsed it answers "what is running"; opened it answers "and what was
+    running before that". Nothing in any store records the branch a builder
+    was built from, so unlike every other page here this one is a written
+    record rather than a derived one -- CI appends to it, humans annotate."""
+    try:
+        rows = deployment_rows()
+    except FileNotFoundError:
+        return shell(
+            '<div class="scaffold"><div class="scafh">no data</div>'
+            f"<p>Expected {html.escape(os.path.basename(DEPLOY_FILE))} beside "
+            "app.py. It is created on the first POST to "
+            "<code>/api/deployment</code>.</p></div>",
+            here="deployments", subtitle="builder deployment history",
+            extra_css=health.CSS)
+    except (csv.Error, UnicodeDecodeError) as exc:
+        return shell(
+            '<div class="scaffold"><div class="scafh">csv will not parse'
+            f"</div><p>{html.escape(str(exc)[:200])}</p></div>",
+            here="deployments", subtitle="builder deployment history",
+            extra_css=health.CSS)
+
+    by_builder = {}
+    for r in rows:
+        by_builder.setdefault(r["builder_id"], []).append(r)
+
+    banner = ""
+    blocks = []
+    for bid in sorted(by_builder):
+        hist = by_builder[bid]
+        cur, past = hist[0], hist[1:]
+        inner = ('<table class="rtab dtab"><tr><th>deployed at (UTC)</th>'
+                 "<th>branch</th><th>what shipped</th></tr>" + _deploy_row(cur, first=True)
+                 + "".join(_deploy_row(r) for r in past) + "</table>")
+        blocks.append(
+            '<details class="dbuild"><summary>'
+            f'<b>{html.escape(bid)}</b>'
+            f'<span class="dsum">{html.escape(str(cur.get("deployed_at") or ""))}'
+            f" &middot; {branch_link(cur.get('branch', ''))}</span>"
+            f'<span class="dcount">{len(hist)} deployment'
+            f'{"" if len(hist) == 1 else "s"}</span>'
+            f"</summary>{inner}</details>")
+    api = (
+        '<details class="dapi"><summary>POST a deployment from CI</summary>'
+        '<div class="dapib"><p>Append a row from a pipeline. Takes every '
+        "field except the description, which stays a human edit.</p>"
+        f"<pre>curl -X POST {html.escape(DEPLOY_PUBLIC_URL)}/api/deployment \\\n"
+        "  -H 'Content-Type: application/json' \\\n"
+        # Double quotes on these two lines, not single: the shell has to
+        # expand $DEPLOY_API_TOKEN and $GITHUB_REF_NAME. Single-quoted, the
+        # token goes over as the literal string and the call 401s.
+        + ('  -H "X-Deploy-Token: $DEPLOY_API_TOKEN" \\\n'
+           if DEPLOY_API_TOKEN else "")
+        + '  -d "{\\"builder_id\\":\\"ASTRALANE_AMS_2\\",'
+          '\\"branch\\":\\"$GITHUB_REF_NAME\\"}"</pre>'
+        "<p><code>deployed_at</code> is optional and defaults to now, UTC. "
+        "Form-encoded bodies work too.</p>"
+        + ("" if DEPLOY_API_TOKEN else
+           '<p class="dwarn"><b>This endpoint is currently unauthenticated.</b>'
+           " Set <code>DEPLOY_API_TOKEN</code> in the environment and it will "
+           "be required as <code>X-Deploy-Token</code>. Until then anything "
+           "that can reach this port can append rows.</p>")
+        + "</div></details>")
+    return shell(banner + api + "".join(blocks), here="deployments",
+                 subtitle="builder deployment history",
+                 extra_css=health.CSS)
+
+
+def snapshots_page(q):
+    """Frozen comparisons: the index, or one of them."""
+    sid = (q.get("id", [""])[0] or "").strip()
+    body = valcomp.snapshots_body(sid, SNAPSHOT_PATH)
+    scripts = f"<script>{COPY_JS}</script>"
+    return shell(body, here="valcomp", leaf="snapshots",
+                 subtitle="frozen comparisons",
+                 extra_css=health.CSS + valcomp.CSS, scripts=scripts)
+
+
+def valcomp_page():
+    """Specific validator comparison.
+
+    Keyed by nothing in the URL: both inputs are page state, and the whole
+    comparison set ships with the page so changing either is instant."""
+    aside = (f'<a href="{html.escape(nav_href(SNAPSHOT_PATH))}">'
+             "snapshots &rarr;</a>")
+    return shell(valcomp.body(clickhouse_main), here="valcomp",
+                 subtitle="specific validator comparison",
+                 aside=aside, extra_css=health.CSS + valcomp.CSS)
+
+
+def scaffold_page(page_id):
+    p = PAGE_BY_ID[page_id]
+    return shell(scaffold_html(p), here=page_id,
+                 subtitle=html.escape(p["title"]),
+                 sel_path=p["path"], sel_params={})
+
 
 class Handler(BaseHTTPRequestHandler):
 
     def _remember_deployment(self):
         if getattr(self, "_set_cookie", None) is None:
             return
-        self.send_header("Set-Cookie",
-                         f"dep={self._set_cookie}; Path=/; Max-Age=31536000; "
-                         "SameSite=Lax")
+        self.send_header(
+            "Set-Cookie",
+            f"instance={urllib.parse.quote(self._set_cookie)}; Path=/; "
+            "Max-Age=31536000; SameSite=Lax")
 
     def _cookie_dep(self):
         cookie = ""
         for part in (self.headers.get("Cookie", "") or "").split(";"):
             k, _, v = part.strip().partition("=")
-            if k == "dep":
-                cookie = v
-        return cookie if cookie in DEPLOY_BY_NAME else ""
+            if k == "instance":
+                cookie = urllib.parse.unquote(v)
+        return cookie if known_instance(cookie) else ""
 
     def _pick_deployment(self, parsed):
         """Resolve the deployment from `dep=`, which every link now carries.
@@ -8723,8 +9736,8 @@ class Handler(BaseHTTPRequestHandler):
         it to an explicit one first -- so by the time this returns, what is on
         screen and what is in the address bar agree."""
         qs = urllib.parse.parse_qs(parsed.query)
-        asked = (qs.get("dep", [""])[0] or "").strip()
-        if asked and asked in DEPLOY_BY_NAME:
+        asked = (qs.get("instance", [""])[0] or "").strip()
+        if asked and known_instance(asked):
             set_dep(asked)
             return True
         set_dep(self._cookie_dep())
@@ -8733,20 +9746,23 @@ class Handler(BaseHTTPRequestHandler):
     def _redirect_dep(self, parsed):
         """Send a URL that names no builder to one that does.
 
-        The deployment used to live in a year-long cookie, invisible in the
+        The builder used to live in a year-long cookie, invisible in the
         URL, so a page could answer as the mock under any heading. Rather than
         guess quietly, redirect: the last explicit choice if there is one,
-        else DEFAULT_DEP. Everything downstream then sees a URL that states
+        else DEFAULT_INSTANCE. Everything downstream then sees a URL that states
         which builder it is about, and so does the user."""
         qs = urllib.parse.parse_qs(parsed.query)
-        asked = (qs.get("dep", [""])[0] or "").strip()
-        if asked in DEPLOY_BY_NAME:
+        asked = (qs.get("instance", [""])[0] or "").strip()
+        if known_instance(asked):
             return False
-        name = self._cookie_dep() or DEFAULT_DEP
-        if name not in DEPLOY_BY_NAME:
-            name = DEPLOYMENTS[0]["name"]
+        name = self._cookie_dep() or DEFAULT_INSTANCE
+        if not known_instance(name):
+            reg = instance_registry()
+            name = next(iter(reg)) if reg else ""
+        qs.pop("instance", None)
         qs.pop("dep", None)
-        pairs = [("dep", name)] + [(k, v) for k, vs in qs.items() for v in vs]
+        pairs = [("instance", name)] + [(k, v) for k, vs in qs.items()
+                                        for v in vs]
         target = parsed.path + "?" + urllib.parse.urlencode(pairs)
         self.send_response(302)
         self.send_header("Location", target)
@@ -8755,135 +9771,376 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         return True
 
-    def do_GET(self):
-        parsed = urllib.parse.urlparse(self.path)
-        if self._redirect_dep(parsed):
-            return
-        remember = self._pick_deployment(parsed)
-        self._set_cookie = dep()["name"] if remember else None
-        if parsed.path == "/analysis/orders":
-            qs = urllib.parse.parse_qs(parsed.query)
-            one = lambda k, d: (qs.get(k, [d])[0] or d)
-            try:
-                out = analysis_orders_html(
-                    one("start", "-24h"), one("end", ""),
-                    float(one("threshold", "5")), one("identity", ""),
-                    int(one("slot", "0")), int(one("round", "0")))
-            except Exception as exc:
-                out = f'<span class="dim">{html.escape(str(exc)[:160])}</span>'
-            body = out.encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self._remember_deployment()
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-            return
-        if parsed.path == "/analysis":
-            qs = urllib.parse.parse_qs(parsed.query)
-            one = lambda k, d: (qs.get(k, [d])[0] or d)
-            try:
-                thr = float(one("threshold", "5"))
-            except ValueError:
-                thr = 5.0
-            try:
-                body = analysis_page(one("start", "-24h"), one("end", ""),
-                                     thr, one("identity", "")).encode()
-            except Exception as exc:
-                body = f"<pre>{html.escape(str(exc))}</pre>".encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self._remember_deployment()
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-            return
-        if parsed.path == "/rewards":
-            try:
-                qs2 = urllib.parse.parse_qs(parsed.query)
-                one = lambda k: (qs2.get(k, [""])[0] or None)
-                body = rewards.rewards_page(
-                    CSS, purl, one("from"), one("to"),
-                    {k: one(k) for k in
-                     ("cu", "render", "hscale", "cam", "insp")}).encode()
-            except Exception as exc:
-                body = f"<pre>{html.escape(str(exc))}</pre>".encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self._remember_deployment()
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-            return
-        if parsed.path == "/winrate":
-            try:
-                out = winrate_html()
-            except Exception as exc:
-                out = ('<div class="err">win rates unavailable: '
-                       f"{html.escape(str(exc))[:200]}</div>")
-            body = out.encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self._remember_deployment()
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-            return
-        if parsed.path == "/perf":
-            try:
-                out = perf_stats_html()
-            except Exception as exc:
-                out = ('<div class="err">performance stats unavailable: '
-                       f"{html.escape(str(exc))[:200]}</div>")
-            body = out.encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self._remember_deployment()
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-            return
-        if parsed.path == "/reference":
-            try:
-                body = reference_page().encode()
-            except Exception as exc:
-                body = f"<pre>{html.escape(str(exc))}</pre>".encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self._remember_deployment()
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-            return
-        if parsed.path not in ("/", "/index.html"):
-            self.send_error(404)
-            return
-        qs = urllib.parse.parse_qs(parsed.query)
-        def as_int(name):
-            try:
-                return int(qs.get(name, [""])[0])
-            except ValueError:
-                return None
-        try:
-            tab = qs.get("tab", ["rounds"])[0]
-            src = qs.get("src", ["ours"])[0]
-            body = page(as_int("win"), as_int("slot"), as_int("round"),
-                        tab if tab in ("compare", "timeline", "offers", "dag",
-                                       "missing", "logs") else "rounds",
-                        src if src in ("ours", "winner") else "ours",
-                        partial=qs.get("partial", ["0"])[0] == "1",
-                        grade=("graded" if qs.get("grade", [""])[0] == "graded"
-                               else "all"),
-                        tl=("sum" if qs.get("tl", [""])[0] == "sum"
-                            else "full")).encode()
-        except Exception as exc:
-            body = f"<pre>{html.escape(str(exc))}</pre>".encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
+    def _send(self, body, code=200, ctype="text/html; charset=utf-8"):
+        if isinstance(body, str):
+            body = body.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
         self._remember_deployment()
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _redirect(self, target):
+        self.send_response(302)
+        self.send_header("Location", target)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _redirect_legacy(self, parsed):
+        """Old flat URLs still resolve, with their query intact.
+
+        /analysis and /rewards were linked from elsewhere for months. They
+        now live under a section, so rather than 404 an existing bookmark,
+        send it on."""
+        target = LEGACY_PATHS.get(parsed.path)
+        if not target:
+            return False
+        self._redirect(target + ("?" + parsed.query if parsed.query else ""))
+        return True
+
+    # -------------------------------------------------------------- pages
+    #
+    # One entry per route. Each returns a string, and the plumbing around
+    # them -- deployment, cookie, encoding, error box -- is identical, so it
+    # lives once in do_GET rather than once per branch as it used to.
+
+    def _page_home(self, q):
+        return home_page()
+
+    def _page_health(self, q):
+        # Takes no query parameter: which builder is on screen is page
+        # state, not an address.
+        return health_page()
+
+    def _page_accuracy(self, q):
+        return accuracy_page(q)
+
+    def _frag_accuracy_slot(self, q):
+        try:
+            return accuracy_slot_html(q)
+        except Exception as exc:
+            return ('<div class="dmeta">could not load: '
+                    f"{html.escape(str(exc)[:200])}</div>")
+
+    def _page_deployments(self, q):
+        return deployments_page()
+
+    def _page_valcomp(self, q):
+        return valcomp_page()
+
+    def _page_snapshots(self, q):
+        return snapshots_page(q)
+
+    def _page_reference(self, q):
+        return reference_page()
+
+    def _page_rewards(self, q):
+        one = lambda k: (q.get(k, [""])[0] or None)
+        return rewards.rewards_page(
+            CSS, purl, one("from"), one("to"),
+            {k: one(k) for k in ("cu", "render", "hscale", "cam", "insp")},
+            paths={"home": HOME_PATH, "self": REWARDS_PATH,
+                   "reference": REF_PATH, "crumb": crumb_html("rewards")})
+
+    def _page_range(self, q):
+        one = lambda k, d: (q.get(k, [d])[0] or d)
+        try:
+            thr = float(one("threshold", "5"))
+        except ValueError:
+            thr = 5.0
+        return analysis_page(one("start", "-24h"), one("end", ""), thr,
+                             one("identity", ""))
+
+    def _page_slots(self, q):
+        def as_int(name):
+            try:
+                return int(q.get(name, [""])[0])
+            except ValueError:
+                return None
+        tab = q.get("tab", ["rounds"])[0]
+        src = q.get("src", ["ours"])[0]
+        return page(as_int("win"), as_int("slot"), as_int("round"),
+                    tab if tab in ("compare", "timeline", "offers", "dag",
+                                   "missing", "logs") else "rounds",
+                    src if src in ("ours", "winner") else "ours",
+                    partial=q.get("partial", ["0"])[0] == "1",
+                    grade=("graded" if q.get("grade", [""])[0] == "graded"
+                           else "all"),
+                    tl=("sum" if q.get("tl", [""])[0] == "sum" else "full"))
+
+    # ---------------------------------------------------------- fragments
+    #
+    # Loaded by fetch() into a page that is already open, so they are bare
+    # HTML with no document around them and carry their own failure text --
+    # a traceback in a <pre> would be injected straight into the host page.
+
+    def _api_valcomp_status(self, q):
+        return valcomp.job_status((q.get("job", [""])[0] or "").strip())
+
+    def _frag_winrate(self, q):
+        try:
+            return winrate_html()
+        except Exception as exc:
+            return ('<div class="err">win rates unavailable: '
+                    f"{html.escape(str(exc))[:200]}</div>")
+
+    def _frag_perf(self, q):
+        try:
+            return perf_stats_html()
+        except Exception as exc:
+            return ('<div class="err">performance stats unavailable: '
+                    f"{html.escape(str(exc))[:200]}</div>")
+
+    def _frag_orders(self, q):
+        one = lambda k, d: (q.get(k, [d])[0] or d)
+        try:
+            return analysis_orders_html(
+                one("start", "-24h"), one("end", ""),
+                float(one("threshold", "5")), one("identity", ""),
+                int(one("slot", "0")), int(one("round", "0")))
+        except Exception as exc:
+            return f'<span class="dim">{html.escape(str(exc)[:160])}</span>'
+
+    def routes(self):
+        return {
+            HOME_PATH: (self._page_home, False),
+            HEALTH_PATH: (self._page_health, False),
+            ACCURACY_PATH: (self._page_accuracy, False),
+            ACCURACY_PATH_SLOT: (self._frag_accuracy_slot, True),
+            OFFERTL_PATH: (self._page_offertl, False),
+            OFFERTL_PATH_SLOT: (self._frag_offertl_slot, True),
+            DEPLOYHIST_PATH: (self._page_deployments, False),
+            SLOTS_PATH: (self._page_slots, False),
+            RANGE_PATH: (self._page_range, False),
+            VALCOMP_PATH: (self._page_valcomp, False),
+            SNAPSHOT_PATH: (self._page_snapshots, False),
+            REWARDS_PATH: (self._page_rewards, False),
+            REF_PATH: (self._page_reference, False),
+            "/winrate": (self._frag_winrate, True),
+            "/perf": (self._frag_perf, True),
+            "/analysis/orders": (self._frag_orders, True),
+            "/api/valcomp/status": (self._api_valcomp_status, "json"),
+            "/api/accuracy/export": (accuracy_export_start, "json"),
+            "/api/accuracy/status": (accuracy_export_status, "json"),
+            ACCURACY_EXPORT: (self._accuracy_export_file, "file"),
+        }
+
+    def _page_offertl(self, q):
+        return offer_timeline_page(q)
+
+    def _frag_offertl_slot(self, q):
+        return offer_timeline_slot_html(q)
+
+    def _accuracy_export_file(self, q):
+        """The finished CSV, by job id. See accuracy.export_file -- the
+        client never names a path."""
+        name, blob = accuracy.export_file((q.get("job", [""])[0] or "").strip())
+        if blob is None:
+            return None, None
+        return name, blob
+
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        if self._redirect_legacy(parsed):
+            return
+        route = self.routes().get(parsed.path)
+        if route is None:
+            self.send_error(404)
+            return
+        handler, mode = route
+        is_fragment = mode is True
+        # The health page is keyed by instance_id, not by deployment, so it
+        # must not be bounced to a ?dep= URL -- that redirect would strip the
+        # ?instance= the picker just set.
+        if parsed.path not in DEP_FREE_PATHS:
+            if self._redirect_dep(parsed):
+                return
+            remember = self._pick_deployment(parsed)
+            self._set_cookie = dkey() if remember else None
+        else:
+            set_dep(self._cookie_dep())
+            self._set_cookie = None
+        q = urllib.parse.parse_qs(parsed.query)
+        try:
+            body = handler(q)
+        except Exception as exc:
+            if mode == "json":
+                self._json({"state": "error", "error": str(exc)[:300]}, 500)
+                return
+            if is_fragment:
+                body = ('<div class="err">'
+                        f"{html.escape(str(exc))[:200]}</div>")
+            else:
+                body = f"<pre>{html.escape(str(exc))}</pre>"
+        if mode == "json":
+            self._json(body)
+            return
+        if mode == "file":
+            name, blob = body
+            if blob is None:
+                self.send_error(404, "no such export")
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/csv; charset=utf-8")
+            self.send_header("Content-Disposition",
+                             f'attachment; filename="{name}"')
+            self.send_header("Content-Length", str(len(blob)))
+            self.end_headers()
+            self.wfile.write(blob)
+            return
+        self._send(body)
+
+    # ------------------------------------------------------------ write
+    #
+    # The only endpoint on this server that changes anything. Append-only:
+    # it can add a deployment, never edit or remove one.
+
+    def _json(self, obj, code=200):
+        body = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _post_valcomp(self, rec):
+        ours = str(rec.get("ours", "") or "").strip()
+        other = str(rec.get("other", "") or "").strip()
+        try:
+            days = int(rec.get("days") or valcomp.DAYS_DEFAULT)
+        except (TypeError, ValueError):
+            days = valcomp.DAYS_DEFAULT
+        days = max(1, min(valcomp.DAYS_MAX, days))
+        if not ours or not other:
+            self._json({"error": "both validators are required"}, 400)
+            return
+        if ours == other:
+            self._json({"error": "pick two different validators"}, 400)
+            return
+        self._json({"job": valcomp.start_job(ours, other, days),
+                    "days": days}, 202)
+
+    def do_POST(self):
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/api/valcomp/snapshot":
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                if n <= 0 or n > 40_000_000:
+                    raise ValueError("body must be 1..40MB")
+                rec = json.loads(self.rfile.read(n).decode() or "{}")
+            except (ValueError, json.JSONDecodeError) as exc:
+                self._json({"error": f"bad body: {str(exc)[:120]}"}, 400)
+                return
+            try:
+                sid = valcomp.snapshot_write(rec if isinstance(rec, dict)
+                                             else {})
+            except (ValueError, OSError) as exc:
+                self._json({"error": str(exc)[:200]}, 400)
+                return
+            self._json({"ok": True, "id": sid}, 201)
+            return
+        if parsed.path == "/api/valcomp/fees":
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                rec = json.loads(self.rfile.read(n).decode() or "{}")
+            except (ValueError, json.JSONDecodeError) as exc:
+                self._json({"error": f"bad body: {str(exc)[:120]}"}, 400)
+                return
+            v = str((rec or {}).get("validator", "") or "").strip()
+            day = str((rec or {}).get("day", "") or "").strip()[:10]
+            if not v or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day):
+                self._json({"error": "validator and day (YYYY-MM-DD) "
+                                     "are required"}, 400)
+                return
+            self._json({"job": valcomp.start_fees_job(v, day)}, 202)
+            return
+        if parsed.path == "/api/valcomp/egress":
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                rec = json.loads(self.rfile.read(n).decode() or "{}")
+            except (ValueError, json.JSONDecodeError) as exc:
+                self._json({"error": f"bad body: {str(exc)[:120]}"}, 400)
+                return
+            v = str((rec or {}).get("validator", "") or "").strip()
+            day = str((rec or {}).get("day", "") or "").strip()[:10]
+            client = str((rec or {}).get("client", "") or "").strip()[:60]
+            if not v or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day):
+                self._json({"error": "validator and day (YYYY-MM-DD) "
+                                     "are required"}, 400)
+                return
+            self._json({"job": valcomp.start_egress_job(clickhouse_quant, v,
+                                                        day, client)}, 202)
+            return
+        if parsed.path == "/api/valcomp/run":
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                rec = json.loads(self.rfile.read(n).decode() or "{}")
+            except (ValueError, json.JSONDecodeError) as exc:
+                self._json({"error": f"bad body: {str(exc)[:120]}"}, 400)
+                return
+            self._post_valcomp(rec if isinstance(rec, dict) else {})
+            return
+        if parsed.path != "/api/deployment":
+            self._json({"error": "no such endpoint"}, 404)
+            return
+        if DEPLOY_API_TOKEN:
+            sent = self.headers.get("X-Deploy-Token", "")
+            # Constant-time: this is a shared secret in a CI variable.
+            if not hmac.compare_digest(sent, DEPLOY_API_TOKEN):
+                self._json({"error": "bad or missing X-Deploy-Token"}, 401)
+                return
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            n = 0
+        if n <= 0 or n > 64_000:
+            self._json({"error": "body must be 1..64000 bytes"}, 400)
+            return
+        raw = self.rfile.read(n).decode("utf-8", "replace")
+        ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip()
+        try:
+            if ctype == "application/json":
+                rec = json.loads(raw)
+                if not isinstance(rec, dict):
+                    raise ValueError("body must be a JSON object")
+            else:
+                rec = {k: v[0] for k, v in
+                       urllib.parse.parse_qs(raw, keep_blank_values=True).items()}
+        except (json.JSONDecodeError, ValueError) as exc:
+            self._json({"error": f"unparseable body: {str(exc)[:120]}"}, 400)
+            return
+        extra = sorted(set(rec) - set(DEPLOY_API_COLS))
+        if extra:
+            # Rejected rather than ignored: a pipeline sending `description`
+            # or a typo'd key should hear about it, not have it swallowed.
+            self._json({"error": "unknown field(s): " + ", ".join(extra),
+                        "accepts": DEPLOY_API_COLS}, 400)
+            return
+        missing = [k for k in ("builder_id", "run_id", "branch")
+                   if not str(rec.get(k, "") or "").strip()]
+        if missing:
+            self._json({"error": "missing: " + ", ".join(missing),
+                        "accepts": DEPLOY_API_COLS}, 400)
+            return
+        when = str(rec.get("deployed_at", "") or "").strip()
+        if when:
+            try:
+                dt.datetime.fromisoformat(when.replace("Z", "+00:00"))
+            except ValueError:
+                self._json({"error": "deployed_at must be ISO 8601, "
+                                     "e.g. 2026-10-13 11:30:00"}, 400)
+                return
+        else:
+            when = dt.datetime.now(dt.UTC).strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            row = deployment_append({**rec, "deployed_at": when,
+                                     "description": ""})
+        except OSError as exc:
+            self._json({"error": f"could not write: {str(exc)[:120]}"}, 500)
+            return
+        self._json({"ok": True, "written": row}, 201)
 
     def log_message(self, *_):
         pass
