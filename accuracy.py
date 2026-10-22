@@ -1390,14 +1390,30 @@ def _connector_sql(connector):
 CONNECTOR_LIST_DAYS = 7
 
 
-def connectors_in(relay_q, r, region="all"):
+# Our builders by region, for the connectors only our own store knows.
+OUR_BUILDER_REGION = {"ams": "ASTRALANE_AMS%", "fra": "ASTRALANE_FRA%",
+                      "tyo": "ASTRALANE_JP%"}
+
+
+def _our_region_sql(region):
+    pat = OUR_BUILDER_REGION.get(region)
+    return f" AND local_builder_id LIKE '{pat}'" if pat else ""
+
+
+def connectors_in(relay_q, r, region="all", ch=None):
     """The validators the region's relays opened rounds for in the last
-    CONNECTOR_LIST_DAYS, busiest first -> [(identity, slots)].
+    CONNECTOR_LIST_DAYS, busiest first -> [(identity, slots, source)].
 
     Deliberately NOT the window being viewed: a validator that happened to
     lead nothing in the last hour would vanish from the list, and the list
     is for picking a validator, not for describing the window. From
-    round_opened, so a validator nobody bid on still appears."""
+    round_opened, so a validator nobody bid on still appears.
+
+    Gattaca's store only knows Gattaca's relays. A validator served through
+    a relay of our own (DaRKu4…, 2026-10-21) leaves no trace there but
+    every trace in bifrost_miniblocks, so our store is unioned in and such
+    an entry is tagged `ours` -- the relay-side pages will be empty for it
+    and fall back to our own records."""
     _, rows = relay_q(
         "SELECT connector_identity, uniqExact(slot) AS n "
         "FROM relay.mini_block_events_v2 "
@@ -1405,7 +1421,22 @@ def connectors_in(relay_q, r, region="all"):
         f"  AND event = 'round_opened'{_region_sql(region)} "
         "  AND connector_identity != '' "
         "GROUP BY connector_identity ORDER BY n DESC")
-    return [(c, int(n or 0)) for c, n in rows if c]
+    out = {c: [int(n or 0), "relay"] for c, n in rows if c}
+    if ch is not None:
+        try:
+            _, ours = ch(
+                "SELECT connector_identity, uniqExact(slot) AS n "
+                "FROM bifrost_miniblocks "
+                f"WHERE ts >= now() - INTERVAL {CONNECTOR_LIST_DAYS} DAY "
+                f"  AND connector_identity != ''{_our_region_sql(region)} "
+                "GROUP BY connector_identity")
+        except Exception:
+            ours = []
+        for c, n in ours:
+            if c and c not in out:
+                out[c] = [int(n or 0), "ours"]
+    return sorted(((c, n, src) for c, (n, src) in out.items()),
+                  key=lambda x: -x[1])
 
 
 def _connector_select(cur, options):
@@ -1414,7 +1445,9 @@ def _connector_select(cur, options):
     on run."""
     opts = ['<option value="">all validators</option>']
     seen = False
-    for ident, name, n in options:
+    for opt in options:
+        ident, name, n = opt[:3]
+        src = opt[3] if len(opt) > 3 else "relay"
         seen = seen or ident == cur
         shown = (html.escape(name) if name
                  else html.escape(ident[:10]) + "\u2026")
@@ -1422,7 +1455,9 @@ def _connector_select(cur, options):
             f'<option value="{html.escape(ident)}"'
             f'{" selected" if ident == cur else ""} '
             f'title="{html.escape(ident)}">{shown} &middot; {n:,} slots / '
-            f"{CONNECTOR_LIST_DAYS}d</option>")
+            f"{CONNECTOR_LIST_DAYS}d"
+            + (" &middot; own relay, from our builders' records"
+               if src == "ours" else "") + "</option>")
     if cur and not seen:
         # Carried over from another region or window: keep it selectable
         # so the URL still means what it says, but say it is not in this list.
@@ -1912,7 +1947,8 @@ def _ms(a, b):
         return None
 
 
-def timeline_slots(relay_q, r, cap=MAX_SLOTS, region="all", connector=""):
+def timeline_slots(relay_q, r, cap=MAX_SLOTS, region="all", connector="",
+                   ch=None):
     """Slots where ANY builder offered, newest first, with who offered.
 
     Keyed on `submitted`, not on round_chosen: a round nobody won still
@@ -1966,6 +2002,40 @@ def timeline_slots(relay_q, r, cap=MAX_SLOTS, region="all", connector=""):
                                            "produced": False})["produced"] = True
         for slot in led:
             by.setdefault(slot, {})
+        # Our own records, for rounds the relay's store never saw (a relay
+        # of our own). Added only where the relay has nothing for that
+        # (slot, round, builder), so nothing is counted twice.
+        if ch is not None and lo and hi:
+            f = "%Y-%m-%d %H:%M:%S"
+            try:
+                _, mine = ch(
+                    "SELECT slot, index_in_slot AS idx, local_builder_id, "
+                    "  countIf(kind = 'selected') AS offers, "
+                    "  maxIf(reward, kind = 'selected') AS best_bid, "
+                    "  maxIf(order_count, kind = 'selected') AS n, "
+                    "  toString(minIf(ts, kind = 'selected')) AS first_t, "
+                    "  toString(maxIf(ts, kind = 'selected')) AS last_t, "
+                    "  countIf(kind = 'winner' AND won_by_us) AS won "
+                    "FROM bifrost_miniblocks "
+                    f"WHERE ts >= '{lo - dt.timedelta(minutes=2):{f}}' "
+                    f"  AND ts <= '{hi + dt.timedelta(minutes=2):{f}}' "
+                    f"  AND connector_identity = '{connector}' "
+                    "GROUP BY slot, idx, local_builder_id")
+            except Exception:
+                mine = []
+            for slot, idx, bld, offers, bid, n, ft, lt, won in mine:
+                slot, idx = int(slot), int(idx)
+                rounds_ = by.setdefault(slot, {})
+                if any(b["builder"] == bld for b in rounds_.get(idx, [])):
+                    continue
+                if int(offers or 0):
+                    rounds_.setdefault(idx, []).append({
+                        "builder": bld or "", "offers": int(offers or 0),
+                        "bid": int(bid or 0), "n": int(n or 0),
+                        "first": ft or "", "last": lt or "",
+                        "won": int(won or 0) > 0, "source": "ours"})
+                led.setdefault(slot, {"rounds_opened": 0, "produced": False})
+                led[slot]["ours_store"] = True
     slots = sorted(by, reverse=True)
     total = len(slots)
     slots = slots[:cap]
@@ -2038,6 +2108,71 @@ def slot_timeline(relay_q, slot, window, region="all"):
         d["builders"] = sorted({o["builder"] for o in d["offers"]})
         out.append(d)
     return {"slot": slot, "rounds": out}
+
+
+def slot_timeline_ours(ch, slot, connector=""):
+    """The same shape as slot_timeline, from bifrost_miniblocks + the
+    builder's round events, for a slot the relay's store never saw.
+
+    The anchor of each round is our builder's own `round_started`; the
+    winner is the `winner` row's uuid, which names one of our offers only
+    when we won -- otherwise the round shows as won by "another builder",
+    because our store never learns who."""
+    _, mb = ch(
+        "SELECT kind, index_in_slot AS idx, local_builder_id, toString(ts), "
+        "  uuid, ifNull(reward, 0), ifNull(execution_cost, 0), order_count, "
+        "  won_by_us FROM bifrost_miniblocks "
+        "WHERE ts >= now() - INTERVAL 7 DAY "
+        f"  AND slot = {int(slot)}"
+        + (f" AND connector_identity = '{connector}'" if connector else "")
+        + " ORDER BY ts")
+    if not mb:
+        return {"slot": slot, "rounds": [], "source": "ours"}
+    insts = ", ".join("'%s'" % b for b in {r[2] for r in mb})
+    _, ev = ch(
+        "SELECT instance_id, nums['index'], event, toString(ts) "
+        "FROM bifrost_events WHERE ts >= now() - INTERVAL 7 DAY "
+        f"  AND instance_id IN ({insts}) AND stage = 'scheduler' "
+        "  AND event IN ('round_started', 'round_winner', 'round_committed') "
+        f"  AND nums['slot'] = {int(slot)} ORDER BY ts")
+    opened = {}
+    for inst, idx, e, t in ev:
+        if e == "round_started":
+            opened.setdefault(int(idx), t)
+    rounds_ = {}
+    winners = {}
+    for kind, idx, bld, t, uuid, reward, cost, n, won in mb:
+        i = int(idx)
+        d = rounds_.setdefault(i, {"idx": i, "opened": opened.get(i, ""),
+                                   "offers": [], "sealed": "", "tail": "",
+                                   "is_last": False, "source": "ours"})
+        if kind == "winner":
+            winners[i] = (uuid, won == "true" or won == "1", bld)
+            continue
+        d["offers"].append({"at": t, "builder": bld or "", "uuid": uuid or "",
+                            "pay": 0, "jito": 0, "fees": 0,
+                            "bid": int(reward or 0), "cost": int(cost or 0),
+                            "n": int(n or 0), "reason": "offered"})
+    out = []
+    for i in sorted(rounds_):
+        d = rounds_[i]
+        d["offers"].sort(key=lambda z: z["at"])
+        anchor = d["opened"] or (d["offers"][0]["at"] if d["offers"] else "")
+        d["anchor"] = anchor
+        w = winners.get(i)
+        win_at, win_b = "", ""
+        for o in d["offers"]:
+            o["t_ms"] = _ms(anchor, o["at"]) if anchor else None
+            o["chosen"] = bool(w) and w[1] and o["uuid"] == w[0]
+            if o["chosen"]:
+                win_at, win_b = o["at"], o["builder"]
+        d["won_by"] = win_b or ("another builder (not in the relay's store)"
+                                if w and not w[1] else "")
+        d["chosen_ms"] = _ms(anchor, win_at) if anchor and win_at else None
+        d["sealed_ms"] = None
+        d["builders"] = sorted({o["builder"] for o in d["offers"]})
+        out.append(d)
+    return {"slot": slot, "rounds": out, "source": "ours"}
 
 
 # ------------------------------------------------------------- the race
@@ -2290,6 +2425,12 @@ def timeline_table_html(r, slots, shown, total, ours_re):
         # into it. The title says how we know it led: rounds the relay
         # opened, a block on chain, or both.
         cls = "srow" + (" noours" if r.get("connector") and not blds else "")
+        if led.get("ours_store"):
+            won = sum(1 for v in rs.values() for b in v if b.get("won"))
+            tags += (f' <span class="wtag own" title="the relay\'s store has '
+                     "nothing for this slot; this is from bifrost_miniblocks"
+                     f'">own relay{" &middot; won " + str(won) if won else ""}'
+                     "</span>")
         why = ""
         if r.get("connector") and not blds:
             why = (f'{led.get("rounds_opened", 0)} round(s) opened'
@@ -2655,6 +2796,7 @@ CSS = """
 .srow.noours td:first-child::before{color:#fca5a5}
 .srow.noours:hover td{background:#3a1317}
 .redn{color:#fca5a5}
+.wtag.own{color:#fbbf24;border-color:#fbbf2455}
 .nextlead{margin:10px 28px 0;color:#8fa6bf;font-size:12.5px}
 .nextlead b{color:#cfe0f0}
 .nextlead .nl-eta{color:#5eead4;font:600 13px ui-monospace,Menlo,monospace}

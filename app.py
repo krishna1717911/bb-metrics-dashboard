@@ -9381,7 +9381,8 @@ def accuracy_page(qs):
     conns = []
     if not r["err"]:
         try:
-            conns = accuracy.connectors_in(relay, r, region=r["region"])
+            conns = accuracy.connectors_in(relay, r, region=r["region"],
+                                           ch=clickhouse_main)
         except Exception:
             conns = []
     names = _validator_names()
@@ -9399,8 +9400,8 @@ def accuracy_page(qs):
             nextlead = ('<div class="nextlead aqcap">next leader slot unknown: '
                         f"{html.escape(str(exc)[:120])}</div>")
     body = nextlead + accuracy.form_html(r, ACCURACY_PATH, region=True,
-                              connectors=[(c, names.get(c) or "", n)
-                                          for c, n in conns])
+                              connectors=[(c, names.get(c) or "", n, src)
+                                          for c, n, src in conns])
     if r["err"]:
         body += accuracy.table_html(r, [], 0, 0, OURS_RE)
     else:
@@ -9498,11 +9499,12 @@ def offer_timeline_page(qs):
     conns = []
     if not r["err"]:
         try:
-            conns = accuracy.connectors_in(relay, r, region=r["region"])
+            conns = accuracy.connectors_in(relay, r, region=r["region"],
+                                           ch=clickhouse_main)
         except Exception:
             conns = []
     names = _validator_names()
-    opts = [(c, names.get(c) or "", n) for c, n in conns]
+    opts = [(c, names.get(c) or "", n, src) for c, n, src in conns]
     if r["connector"]:
         r["connector_label"] = names.get(r["connector"]) or ""
     # The picked validator's next leader slot, from the chain's schedule;
@@ -9523,7 +9525,8 @@ def offer_timeline_page(qs):
     else:
         try:
             slots, shown, total = accuracy.timeline_slots(
-                relay, r, region=r["region"], connector=r["connector"])
+                relay, r, region=r["region"], connector=r["connector"],
+                ch=clickhouse_main)
             body += accuracy.timeline_table_html(r, slots, shown, total,
                                                  OURS_RE)
         except Exception as exc:
@@ -9543,9 +9546,21 @@ def offer_timeline_slot_html(qs):
     if slot <= 0:
         return '<div class="dmeta">not a slot</div>'
     reg = (qs.get("region", [""])[0] or "all").strip()
-    return accuracy.timeline_html(
-        accuracy.slot_timeline(relay, slot,
-                               accuracy.slot_window(relay, slot), region=reg))
+    d = accuracy.slot_timeline(relay, slot, accuracy.slot_window(relay, slot),
+                               region=reg)
+    if not d.get("rounds"):
+        # Nothing in Gattaca's store: a relay of our own served this slot,
+        # and only our builders' records describe it.
+        try:
+            d = accuracy.slot_timeline_ours(clickhouse_main, slot)
+        except Exception as exc:
+            return ('<div class="dmeta">the relay recorded nothing for this '
+                    f"slot and our own store could not be read: "
+                    f"{html.escape(str(exc)[:200])}</div>")
+        if not d.get("rounds"):
+            return ('<div class="dmeta">no builder offered into this slot, '
+                    "in the relay's store or in ours</div>")
+    return accuracy.timeline_html(d)
 
 
 def accuracy_export_start(qs):
