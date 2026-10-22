@@ -9387,7 +9387,18 @@ def accuracy_page(qs):
     names = _validator_names()
     if r["connector"]:
         r["connector_label"] = names.get(r["connector"]) or ""
-    body = accuracy.form_html(r, ACCURACY_PATH, region=True,
+    # The picked validator's next leader slot, from the chain's schedule;
+    # best effort, the page is the same page without it.
+    nextlead = ""
+    if r["connector"]:
+        try:
+            nextlead = accuracy.next_leader_html(
+                accuracy.next_leader_slot(SOLANA_RPC, r["connector"]),
+                r.get("connector_label") or r["connector"][:10] + "\u2026")
+        except Exception as exc:
+            nextlead = ('<div class="nextlead aqcap">next leader slot unknown: '
+                        f"{html.escape(str(exc)[:120])}</div>")
+    body = nextlead + accuracy.form_html(r, ACCURACY_PATH, region=True,
                               connectors=[(c, names.get(c) or "", n)
                                           for c, n in conns])
     if r["err"]:
@@ -9494,7 +9505,18 @@ def offer_timeline_page(qs):
     opts = [(c, names.get(c) or "", n) for c, n in conns]
     if r["connector"]:
         r["connector_label"] = names.get(r["connector"]) or ""
-    body = accuracy.form_html(r, OFFERTL_PATH, metric=False, region=True,
+    # The picked validator's next leader slot, from the chain's schedule;
+    # best effort, the page is the same page without it.
+    nextlead = ""
+    if r["connector"]:
+        try:
+            nextlead = accuracy.next_leader_html(
+                accuracy.next_leader_slot(SOLANA_RPC, r["connector"]),
+                r.get("connector_label") or r["connector"][:10] + "\u2026")
+        except Exception as exc:
+            nextlead = ('<div class="nextlead aqcap">next leader slot unknown: '
+                        f"{html.escape(str(exc)[:120])}</div>")
+    body = nextlead + accuracy.form_html(r, OFFERTL_PATH, metric=False, region=True,
                               connectors=opts)
     if r["err"]:
         body += accuracy.timeline_table_html(r, [], 0, 0, OURS_RE)

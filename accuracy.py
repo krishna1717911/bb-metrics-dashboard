@@ -1433,6 +1433,83 @@ def _connector_select(cur, options):
             f'<select name=connector>{"".join(opts)}</select></label>')
 
 
+SLOT_MS = 200          # nominal since SIMD-0525; measured 204-217
+
+
+def _rpc(rpc_url, method, params):
+    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method,
+                       "params": params}).encode()
+    req = urllib.request.Request(rpc_url, data=body,
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        d = json.loads(resp.read())
+    if d.get("error"):
+        raise RuntimeError(str(d["error"].get("message", ""))[:160])
+    return d.get("result")
+
+
+def next_leader_slot(rpc_url, identity):
+    """The validator's next leader slot and when it is due.
+
+    From the chain's leader schedule, not the relay: a validator keeps its
+    slots whether or not any relay serves it. Looks in the current epoch
+    first, then the next (its schedule is known one epoch ahead). The
+    ETA assumes SLOT_MS per slot from the current slot, which is what the
+    page's countdown then runs down from; `now_ms` goes along so the
+    browser can correct for its own clock."""
+    if not rpc_url or not identity:
+        return None
+    info = _rpc(rpc_url, "getEpochInfo", [])
+    cur, idx, per = (int(info["absoluteSlot"]), int(info["slotIndex"]),
+                     int(info["slotsInEpoch"]))
+    epoch_start = cur - idx
+    sched = _rpc(rpc_url, "getLeaderSchedule", [None, {"identity": identity}])
+    slots = sorted(int(x) for x in (sched or {}).get(identity, []))
+    leading = [epoch_start + x for x in slots
+               if epoch_start + x <= cur < epoch_start + x + 1]
+    nxt = next((epoch_start + x for x in slots if epoch_start + x > cur), None)
+    epoch = int(info["epoch"])
+    if nxt is None:
+        nxt_start = epoch_start + per
+        sched = _rpc(rpc_url, "getLeaderSchedule",
+                     [nxt_start, {"identity": identity}])
+        slots = sorted(int(x) for x in (sched or {}).get(identity, []))
+        nxt = nxt_start + slots[0] if slots else None
+        epoch += 1
+    if nxt is None:
+        return {"current_slot": cur, "next_slot": None, "epoch": epoch}
+    ahead = nxt - cur
+    return {"current_slot": cur, "next_slot": nxt, "epoch": epoch,
+            "slots_ahead": ahead, "eta_ms": ahead * SLOT_MS,
+            "leading_now": bool(leading),
+            "now_ms": int(time.time() * 1000),
+            "in_epoch": epoch == int(info["epoch"])}
+
+
+def next_leader_html(nl, label):
+    """The countdown line. Rendered once with the server's numbers; the JS
+    keeps `.nl-eta` and `.nl-at` ticking from data-* on the span."""
+    if not nl:
+        return ""
+    if nl.get("next_slot") is None:
+        return (f'<div class="nextlead">{html.escape(label)} has no leader '
+                f"slot in epoch {nl['epoch']} or the next</div>")
+    eta = nl["eta_ms"] / 1000
+    at = (dt.datetime.now(dt.UTC) + dt.timedelta(milliseconds=nl["eta_ms"]))
+    return (f'<div class="nextlead" data-slot="{nl["next_slot"]}" '
+            f'data-cur="{nl["current_slot"]}" data-eta="{nl["eta_ms"]}" '
+            f'data-now="{nl["now_ms"]}" data-slotms="{SLOT_MS}">'
+            + ("<b>leading now</b> &middot; " if nl.get("leading_now") else "")
+            + f'next leader slot for <b>{html.escape(label)}</b>: '
+            f'<span class="m">{copy_val(str(nl["next_slot"]))}</span> '
+            f'(window {nl["next_slot"]}&ndash;{nl["next_slot"] + 3}'
+            + ("" if nl.get("in_epoch", True) else f', epoch {nl["epoch"]}')
+            + f') &middot; <b class="nl-eta">{eta:,.1f} s</b> from now, '
+            f'~<span class="nl-at">{at:%H:%M:%S}</span> UTC '
+            f'<span class="aqcap">({nl["slots_ahead"]:,} slots ahead at '
+            f"{SLOT_MS} ms/slot, from slot {nl['current_slot']:,})</span></div>")
+
+
 def _region_select(cur):
     opts = "".join(
         f'<option value="{k}"{" selected" if k == cur else ""}>'
@@ -2578,6 +2655,10 @@ CSS = """
 .srow.noours td:first-child::before{color:#fca5a5}
 .srow.noours:hover td{background:#3a1317}
 .redn{color:#fca5a5}
+.nextlead{margin:10px 28px 0;color:#8fa6bf;font-size:12.5px}
+.nextlead b{color:#cfe0f0}
+.nextlead .nl-eta{color:#5eead4;font:600 13px ui-monospace,Menlo,monospace}
+.nextlead .nl-eta.past{color:#fbbf24}
 .ours{color:#5eead4;font-weight:600}
 .wtag{font:10.5px ui-monospace,Menlo,monospace;padding:1px 7px;
   border-radius:4px;border:1px solid #22303f;color:#8fa6bf}
@@ -2724,6 +2805,29 @@ ACCURACY_JS = r'''
     if (tab) tab.querySelectorAll('tr.selx').forEach(function(tr){ tr.hidden = false; });
     if (note) note.remove();
   });
+  // The next-leader-slot countdown. The server sent its own clock
+  // (data-now) with the ETA, so the browser's clock only has to be
+  // consistent with itself: remaining = eta - (Date.now() - now0) + skew.
+  var nl = document.querySelector('.nextlead[data-eta]');
+  if (nl){
+    var eta0 = parseFloat(nl.getAttribute('data-eta')),
+        now0 = parseFloat(nl.getAttribute('data-now')),
+        skew = Date.now() - now0,            // includes network + clock skew
+        slotms = parseFloat(nl.getAttribute('data-slotms')) || 200,
+        etaEl = nl.querySelector('.nl-eta'), atEl = nl.querySelector('.nl-at');
+    var due = Date.now() + eta0 - Math.max(0, Math.min(skew, 5000));
+    function pad(n){ return (n < 10 ? '0' : '') + n; }
+    function tick(){
+      var left = due - Date.now();
+      if (etaEl){
+        etaEl.textContent = (left < 0 ? '-' : '') + (Math.abs(left) / 1000).toFixed(1) + ' s';
+        etaEl.classList.toggle('past', left < 0);
+        if (left < -4 * slotms) etaEl.textContent += ' (window over; reload for the next)';
+      }
+      if (atEl){ var d = new Date(due); atEl.textContent = pad(d.getUTCHours()) + ':' + pad(d.getUTCMinutes()) + ':' + pad(d.getUTCSeconds()); }
+    }
+    tick(); setInterval(tick, 100);
+  }
   var reg = document.querySelector('.aqform select[name=region]'),
       con = document.querySelector('.aqform select[name=connector]');
   if (reg && con) reg.addEventListener('change', function(){ con.value = ''; });
