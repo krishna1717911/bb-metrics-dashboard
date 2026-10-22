@@ -9410,7 +9410,8 @@ def accuracy_page(qs):
                                                  region=r["region"],
                                                  connector=r["connector"])
             body += accuracy.stale_banner(accuracy.relay_tx_lag(relay))
-            body += accuracy.table_html(r, rows, shown, total, OURS_RE)
+            body += accuracy.table_html(r, rows, shown, total, OURS_RE,
+                                        slot_ref=_slot_ref())
         except Exception as exc:
             body += ('<div class="herr" style="margin:20px 28px">the relay '
                      f"could not be read: {html.escape(str(exc)[:300])}</div>")
@@ -9419,7 +9420,8 @@ def accuracy_page(qs):
                  # OFFERS_JS defines window.__renderOffers; the fragment
                  # handler re-invokes it after each expansion
                  scripts=(f"<script>{accuracy.ACCURACY_JS}</script>"
-                          f"<script>{OFFERS_JS}</script>"))
+                          f"<script>{OFFERS_JS}</script>"
+                          f'<script>{TICK_JS.replace("__SERVER_NOW__", f"{time.time():.3f}")}</script>'))
 
 
 def accuracy_slot_html(qs):
@@ -9477,6 +9479,18 @@ def accuracy_slot_html(qs):
     return body
 
 
+def _slot_ref():
+    """(current slot, now) for the per-row 'N ago' estimate; None if the
+    RPC is not configured or does not answer -- the tables are the same
+    tables without it."""
+    try:
+        return (int(accuracy._rpc(SOLANA_RPC, "getSlot",
+                                  [{"commitment": "processed"}])),
+                time.time())
+    except Exception:
+        return None
+
+
 def _validator_names():
     """leader identity -> name, from valcomp's cached Firedancer report."""
     try:
@@ -9528,14 +9542,15 @@ def offer_timeline_page(qs):
                 relay, r, region=r["region"], connector=r["connector"],
                 ch=clickhouse_main)
             body += accuracy.timeline_table_html(r, slots, shown, total,
-                                                 OURS_RE)
+                                                 OURS_RE, slot_ref=_slot_ref())
         except Exception as exc:
             body += ('<div class="herr" style="margin:20px 28px">the relay '
                      f"could not be read: {html.escape(str(exc)[:300])}</div>")
     return shell(body, here="offertl", subtitle="offer timelines",
                  extra_css=accuracy.CSS,
                  scripts=(f"<script>{accuracy.ACCURACY_JS}</script>"
-                          f"<script>{OFFERS_JS}</script>"))
+                          f"<script>{OFFERS_JS}</script>"
+                          f'<script>{TICK_JS.replace("__SERVER_NOW__", f"{time.time():.3f}")}</script>'))
 
 
 def offer_timeline_slot_html(qs):

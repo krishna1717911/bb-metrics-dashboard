@@ -1521,6 +1521,26 @@ def next_leader_slot(rpc_url, identity):
             "in_epoch": epoch == int(info["epoch"])}
 
 
+def slot_age_html(slot, ref):
+    """'~3m 12s ago' beside a slot, estimated from the current slot at page
+    load and SLOT_MS per slot -- the page's age ticker then keeps it
+    running. `ref` is (current_slot, now_epoch_s) or None."""
+    if not ref:
+        return ""
+    cur, now = ref
+    behind = cur - int(slot)
+    if behind < 0:
+        return ' <span class="sage dim">upcoming</span>'
+    at = now - behind * SLOT_MS / 1000
+    s_ = int(behind * SLOT_MS / 1000)
+    d, h, m, sec = s_ // 86400, s_ % 86400 // 3600, s_ % 3600 // 60, s_ % 60
+    txt = (f"{d}d {h}h" if d else f"{h}h {m}m" if h else f"{m}m {sec}s" if m
+           else f"{sec}s")
+    return (f' <span class="age sage dim" data-t="{at:.1f}" title="estimated: '
+            f"{behind:,} slots before the current slot at page load, at "
+            f'{SLOT_MS} ms per slot">{txt} ago</span>')
+
+
 def next_leader_html(nl, label):
     """The countdown line. Rendered once with the server's numbers; the JS
     keeps `.nl-eta` and `.nl-at` ticking from data-* on the span."""
@@ -2372,7 +2392,7 @@ def _copy_raw(text, label):
             f'tabindex="0" title="copy as CSV">{label}</span>')
 
 
-def timeline_table_html(r, slots, shown, total, ours_re):
+def timeline_table_html(r, slots, shown, total, ours_re, slot_ref=None):
     """The slot list for the timeline metric: who OFFERED, not who won."""
     if r["err"]:
         return (f'<div class="herr" style="margin:20px 28px">'
@@ -2440,7 +2460,7 @@ def timeline_table_html(r, slots, shown, total, ours_re):
         out.append(
             f'<tr class="{cls}" data-slot="{sl}"'
             + (f' title="{html.escape(why)}"' if why else "") + ">"
-            f'<td class="m">{copy_val(str(sl))}</td>'
+            f'<td class="m">{copy_val(str(sl))}{slot_age_html(sl, slot_ref)}</td>'
             f'<td class="n">{len(rs)}</td><td class="n">{offers:,}</td>'
             f"<td>{tags}</td><td class=\"n\">{best:,}</td></tr>"
             f'<tr class="drow" id="d{sl}" hidden><td colspan=5>'
@@ -2796,6 +2816,7 @@ CSS = """
 .srow.noours td:first-child::before{color:#fca5a5}
 .srow.noours:hover td{background:#3a1317}
 .redn{color:#fca5a5}
+.sage{margin-left:8px;font-size:10.5px;font-variant-numeric:tabular-nums}
 .wtag.own{color:#fbbf24;border-color:#fbbf2455}
 .nextlead{margin:10px 28px 0;color:#8fa6bf;font-size:12.5px}
 .nextlead b{color:#cfe0f0}
@@ -3168,7 +3189,7 @@ def form_html(r, path, metric=True, region=False, connectors=None):
     return "".join(out)
 
 
-def table_html(r, rows, shown, total, ours_re):
+def table_html(r, rows, shown, total, ours_re, slot_ref=None):
     if r["err"]:
         return f'<div class="herr" style="margin:20px 28px">{html.escape(r["err"])}</div>'
     if not rows:
@@ -3211,7 +3232,7 @@ def table_html(r, rows, shown, total, ours_re):
         conn = rs[0]["connector"]
         body.append(
             f'<tr class="srow" data-slot="{slot}">'
-            f'<td class="m">{copy_val(slot)}</td>'
+            f'<td class="m">{copy_val(slot)}{slot_age_html(slot, slot_ref)}</td>'
             f'<td class="n m">{len(rs)}</td>'
             f'<td>{" ".join(wins)}</td>'
             f'<td class="n m">{orders:,}</td>'
