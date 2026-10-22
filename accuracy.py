@@ -1387,18 +1387,22 @@ def _connector_sql(connector):
     return f" AND connector_identity = '{connector}'" if connector else ""
 
 
+CONNECTOR_LIST_DAYS = 7
+
+
 def connectors_in(relay_q, r, region="all"):
-    """The validators the region's relays opened rounds for in the window,
-    busiest first -> [(identity, rounds)]. From round_opened, so a
-    validator nobody bid on still appears; the point of the filter is to
-    pick a validator, not a validator we happened to serve."""
-    if r["slot"] is not None and "win_lo" not in r:
-        r["win_lo"], r["win_hi"] = slot_window(relay_q, r["slot"])
-    sub_w = _bounds(r)[1]
+    """The validators the region's relays opened rounds for in the last
+    CONNECTOR_LIST_DAYS, busiest first -> [(identity, slots)].
+
+    Deliberately NOT the window being viewed: a validator that happened to
+    lead nothing in the last hour would vanish from the list, and the list
+    is for picking a validator, not for describing the window. From
+    round_opened, so a validator nobody bid on still appears."""
     _, rows = relay_q(
-        "SELECT connector_identity, uniqExact((slot, index_in_slot)) AS n "
+        "SELECT connector_identity, uniqExact(slot) AS n "
         "FROM relay.mini_block_events_v2 "
-        f"WHERE {sub_w} AND event = 'round_opened'{_region_sql(region)} "
+        f"WHERE timestamp >= now() - INTERVAL {CONNECTOR_LIST_DAYS} DAY "
+        f"  AND event = 'round_opened'{_region_sql(region)} "
         "  AND connector_identity != '' "
         "GROUP BY connector_identity ORDER BY n DESC")
     return [(c, int(n or 0)) for c, n in rows if c]
@@ -1417,14 +1421,15 @@ def _connector_select(cur, options):
         opts.append(
             f'<option value="{html.escape(ident)}"'
             f'{" selected" if ident == cur else ""} '
-            f'title="{html.escape(ident)}">{shown} &middot; {n:,} rounds'
-            "</option>")
+            f'title="{html.escape(ident)}">{shown} &middot; {n:,} slots / '
+            f"{CONNECTOR_LIST_DAYS}d</option>")
     if cur and not seen:
         # Carried over from another region or window: keep it selectable
         # so the URL still means what it says, but say it is not in this list.
         opts.append(f'<option value="{html.escape(cur)}" selected>'
                     f"{html.escape(cur[:10])}\u2026 &middot; not seen here</option>")
-    return ('<label>validator <span class="dim">in this region</span>'
+    return ('<label>validator <span class="dim">in this region, last '
+            f'{CONNECTOR_LIST_DAYS}d</span>'
             f'<select name=connector>{"".join(opts)}</select></label>')
 
 
@@ -1857,10 +1862,38 @@ def timeline_slots(relay_q, r, cap=MAX_SLOTS, region="all", connector=""):
             "builder": bld or "", "offers": int(offers or 0),
             "bid": int(bid or 0), "n": int(n or 0),
             "first": ft or "", "last": lt or ""})
+    # With one validator picked, the question changes from "where were
+    # offers" to "what happened on EVERY slot it led". Add the slots the
+    # relay opened rounds for and the blocks the chain says it produced,
+    # whether or not anyone offered; a slot with no offer at all stays in
+    # with an empty round list, and the table paints it.
+    led = {}
+    if connector:
+        _, opened = relay_q(
+            "SELECT slot, count() AS rounds FROM relay.mini_block_events_v2 "
+            f"WHERE {sub_w} AND event = 'round_opened'{_region_sql(region)}"
+            f"{_connector_sql(connector)} GROUP BY slot")
+        for slot, n in opened:
+            led[int(slot)] = {"rounds_opened": int(n or 0), "produced": False}
+        lo = r.get("win_lo") if r["slot"] is not None else r["lo"]
+        hi = r.get("win_hi") if r["slot"] is not None else r["hi"]
+        if lo and hi:
+            f = "%Y-%m-%d %H:%M:%S"
+            _, blocks = relay_q(
+                "SELECT slot FROM solana.block_summary "
+                f"WHERE estimated_slot_time >= '{lo:{f}}' "
+                f"  AND estimated_slot_time <= '{hi:{f}}' "
+                f"  AND leader = '{connector}'")
+            for (slot,) in blocks:
+                led.setdefault(int(slot), {"rounds_opened": 0,
+                                           "produced": False})["produced"] = True
+        for slot in led:
+            by.setdefault(slot, {})
     slots = sorted(by, reverse=True)
     total = len(slots)
     slots = slots[:cap]
-    return [{"slot": sl, "rounds": by[sl]} for sl in slots], len(slots), total
+    return ([{"slot": sl, "rounds": by[sl], "led": led.get(sl)} for sl in slots],
+            len(slots), total)
 
 
 def slot_timeline(relay_q, slot, window, region="all"):
@@ -2151,8 +2184,14 @@ def timeline_table_html(r, slots, shown, total, ours_re):
                for v in srow["rounds"].values() for b in v):
         note += (' &middot; <span class="aqcap">no Astralane builder offers '
                  "here</span>")
+    noours = sum(1 for srow in slots if not any(
+        _is_ours(b["builder"]) for v in srow["rounds"].values() for b in v))
+    what = (f"{shown:,} slots led"
+            f' &middot; <b class="redn">{noours:,} with no offer from us</b> '
+            '<span class="aqcap">(red)</span>'
+            if r.get("connector") else f"{shown:,} slots with offers")
     out = [f'<div class="aqhead"><b>{html.escape(r["label"])}</b> &mdash; '
-           f"{shown:,} slots with offers{note}{cap}. Click a slot for the "
+           f"{what}{note}{cap}. Click a slot for the "
            "offers in arrival order, timed from when the relay opened the "
            "round.</div>",
            '<table class="atab2"><tr><th>slot</th><th class="n">rounds</th>'
@@ -2169,8 +2208,24 @@ def timeline_table_html(r, slots, shown, total, ours_re):
         tags = "".join(
             f'<span class="wtag{" us" if ours_re and ours_re.match(b) else ""}">'
             f"{html.escape(b)}</span>" for b in blds)
+        ours_here = any(ours_re and ours_re.match(b) for b in blds)
+        led = srow.get("led") or {}
+        # Red = the validator led this slot and no Astralane builder offered
+        # into it. The title says how we know it led: rounds the relay
+        # opened, a block on chain, or both.
+        cls = "srow" + ("" if ours_here or not r.get("connector") else " noours")
+        why = ""
+        if not ours_here and r.get("connector"):
+            why = (f'{led.get("rounds_opened", 0)} round(s) opened'
+                   + (", block produced" if led.get("produced") else
+                      ", no block on chain yet")
+                   + (", nobody offered" if not blds else
+                      ", only " + ", ".join(blds) + " offered"))
+            if not tags:
+                tags = '<span class="dim">&mdash;</span>'
         out.append(
-            f'<tr class="srow" data-slot="{sl}">'
+            f'<tr class="{cls}" data-slot="{sl}"'
+            + (f' title="{html.escape(why)}"' if why else "") + ">"
             f'<td class="m">{copy_val(str(sl))}</td>'
             f'<td class="n">{len(rs)}</td><td class="n">{offers:,}</td>'
             f"<td>{tags}</td><td class=\"n\">{best:,}</td></tr>"
@@ -2521,6 +2576,12 @@ CSS = """
 .srow:hover{background:#101a23}
 .srow td:first-child::before{content:"\\25B8 ";color:#5eead4}
 .srow.open td:first-child::before{content:"\\25BE "}
+/* a slot the picked validator led with no offer from any of our builders */
+.srow.noours td{background:#2a0e10}
+.srow.noours td:first-child{color:#fca5a5}
+.srow.noours td:first-child::before{color:#fca5a5}
+.srow.noours:hover td{background:#3a1317}
+.redn{color:#fca5a5}
 .ours{color:#5eead4;font-weight:600}
 .wtag{font:10.5px ui-monospace,Menlo,monospace;padding:1px 7px;
   border-radius:4px;border:1px solid #22303f;color:#8fa6bf}
