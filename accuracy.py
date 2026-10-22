@@ -2178,8 +2178,8 @@ def timeline_table_html(r, slots, shown, total, ours_re):
         note = f' &middot; <b>{html.escape(REGIONS[reg])}</b> only'
     if r.get("connector"):
         lab = r.get("connector_label") or r["connector"][:10] + "\u2026"
-        note += (f' &middot; validator <b title="{html.escape(r["connector"])}">'
-                 f"{html.escape(lab)}</b> only")
+        note += (f' &middot; validator <b>{html.escape(lab)}</b> '
+                 f'<span class="m">{copy_val(r["connector"])}</span> only')
     if not any(_is_ours(b["builder"]) for srow in slots
                for v in srow["rounds"].values() for b in v):
         note += (' &middot; <span class="aqcap">no Astralane builder offers '
@@ -2944,8 +2944,8 @@ def table_html(r, rows, shown, total, ours_re):
         note = f' &middot; <b>{html.escape(REGIONS[reg])}</b> only'
     if r.get("connector"):
         lab = r.get("connector_label") or r["connector"][:10] + "\u2026"
-        note += (f' &middot; validator <b title="{html.escape(r["connector"])}">'
-                 f"{html.escape(lab)}</b> only")
+        note += (f' &middot; validator <b>{html.escape(lab)}</b> '
+                 f'<span class="m">{copy_val(r["connector"])}</span> only')
     if reg != "all":
         if not any(ours_re and ours_re.match(x["winner"] or "") for x in rows):
             note += (' &middot; <span class="aqcap">no Astralane builder '
