@@ -819,6 +819,11 @@ def slot_detail(relay_q, ch, rpc_url, slot, rows, blk_sigs=None):
             it["elsewhere"] = (status.get(it["sig"], UNKNOWN)
                                if it["sig"] else UNKNOWN)
             it["validator"] = vres.get(_vkey(it), [])
+        for blk in out:
+            for it in blk["orders"]:
+                it["round_idx"] = blk["round"]["idx"]
+        attach_recv(ch, miss, slot, lo, hi, round_of=lambda x: x["round_idx"],
+                    prefix_of=lambda x: x.get("prefix"))
     # handed on to the selection diff so it does not re-fetch the block
     return {"slot": slot, "rounds": out, "block_sigs": sigs,
             "source": source, "block": sigs is not None,
@@ -1060,6 +1065,118 @@ def attach_notes(ch, rows, lo=None, hi=None):
     return rows
 
 
+def round_marks(ch, slot, lo=None, hi=None):
+    """{(instance, round): {"open": ts, "win": ts}} -- each builder
+    instance's own round_started / round_winner for this slot, on that
+    instance's clock."""
+    f = "%Y-%m-%d %H:%M:%S"
+    tb = (f"ts >= '{lo:{f}}' AND ts <= '{hi:{f}}' AND " if lo and hi
+          else "ts > now() - INTERVAL 2 HOUR AND ")
+    out = {}
+    try:
+        _, rows = ch(
+            "SELECT instance_id, nums['index'], event, toString(min(ts)) "
+            f"FROM bifrost_events WHERE {tb}stage = 'scheduler' "
+            "  AND event IN ('round_started', 'round_winner') "
+            f"  AND nums['slot'] = {int(slot)} "
+            "GROUP BY instance_id, nums['index'], event")
+    except Exception:
+        return out
+    for inst, idx, e, t in rows:
+        out.setdefault((inst, int(idx)), {})["open" if e == "round_started"
+                                            else "win"] = t
+    return out
+
+
+def received_at(ch, entities, lo=None, hi=None):
+    """{entity: {instance: first scheduler/received ts}} for SigPrefixes
+    and bundle ids -- an order is logged once per instance at admission."""
+    out = {}
+    ents = sorted({e for e in entities if e})
+    if not ents:
+        return out
+    f = "%Y-%m-%d %H:%M:%S"
+    tb = (f"ts >= '{lo:{f}}' AND ts <= '{hi:{f}}' AND " if lo and hi
+          else "ts > now() - INTERVAL 2 HOUR AND ")
+    for i in range(0, len(ents), ENTITY_BATCH):
+        lst = ", ".join("'%s'" % _q(e) for e in ents[i:i + ENTITY_BATCH])
+        try:
+            _, rows = ch(
+                "SELECT entity, instance_id, toString(min(ts)) "
+                f"FROM bifrost_events WHERE {tb}stage = 'scheduler' "
+                f"  AND event = 'received' AND entity IN ({lst}) "
+                "GROUP BY entity, instance_id")
+        except Exception:
+            continue
+        for ent, inst, t in rows:
+            out.setdefault(ent, {})[inst] = t
+    return out
+
+
+def attach_recv(ch, rows, slot, lo=None, hi=None, round_of=lambda x: x["round"],
+                prefix_of=lambda x: x.get("sigprefix"),
+                bundle_of=lambda x: x.get("bundle_id")):
+    """Hang, on each row, when the builder admitted the order relative to
+    its round: {instance: (ms after round_started, ms before round_winner)}.
+
+    The order is looked up by its SigPrefix and, for a bundle member, by
+    the bundle id (that is the entity a bundle's `received` carries); the
+    earlier of the two is the admission. Both stamps are the same
+    instance's clock, so no correction applies. Negative "after open"
+    means it arrived before that round opened -- normal for a round that
+    is not the slot's first."""
+    marks = round_marks(ch, slot, lo, hi)
+    if not marks:
+        for x in rows:
+            x.setdefault("recv", {})
+        return rows
+    ents = set()
+    for x in rows:
+        ents.update(k for k in (prefix_of(x), bundle_of(x)) if k)
+    recv = received_at(ch, ents, lo, hi)
+    for x in rows:
+        got = {}
+        for key in (prefix_of(x), bundle_of(x)):
+            for inst, t in (recv.get(key) or {}).items():
+                if inst not in got or t < got[inst]:
+                    got[inst] = t
+        rec = {}
+        for inst, t in got.items():
+            m = marks.get((inst, int(round_of(x))))
+            if not m or "open" not in m:
+                continue
+            after = _ms(m["open"], t)
+            before = _ms(t, m["win"]) if "win" in m else None
+            if after is not None:
+                rec[inst] = (after, before)
+        x["recv"] = rec
+    return rows
+
+
+def _recv_cells(x, prefer=None):
+    """Two cells: ms after the round opened, ms before its winner. One
+    instance is shown -- `prefer` (the row's own builder) if it logged the
+    order, else the earliest admission -- and every instance is in the
+    title."""
+    rec = x.get("recv") or {}
+    if not rec:
+        return '<td class="n dim">&mdash;</td><td class="n dim">&mdash;</td>'
+    inst = prefer if prefer in rec else min(rec, key=lambda k: rec[k][0])
+    after, before = rec[inst]
+    title = html.escape("; ".join(
+        f"{k}: {v[0]:+.1f} ms after open" +
+        (f", {v[1]:.1f} ms before winner" if v[1] is not None else "")
+        for k, v in sorted(rec.items())))
+    def cell(v, cls=""):
+        if v is None:
+            return '<td class="n dim">&mdash;</td>'
+        return (f'<td class="n m{cls}" title="{title}">'
+                f'{v:+.1f}</td>' if cls else
+                f'<td class="n m" title="{title}">{v:.1f}</td>')
+    return (cell(after, " neg" if after < 0 else " pos")
+            + cell(before, " neg" if before is not None and before < 0 else ""))
+
+
 def _sched_pairs(x):
     seen, out = set(), []
     for n in x.get("sched") or []:
@@ -1296,7 +1413,11 @@ def selection_diff(relay_q, ch, rounds_, window, blocks=None,
                               (rewards or {}).get(rnd["slot"])))
     flat_rows = [x for part in rows for x in part]
     # the chunk's own window, so the scan stays narrow even over a range
-    return attach_notes(ch, flat_rows, *(window or (None, None)))
+    attach_notes(ch, flat_rows, *(window or (None, None)))
+    lo, hi = window or (None, None)
+    for sl in {x["slot"] for x in flat_rows}:
+        attach_recv(ch, [x for x in flat_rows if x["slot"] == sl], sl, lo, hi)
+    return flat_rows
 
 
 def _sel_flat(x, col):
@@ -1655,6 +1776,8 @@ def _sel_table(group):
            '<th>landed</th><th class="n" title="landed: fee and tip from the '
            'block. offered: from the transaction bytes in the relay packet log, '
            'for an order that did not land here">reward</th>'
+           '<th class="n" title="ms from this round&#39;s round_started to the builder admitting the order (scheduler/received), same clock; negative = it arrived before the round opened">recv +open</th>'
+           '<th class="n" title="ms from the builder admitting the order to this round&#39;s round_winner">win &minus;recv</th>'
            "<th>scheduler said</th></tr>"]
     real = [i for i in group
             if i["verdict"] not in ("no_accepted_offer", "no_content")]
@@ -1676,7 +1799,7 @@ def _sel_table(group):
             bid += (f' <span class="scopen bxo" data-sx="{bxid}" role="button" '
                     f'tabindex="0" title="every member of this bundle">'
                     f'#{pos or "?"} of {n}</span>')
-            bx = (f'<tr class="sxrow" id="{bxid}" hidden><td colspan=9>'
+            bx = (f'<tr class="sxrow" id="{bxid}" hidden><td colspan=11>'
                   + _bundle_panel(i) + "</td></tr>")
         vcls = "us" if i["verdict"] == "us_inc_not_titan" else "ti"
         pairs = _sched_pairs(i)
@@ -1709,11 +1832,12 @@ def _sel_table(group):
                    f'<td class="land {"y" if i["landed"] == "yes" else "n"}">'
                    f'{i["landed"] or "?"}</td>'
                    f'<td class="n">{_rw_cell(i)}</td>'
+                   f'{_recv_cells(i, i.get("our_builder"))}'
                    f"<td>{cell}</td></tr>")
         if bx:
             out.append(bx)
         if pairs:
-            out.append(f'<tr class="sxrow" id="{rid}" hidden><td colspan=9>'
+            out.append(f'<tr class="sxrow" id="{rid}" hidden><td colspan=11>'
                        + _sched_panel(i) + "</td></tr>")
     out.append("</table>")
     if len(real) > len(shown):
@@ -2816,6 +2940,7 @@ CSS = """
 .srow.noours td:first-child::before{color:#fca5a5}
 .srow.noours:hover td{background:#3a1317}
 .redn{color:#fca5a5}
+.otab td.neg{color:#fbbf24}
 .sage{margin-left:8px;font-size:10.5px;font-variant-numeric:tabular-nums}
 .wtag.own{color:#fbbf24;border-color:#fbbf2455}
 .nextlead{margin:10px 28px 0;color:#8fa6bf;font-size:12.5px}
@@ -3372,10 +3497,13 @@ def detail_html(d):
                 f"<td>{bid}</td>"
                 f'<td class="ours">{"ours" if i["ours"] else ""}</td>'
                 f"<td>{_chain_cell(i)}</td>"
+                f"{_recv_cells(i)}"
                 f"<td>{_val_cell(i)}</td></tr>")
         out.append('<table class="otab"><tr><th>#</th><th>type</th>'
                    "<th>signature</th><th>sigprefix</th><th>bundle</th>"
                    "<th>held</th><th>landed elsewhere</th>"
+                   '<th class="n" title="ms from this round&#39;s round_started to the builder admitting the order (scheduler/received), same clock; negative = it arrived before the round opened">recv +open</th>'
+           '<th class="n" title="ms from the builder admitting the order to this round&#39;s round_winner">win &minus;recv</th>'
                    "<th>validator said</th></tr>"
                    + "".join(rowsh) + "</table>")
         if len(miss) > SIG_CAP:
