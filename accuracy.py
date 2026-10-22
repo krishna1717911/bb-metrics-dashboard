@@ -153,6 +153,21 @@ SLOT_RE = re.compile(r"^\d{6,}$")
 PUBKEY_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
 
 
+# The validator's leader schedule on Staking Facilities' Firedancer explorer:
+# the next slots it leads, with the client and skip history -- quicker than
+# our own countdown when the question is "is this validator actually up".
+STAKINGFAC_URL = "https://fd-mainnet.stakingfacilities.com/leaderSchedule?searchText="
+
+
+def stakingfac_link(pubkey):
+    if not PUBKEY_RE.match(pubkey or ""):
+        return ""
+    url = html.escape(STAKINGFAC_URL + pubkey, quote=True)
+    return (f' <a class="extbtn" href="{url}" target="_blank" rel="noopener" '
+            f'title="leader schedule for {html.escape(pubkey)} on Staking '
+            f'Facilities">staking fac</a>')
+
+
 def parse_range(qs):
     """-> dict(mode, slot, lo, hi, label, err). One of three shapes."""
     one = lambda k: (qs.get(k, [""])[0] or "").strip()
@@ -2535,7 +2550,8 @@ def timeline_table_html(r, slots, shown, total, ours_re, slot_ref=None):
     if r.get("connector"):
         lab = r.get("connector_label") or r["connector"][:10] + "\u2026"
         note += (f' &middot; validator <b>{html.escape(lab)}</b> '
-                 f'<span class="m">{copy_val(r["connector"])}</span> only')
+                 f'<span class="m">{copy_val(r["connector"])}</span>'
+                 f'{stakingfac_link(r["connector"])} only')
     if not any(_is_ours(b["builder"]) for srow in slots
                for v in srow["rounds"].values() for b in v):
         note += (' &middot; <span class="aqcap">no Astralane builder offers '
@@ -2941,6 +2957,8 @@ CSS = """
 .srow.noours:hover td{background:#3a1317}
 .redn{color:#fca5a5}
 .otab td.neg{color:#fbbf24}
+.extbtn{display:inline-block;padding:1px 8px;margin-left:4px;border:1px solid #475569;border-radius:4px;font-size:11px;color:#93c5fd;text-decoration:none;white-space:nowrap}
+.extbtn:hover{background:#1e293b;border-color:#93c5fd}
 .sage{margin-left:8px;font-size:10.5px;font-variant-numeric:tabular-nums}
 .wtag.own{color:#fbbf24;border-color:#fbbf2455}
 .nextlead{margin:10px 28px 0;color:#8fa6bf;font-size:12.5px}
@@ -3333,7 +3351,8 @@ def table_html(r, rows, shown, total, ours_re, slot_ref=None):
     if r.get("connector"):
         lab = r.get("connector_label") or r["connector"][:10] + "\u2026"
         note += (f' &middot; validator <b>{html.escape(lab)}</b> '
-                 f'<span class="m">{copy_val(r["connector"])}</span> only')
+                 f'<span class="m">{copy_val(r["connector"])}</span>'
+                 f'{stakingfac_link(r["connector"])} only')
     if reg != "all":
         if not any(ours_re and ours_re.match(x["winner"] or "") for x in rows):
             note += (' &middot; <span class="aqcap">no Astralane builder '
