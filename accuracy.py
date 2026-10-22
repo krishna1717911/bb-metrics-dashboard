@@ -2184,10 +2184,10 @@ def timeline_table_html(r, slots, shown, total, ours_re):
                for v in srow["rounds"].values() for b in v):
         note += (' &middot; <span class="aqcap">no Astralane builder offers '
                  "here</span>")
-    noours = sum(1 for srow in slots if not any(
-        _is_ours(b["builder"]) for v in srow["rounds"].values() for b in v))
+    nobody = sum(1 for srow in slots if not any(
+        b for v in srow["rounds"].values() for b in v))
     what = (f"{shown:,} slots led"
-            f' &middot; <b class="redn">{noours:,} with no offer from us</b> '
+            f' &middot; <b class="redn">{nobody:,} with no offer from any builder</b> '
             '<span class="aqcap">(red)</span>'
             if r.get("connector") else f"{shown:,} slots with offers")
     out = [f'<div class="aqhead"><b>{html.escape(r["label"])}</b> &mdash; '
@@ -2208,21 +2208,17 @@ def timeline_table_html(r, slots, shown, total, ours_re):
         tags = "".join(
             f'<span class="wtag{" us" if ours_re and ours_re.match(b) else ""}">'
             f"{html.escape(b)}</span>" for b in blds)
-        ours_here = any(ours_re and ours_re.match(b) for b in blds)
         led = srow.get("led") or {}
-        # Red = the validator led this slot and no Astralane builder offered
+        # Red = the validator led this slot and NO builder at all offered
         # into it. The title says how we know it led: rounds the relay
         # opened, a block on chain, or both.
-        cls = "srow" + ("" if ours_here or not r.get("connector") else " noours")
+        cls = "srow" + (" noours" if r.get("connector") and not blds else "")
         why = ""
-        if not ours_here and r.get("connector"):
+        if r.get("connector") and not blds:
             why = (f'{led.get("rounds_opened", 0)} round(s) opened'
                    + (", block produced" if led.get("produced") else
-                      ", no block on chain yet")
-                   + (", nobody offered" if not blds else
-                      ", only " + ", ".join(blds) + " offered"))
-            if not tags:
-                tags = '<span class="dim">&mdash;</span>'
+                      ", no block on chain yet") + ", nobody offered")
+            tags = '<span class="dim">&mdash;</span>'
         out.append(
             f'<tr class="{cls}" data-slot="{sl}"'
             + (f' title="{html.escape(why)}"' if why else "") + ">"
@@ -2576,7 +2572,7 @@ CSS = """
 .srow:hover{background:#101a23}
 .srow td:first-child::before{content:"\\25B8 ";color:#5eead4}
 .srow.open td:first-child::before{content:"\\25BE "}
-/* a slot the picked validator led with no offer from any of our builders */
+/* a slot the picked validator led that no builder at all offered into */
 .srow.noours td{background:#2a0e10}
 .srow.noours td:first-child{color:#fca5a5}
 .srow.noours td:first-child::before{color:#fca5a5}
