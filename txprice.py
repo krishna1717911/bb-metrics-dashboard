@@ -41,10 +41,34 @@ SYSTEM_TRANSFER_TAG = 2            # u32 LE instruction discriminator
 SET_COMPUTE_UNIT_LIMIT_TAG = 2     # u8
 SET_COMPUTE_UNIT_PRICE_TAG = 3     # u8
 LAMPORTS_PER_SIGNATURE = 5000
-# Agave's default when a legacy/v0 tx sets a price but no limit: 200k per
-# non-compute-budget instruction, capped at the block-wide maximum.
+# Agave's default limit for a tx that sets none
+# (compute-budget-instruction compute_budget_instruction_details.rs
+# calculate_default_compute_unit_limit): 3,000 per instruction to a builtin
+# program, 200,000 per any other instruction, capped at 1.4M. The builtins
+# are builtins-default-costs NON_MIGRATING_BUILTINS_COSTS plus Vote, which
+# only leaves the list under SIMD-0387 and has no bearing on fee-paying
+# flow either way.
 DEFAULT_INSTRUCTION_CU = 200_000
+BUILTIN_INSTRUCTION_CU = 3_000
 MAX_CU_LIMIT = 1_400_000
+BUILTIN_PROGRAMS = frozenset((
+    SYSTEM_PROGRAM, COMPUTE_BUDGET_PROGRAM,
+    "BPFLoaderUpgradeab1e11111111111111111111111",
+    "BPFLoader1111111111111111111111111111111111",
+    "BPFLoader2111111111111111111111111111111111",
+    "LoaderV411111111111111111111111111111111111",
+    "KeccakSecp256k11111111111111111111111111111",
+    "Ed25519SigVerify111111111111111111111111111",
+    "Vote111111111111111111111111111111111111111"))
+
+
+def default_cu_limit(instructions):
+    """What Agave charges a tx that declares no compute-unit limit."""
+    n_builtin = sum(1 for prog, _a, _d in instructions
+                    if prog in BUILTIN_PROGRAMS)
+    n_other = len(instructions) - n_builtin
+    return min(MAX_CU_LIMIT, n_builtin * BUILTIN_INSTRUCTION_CU
+               + n_other * DEFAULT_INSTRUCTION_CU)
 
 
 def b58encode(b):
@@ -98,14 +122,19 @@ class _R:
 
 
 def parse(raw):
-    """-> dict(version, n_sigs, keys, instructions, priority_fee, cu_limit,
-    has_lookups). `instructions` is [(program_key, [account_idx], data)],
-    account indexes referring to `keys` (static keys only)."""
+    """-> dict(version, n_sigs, sig, keys, instructions, priority_fee,
+    cu_limit, declared_cu, has_lookups). `instructions` is
+    [(program_key, [account_idx], data)], account indexes referring to
+    `keys` (static keys only). `sig` is the first signature -- the tx id.
+    `cu_limit` is the explicit limit or None; `declared_cu` is that, or
+    Agave's default when there is none."""
     if not raw:
         raise ParseError("empty")
-    if raw[0] & 0x80:
-        return _parse_v1(raw)
-    return _parse_legacy_v0(raw)
+    t = _parse_v1(raw) if raw[0] & 0x80 else _parse_legacy_v0(raw)
+    t["declared_cu"] = (min(MAX_CU_LIMIT, t["cu_limit"])
+                        if t["cu_limit"] is not None
+                        else default_cu_limit(t["instructions"]))
+    return t
 
 
 def _parse_v1(raw):
@@ -139,10 +168,11 @@ def _parse_v1(raw):
         if pidx >= len(keys):
             raise ParseError("program index out of range")
         ixs.append((keys[pidx], accts, data))
-    r.take(64 * n_sigs)
+    sigs = r.take(64 * n_sigs)
     if r.i != len(raw):
         raise ParseError(f"{len(raw) - r.i} trailing bytes")
-    return {"version": "v1", "n_sigs": n_sigs, "keys": keys,
+    return {"version": "v1", "n_sigs": n_sigs,
+            "sig": b58encode(sigs[:64]) if n_sigs else "", "keys": keys,
             "instructions": ixs, "priority_fee": priority_fee,
             "cu_limit": cu_limit, "has_lookups": False}
 
@@ -150,7 +180,7 @@ def _parse_v1(raw):
 def _parse_legacy_v0(raw):
     r = _R(raw)
     n_sigs = r.compact_u16()
-    r.take(64 * n_sigs)
+    sigs = r.take(64 * n_sigs)
     first = r.u8()
     if first & 0x80:
         if first & 0x7f != 0:
@@ -185,10 +215,9 @@ def _parse_legacy_v0(raw):
         raise ParseError(f"{len(raw) - r.i} trailing bytes")
     # compute budget: the builder's explicit_compute_budget, plus Agave's
     # default limit so a price without a limit still prices
-    cu_limit, cu_price, n_other = None, None, 0
+    cu_limit, cu_price = None, None
     for prog, _accts, data in ixs:
         if prog != COMPUTE_BUDGET_PROGRAM:
-            n_other += 1
             continue
         if not data:
             continue
@@ -198,16 +227,17 @@ def _parse_legacy_v0(raw):
             cu_price = struct.unpack("<Q", data[1:9])[0]
     priority_fee = 0
     if cu_price:
-        limit = cu_limit if cu_limit is not None else min(
-            MAX_CU_LIMIT, DEFAULT_INSTRUCTION_CU * n_other)
+        limit = (min(MAX_CU_LIMIT, cu_limit) if cu_limit is not None
+                 else default_cu_limit(ixs))
         priority_fee = -(-(limit * cu_price) // 1_000_000)     # ceil
-    return {"version": version, "n_sigs": n_sigs, "keys": keys,
+    return {"version": version, "n_sigs": n_sigs,
+            "sig": b58encode(sigs[:64]) if n_sigs else "", "keys": keys,
             "instructions": ixs, "priority_fee": priority_fee,
             "cu_limit": cu_limit, "has_lookups": has_lookups}
 
 
 def price(raw, tip_accounts):
-    """-> {"fee", "tip", "version", "lookups"}.
+    """-> {"fee", "tip", "version", "lookups", "cu", "cu_explicit", "sig"}.
 
     `fee` is what the payer pays: base fee per signature plus the priority
     fee -- the same quantity `getBlock` reports as meta.fee for a landed
@@ -226,4 +256,6 @@ def price(raw, tip_accounts):
         if dest < len(t["keys"]) and t["keys"][dest] in tip_accounts:
             tip += struct.unpack("<Q", data[4:12])[0]
     return {"fee": LAMPORTS_PER_SIGNATURE * t["n_sigs"] + t["priority_fee"],
-            "tip": tip, "version": t["version"], "lookups": t["has_lookups"]}
+            "tip": tip, "version": t["version"], "lookups": t["has_lookups"],
+            "cu": t["declared_cu"], "cu_explicit": t["cu_limit"] is not None,
+            "sig": t["sig"]}

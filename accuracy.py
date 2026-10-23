@@ -33,6 +33,7 @@ import csv
 import datetime as dt
 import html
 import json
+import math
 import os
 import re
 import threading
@@ -412,6 +413,37 @@ def block_rewards(rpc_url, slot):
                "err": meta.get("err") is not None}
         for sig in inner.get("signatures") or []:
             out[sig] = rec
+    return out
+
+
+def block_tx_bytes(rpc_url, slot):
+    """-> {signature: raw transaction bytes} for every tx in the block.
+
+    The same block fetched with base64 bodies, for what block_rewards'
+    accounts view cannot give: the transaction's own compute-unit limit.
+    Measured on 460494455: 3.4 MB / 0.6 s against 2.9 MB / 0.5 s for the
+    accounts view. This is the only source of bytes for a landed bundle
+    member -- our relayer never sees most of those (3 of 17 on a measured
+    round)."""
+    body = {"jsonrpc": "2.0", "id": 1, "method": "getBlock", "params": [
+        int(slot), {"encoding": "base64", "transactionDetails": "full",
+                    "rewards": False, "maxSupportedTransactionVersion": 1}]}
+    req = urllib.request.Request(
+        rpc_url, headers={"Content-Type": "application/json"},
+        data=json.dumps(body).encode())
+    with urllib.request.urlopen(req, timeout=90) as resp:
+        d = json.loads(resp.read())
+    if d.get("error"):
+        if d["error"].get("code") in (-32009, -32007):
+            return {}
+        raise RuntimeError(str(d["error"].get("message", ""))[:160])
+    out = {}
+    for tx in (d.get("result") or {}).get("transactions") or []:
+        try:
+            raw = base64.b64decode((tx.get("transaction") or [""])[0])
+            out[txprice.parse(raw)["sig"]] = raw
+        except Exception:
+            continue
     return out
 
 
@@ -1323,9 +1355,44 @@ def _reward_of(o, blk_pfx, rewards):
             "reward": rec["fee"] + rec["tip"]}
 
 
-def price_from_packets(relayer_q, rows, window=(None, None)):
+def packet_bodies(relayer_q, sigs, window=(None, None)):
+    """-> {signature: raw bytes} from relayer.validator_packet_events.
+
+    That table is written by OUR relayer (txn-router mev-relay), not by
+    Gattaca's relay: everything it received -- the Gattaca relay's mempool
+    feed, sendTransaction, validator-side forwarders, what our builders
+    forward. Votes are never written, and searcher-gateway bundle members
+    mostly never pass through it."""
+    sigs = sorted({x for x in sigs if x})
+    out = {}
+    if not sigs:
+        return out
+    lo, hi = window or (None, None)
+    f = "%Y-%m-%d %H:%M:%S"
+    # partitioned on created_at; an hour either side covers clock skew and
+    # a packet that arrived well before the round it was offered in
+    tb = (f"created_at >= '{lo - dt.timedelta(hours=1):{f}}' "
+          f"AND created_at <= '{hi + dt.timedelta(hours=1):{f}}'"
+          if lo and hi else "created_at >= now() - INTERVAL 1 DAY")
+    for i in range(0, len(sigs), ENTITY_BATCH):
+        lst = ", ".join("'%s'" % _q(x) for x in sigs[i:i + ENTITY_BATCH])
+        got = relayer_q(
+            "SELECT signature, any(tx_body) FROM validator_packet_events "
+            f"WHERE {tb} AND signature IN ({lst}) GROUP BY signature")
+        for sig, body in got:
+            if not body:
+                continue
+            try:
+                out[sig] = base64.b64decode(body)
+            except Exception:
+                continue
+    return out
+
+
+def price_from_packets(relayer_q, rows, window=(None, None), bodies=None):
     """Price the diff rows the block could not: from the transaction bytes
-    in the relay's packet log, in place.
+    in our relayer's packet log, in place. `bodies` is an already-fetched
+    {signature: bytes}; only signatures missing from it are queried.
 
     `_reward_of` prices an order only if it landed in THIS block, so a
     `us_inc_not_titan` row -- our order the winner left out, which then
@@ -1346,34 +1413,22 @@ def price_from_packets(relayer_q, rows, window=(None, None)):
             want.setdefault(x["signature"], []).append(x)
     if not want:
         return rows
-    lo, hi = window or (None, None)
-    f = "%Y-%m-%d %H:%M:%S"
-    # the table is partitioned on created_at; an hour either side covers
-    # relay/builder clock skew and a packet that arrived well before the
-    # round it was offered in
-    tb = (f"created_at >= '{lo - dt.timedelta(hours=1):{f}}' "
-          f"AND created_at <= '{hi + dt.timedelta(hours=1):{f}}'"
-          if lo and hi else "created_at >= now() - INTERVAL 1 DAY")
-    sigs = sorted(want)
-    for i in range(0, len(sigs), ENTITY_BATCH):
-        lst = ", ".join("'%s'" % _q(x) for x in sigs[i:i + ENTITY_BATCH])
+    have = dict(bodies or {})
+    try:
+        have.update(packet_bodies(relayer_q, set(want) - set(have), window))
+    except Exception:
+        pass
+    for sig, raw in have.items():
+        if sig not in want:
+            continue
         try:
-            got = relayer_q(
-                "SELECT signature, any(tx_body) FROM validator_packet_events "
-                f"WHERE {tb} AND signature IN ({lst}) GROUP BY signature")
+            pr = txprice.price(raw, TIP_ACCOUNTS)
         except Exception:
-            return rows
-        for sig, body in got:
-            if not body:
-                continue
-            try:
-                pr = txprice.price(base64.b64decode(body), TIP_ACCOUNTS)
-            except Exception:
-                continue
-            for x in want.get(sig, []):
-                x.update(fee=pr["fee"], tip=pr["tip"],
-                         reward=pr["fee"] + pr["tip"], priced="bytes",
-                         tip_lower_bound=bool(pr["lookups"]))
+            continue
+        for x in want[sig]:
+            x.update(fee=pr["fee"], tip=pr["tip"],
+                     reward=pr["fee"] + pr["tip"], priced="bytes",
+                     tip_lower_bound=bool(pr["lookups"]))
     return rows
 
 
@@ -1388,8 +1443,12 @@ def _landed_mark(o, blk_pfx):
 
 
 def selection_diff(relay_q, ch, rounds_, window, blocks=None,
-                   contents=None, rewards=None):
-    """Every us-vs-titan content difference across these rounds."""
+                   contents=None, rewards=None, keep=None):
+    """Every us-vs-titan content difference across these rounds.
+
+    `keep`, a dict, receives the compared offers (`plan`) and their full
+    contents, so the CU/reward profile reuses them instead of reading the
+    relay a second time."""
     slots = {r["slot"] for r in rounds_}
     # The instant the round was decided is when the WINNING OFFER was
     # submitted, not when round_chosen fired. Measured on 457382947 r0
@@ -1420,6 +1479,8 @@ def selection_diff(relay_q, ch, rounds_, window, blocks=None,
     if contents is None:
         contents, _src = order_contents(relay_q, ch, sorted(need), window,
                                         flat)
+    if keep is not None:
+        keep.update(plan=plan, contents=contents)
     rows = []
     for rnd, tb, tv, ours in plan:
         rows.append(_sel_rows(rnd, tb, tv, ours, contents,
@@ -1456,7 +1517,7 @@ def _sel_csv(rows):
 
 
 def slot_selection(relay_q, ch, rpc_url, slot, rounds_, blk_sigs=None,
-                   rewards=None):
+                   rewards=None, keep=None):
     """The selection diff for one slot, for the page expansion."""
     win = _chunk_window(rounds_)
     if blk_sigs is None:
@@ -1465,7 +1526,8 @@ def slot_selection(relay_q, ch, rpc_url, slot, rounds_, blk_sigs=None,
         except Exception:
             blk_sigs = None
     return selection_diff(relay_q, ch, rounds_, win, blocks={slot: blk_sigs},
-                          rewards={slot: rewards} if rewards else None)
+                          rewards={slot: rewards} if rewards else None,
+                          keep=keep)
 
 
 def relay_tx_lag(relay_q):
@@ -2067,6 +2129,257 @@ def selection_html(rows, slot):
                            f'bid <span class="land n">{g[0]["bid_gap"]:+,}</span>'
                            f" &middot; {_sel_counts(g)}</div>")
             out.append("</div>")
+    out.append("</div>")
+    return "".join(out)
+
+
+# -------------------------------------------- declared CU / reward profile
+#
+# Every transaction each side OFFERED in a round, not only the diff: what
+# it declared it would burn (its SetComputeUnitLimit, or Agave's default
+# when it sets none) and what it pays. Same offers the diff compares --
+# the winner's chosen miniblock, our offer as it stood at the close.
+
+PROFILE_METRICS = (
+    ("cu", "declared CU", "CU"),
+    ("reward", "reward", "lamports"),
+    ("density", "reward per declared CU", "lamports/CU"),
+)
+
+
+def profile_sigs(keep):
+    """Every signature in the offers `keep` holds."""
+    contents = (keep or {}).get("contents") or {}
+    out = set()
+    for _rnd, _tb, tv, ours in (keep or {}).get("plan") or []:
+        for v in [tv] + [v for _b, v in ours]:
+            out.update(o["sig"] for o in contents.get(v.get("uuid"), [])
+                       if o["sig"])
+    return out
+
+
+def offer_profile(keep, blk_bytes=None, rewards=None, bodies=None):
+    """-> [{round, winner, sides: [{kind, builder, won, n, n_sig, recs}]}].
+
+    A tx is profiled only if its bytes are somewhere -- the block (landed
+    in this slot) or our relayer's packet log. Its reward is what the
+    block says it paid when it landed here, else what its bytes would pay
+    (txprice: fee + static transfers to a tip account). Gravity wallets
+    are not tip accounts here, as everywhere on this page."""
+    plan = (keep or {}).get("plan") or []
+    contents = (keep or {}).get("contents") or {}
+    blk_bytes, rewards, bodies = blk_bytes or {}, rewards or {}, bodies or {}
+    memo = {}
+
+    def rec(sig):
+        if sig in memo:
+            return memo[sig]
+        raw = blk_bytes.get(sig) or bodies.get(sig)
+        out = None
+        if raw:
+            try:
+                pr = txprice.price(raw, TIP_ACCOUNTS)
+                got = rewards.get(sig)
+                fee, tip, src = ((got["fee"], got["tip"], "block") if got
+                                 else (pr["fee"], pr["tip"], "bytes"))
+                out = {"cu": pr["cu"], "explicit": pr["cu_explicit"],
+                       "reward": fee + tip, "src": src,
+                       "density": (fee + tip) / pr["cu"] if pr["cu"] else None}
+            except Exception:
+                out = None
+        memo[sig] = out
+        return out
+
+    prof = []
+    for rnd, tb, tv, ours in plan:
+        sides = []
+        for kind, b, v in [("titan", tb, tv)] + [("ours", b, v)
+                                                  for b, v in ours]:
+            items = contents.get(v.get("uuid"), [])
+            if not items:
+                continue
+            sigs = list(dict.fromkeys(o["sig"] for o in items if o["sig"]))
+            sides.append({"kind": kind, "builder": b,
+                          "won": b == rnd["winner"], "n": len(items),
+                          "n_sig": len(sigs),
+                          "recs": [r for r in map(rec, sigs) if r]})
+        if (any(x["kind"] == "titan" for x in sides)
+                and any(x["kind"] == "ours" for x in sides)):
+            prof.append({"round": rnd["idx"], "winner": rnd["winner"],
+                         "sides": sides})
+    prof.sort(key=lambda r: r["round"])
+    return prof
+
+
+def _qtile(vals, q):
+    """Nearest-rank quantile of a sorted list."""
+    if not vals:
+        return None
+    return vals[max(0, min(len(vals) - 1,
+                           int(round(q / 100 * (len(vals) - 1)))))]
+
+
+def _num(v):
+    if v is None:
+        return "&mdash;"
+    a = abs(v)
+    if a >= 1e9:
+        return f"{v / 1e9:.2f}B"
+    if a >= 1e6:
+        return f"{v / 1e6:.2f}M"
+    if a >= 1e4:
+        return f"{v / 1e3:.1f}k"
+    if a >= 100:
+        return f"{v:,.0f}"
+    if a >= 1:
+        return f"{v:.2f}"
+    return f"{v:.3g}"
+
+
+def _decade(e):
+    """10**e as an axis label: 1k, 10M, 0.01."""
+    for p, suf in ((9, "B"), (6, "M"), (3, "k")):
+        if e >= p:
+            return f"{10 ** (e - p)}{suf}"
+    return f"{10 ** e}" if e >= 0 else f"{10.0 ** e:g}"
+
+
+def _stats(vals):
+    v = sorted(x for x in vals if x is not None)
+    if not v:
+        return None
+    return {"n": len(v), "min": v[0], "max": v[-1], "sum": sum(v),
+            "mean": sum(v) / len(v),
+            **{f"p{q}": _qtile(v, q) for q in (10, 25, 50, 75, 90)}}
+
+
+def _side_label(x):
+    return x["builder"] + (" (won)" if x["won"] else "")
+
+
+def _box_svg(sides, key, title, unit):
+    """One metric, one row per side, on a shared log axis."""
+    rows = [(x, _stats([r[key] for r in x["recs"]])) for x in sides]
+    # the axis spans the whiskers, not min..max: one 1.4M-CU outlier would
+    # otherwise squeeze every box into a sliver. Extremes are in the tooltip.
+    vals = [st[k] for _x, st in rows if st for k in ("p10", "p90")]
+    vals = [v for v in vals if v and v > 0]
+    if not vals:
+        return ""
+    lo = math.floor(math.log10(min(vals)))
+    hi = math.ceil(math.log10(max(vals)))
+    if hi <= lo:
+        hi = lo + 1
+    lab_w, plot_w, row_h, top = 128, 230, 26, 6
+    W = lab_w + plot_w + 24
+    step = max(1, math.ceil(44 / (plot_w / (hi - lo))))
+    H = top + row_h * len(rows) + 22
+
+    def X(v):
+        v = min(max(v, 10 ** lo), 10 ** hi)
+        return lab_w + (math.log10(v) - lo) / (hi - lo) * plot_w
+
+    g = [f'<svg class="pfsvg" viewBox="0 0 {W} {H}" width="{W}" '
+         f'height="{H}" role="img" aria-label="{html.escape(title)}">']
+    for e in range(lo, hi + 1):
+        x = X(10 ** e)
+        g.append(f'<line class="pfgrid" x1="{x:.1f}" x2="{x:.1f}" '
+                 f'y1="{top}" y2="{H - 18}"/>')
+        if (e - lo) % step == 0:
+            g.append(f'<text class="pfax" x="{x:.1f}" y="{H - 5}" '
+                     f'text-anchor="middle">{_decade(e)}</text>')
+    for i, (x, st) in enumerate(rows):
+        y = top + i * row_h
+        cls = "ti" if x["kind"] == "titan" else "us"
+        name = html.escape(_side_label(x))
+        if not st:
+            g.append(f'<text class="pflab" x="0" y="{y + 16}">{name}</text>'
+                     f'<text class="pfax" x="{lab_w}" y="{y + 16}">'
+                     "no priced txs</text>")
+            continue
+        tip = (f"{_side_label(x)} - {title}, {st['n']} txs: "
+               f"p10 {_num(st['p10'])} · p25 {_num(st['p25'])} · "
+               f"median {_num(st['p50'])} · p75 {_num(st['p75'])} · "
+               f"p90 {_num(st['p90'])} · max {_num(st['max'])} · "
+               f"mean {_num(st['mean'])} {unit}")
+        x10, x25, x50, x75, x90 = (X(st[k]) for k in
+                                   ("p10", "p25", "p50", "p75", "p90"))
+        cy = y + 12
+        g.append(f'<g class="pfrow" tabindex="0" data-tip="{html.escape(tip)}">'
+                 f'<rect class="pfhit" x="0" y="{y}" width="{W}" '
+                 f'height="{row_h}"/>'
+                 f'<text class="pflab" x="0" y="{cy + 4}">{name}</text>'
+                 f'<line class="pfwhisk {cls}" x1="{x10:.1f}" x2="{x90:.1f}" '
+                 f'y1="{cy}" y2="{cy}"/>'
+                 f'<rect class="pfbox {cls}" x="{x25:.1f}" y="{cy - 6}" '
+                 f'width="{max(2.0, x75 - x25):.1f}" height="12" rx="3"/>'
+                 f'<line class="pfmed" x1="{x50:.1f}" x2="{x50:.1f}" '
+                 f'y1="{cy - 7}" y2="{cy + 7}"/></g>')
+    g.append("</svg>")
+    return (f'<div class="pfchart"><div class="pftitle">{html.escape(title)} '
+            f'<span class="dim">{html.escape(unit)}, log scale</span></div>'
+            + "".join(g) + "</div>")
+
+
+def _profile_table(sides):
+    head = ("<tr><th>side</th><th>txs offered</th><th>priced</th>"
+            "<th>no explicit limit</th><th>&Sigma; declared CU</th>"
+            "<th>&Sigma; reward</th><th>&Sigma;reward / &Sigma;CU</th>"
+            "<th>median CU</th><th>median reward</th>"
+            "<th>median reward/CU</th></tr>")
+    body = []
+    for x in sides:
+        recs = x["recs"]
+        cu = sum(r["cu"] for r in recs)
+        rw = sum(r["reward"] for r in recs)
+        nb = sum(1 for r in recs if r["src"] == "block")
+        nd = sum(1 for r in recs if not r["explicit"])
+        st = {k: _stats([r[k] for r in recs]) for k, _t, _u in PROFILE_METRICS}
+        med = lambda k: _num(st[k]["p50"]) if st[k] else "&mdash;"
+        cls = "ti" if x["kind"] == "titan" else "us"
+        body.append(
+            f'<tr><td><span class="vd {cls}">{html.escape(_side_label(x))}'
+            f'</span></td><td class="n">{x["n"]:,}</td>'
+            f'<td class="n" title="{nb} priced from the block (landed here), '
+            f'{len(recs) - nb} from their bytes in our relayer\'s packet '
+            f'log; {x["n_sig"] - len(recs)} have no bytes anywhere, '
+            f'{x["n"] - x["n_sig"]} are bundle refs we could not expand">'
+            f'{len(recs):,}</td><td class="n">{nd:,}</td>'
+            f'<td class="n">{cu:,}</td><td class="n">{rw:,}</td>'
+            f'<td class="n">{_num(rw / cu) if cu else "&mdash;"}</td>'
+            f'<td class="n">{med("cu")}</td><td class="n">{med("reward")}</td>'
+            f'<td class="n">{med("density")}</td></tr>')
+    return f'<table class="otab pftab">{head}{"".join(body)}</table>'
+
+
+def profile_html(prof):
+    out = ['<div class="selsec"><div class="seltitle">declared CU / reward '
+           '<span class="dim">&mdash; every transaction each side offered, '
+           "Titan against us, per round</span></div>"
+           '<div class="dmeta aqcap">Declared CU is the transaction\'s own '
+           "SetComputeUnitLimit, or Agave's default when it sets none "
+           "(3,000 per builtin instruction, 200,000 per other, capped at "
+           "1.4M). Reward is fee + tips to Jito/Titan/Bifrost tip accounts: "
+           "what the block paid when it landed in this slot, otherwise what "
+           "its bytes would pay. Only transactions whose bytes we have "
+           "count &mdash; the block or our relayer's packet log; most "
+           "unlanded searcher bundle members have none. Boxes are p25&ndash;"
+           "p75, whiskers p10&ndash;p90, the bar is the median.</div>"]
+    if not prof:
+        out.append('<div class="dmeta">no round in this slot has both a '
+                   "Titan and an Astralane offer with stored contents</div>"
+                   "</div>")
+        return "".join(out)
+    for r in prof:
+        sides = r["sides"]
+        out.append(f'<div class="selblk"><div class="selhead"><b>r{r["round"]}'
+                   f'</b> &middot; won by {html.escape(r["winner"] or "?")} '
+                   '&middot; <span class="pfkey ti"></span>Titan '
+                   '<span class="pfkey us"></span>Astralane</div>'
+                   '<div class="pfcharts">'
+                   + "".join(_box_svg(sides, k, t, u)
+                             for k, t, u in PROFILE_METRICS)
+                   + "</div>" + _profile_table(sides) + "</div>")
     out.append("</div>")
     return "".join(out)
 
@@ -2957,6 +3270,25 @@ CSS = """
 .srow.noours:hover td{background:#3a1317}
 .redn{color:#fca5a5}
 .otab td.neg{color:#fbbf24}
+.pfcharts{display:flex;flex-wrap:wrap;gap:18px;margin:6px 0 8px}
+.pfchart{min-width:0}
+.pftitle{font-size:12px;color:#dbe4ee;margin-bottom:2px}
+.pfsvg{display:block;max-width:100%;height:auto;overflow:visible}
+.pfgrid{stroke:#1e293b;stroke-width:1}
+.pfax{fill:#64748b;font:10px ui-monospace,Menlo,monospace}
+.pflab{fill:#94a3b8;font:11px ui-monospace,Menlo,monospace}
+.pfhit{fill:transparent}
+.pfrow:hover .pfhit,.pfrow:focus .pfhit{fill:#ffffff0d}
+.pfrow:focus{outline:none}
+.pfbox.ti,.pfkey.ti{fill:#d97706;background:#d97706}
+.pfbox.us,.pfkey.us{fill:#0d9488;background:#0d9488}
+.pfbox{stroke:#0b1016;stroke-width:2}
+.pfwhisk{stroke-width:2;stroke-linecap:round}
+.pfwhisk.ti{stroke:#d97706}.pfwhisk.us{stroke:#0d9488}
+.pfmed{stroke:#f8fafc;stroke-width:2;stroke-linecap:round}
+.pfkey{display:inline-block;width:10px;height:10px;border-radius:2px;
+  margin:0 4px 0 8px;vertical-align:-1px}
+.pftab td.n{text-align:right}
 .extbtn{display:inline-block;padding:1px 8px;margin-left:4px;border:1px solid #475569;border-radius:4px;font-size:11px;color:#93c5fd;text-decoration:none;white-space:nowrap}
 .extbtn:hover{background:#1e293b;border-color:#93c5fd}
 .sage{margin-left:8px;font-size:10.5px;font-variant-numeric:tabular-nums}

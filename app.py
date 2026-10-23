@@ -9461,18 +9461,39 @@ def accuracy_slot_html(qs):
         body += accuracy.detail_html(d)
     if metric in (accuracy.SELECTION, accuracy.BOTH):
         try:
+            keep = {}
             sel = accuracy.slot_selection(relay, clickhouse_main,
-                                          SOLANA_RPC, slot, rows, sigs, rew)
-            # Orders the block could not price (they did not land) get
-            # their fee and tip from the relay packet log's bytes. Optional:
-            # without RELAYER_URL, or a packet it never saw, the cell stays
-            # blank exactly as before.
+                                          SOLANA_RPC, slot, rows, sigs, rew,
+                                          keep=keep)
+            win = accuracy._chunk_window(rows)
+            # Bytes for the CU/reward profile: the block for what landed
+            # here, our relayer's packet log for the rest. Both optional --
+            # without them the profile just prices fewer transactions.
             try:
-                accuracy.price_from_packets(relayer, sel,
-                                            accuracy._chunk_window(rows))
+                blk_bytes = accuracy.block_tx_bytes(SOLANA_RPC, slot)
+            except Exception:
+                blk_bytes = {}
+            try:
+                bodies = accuracy.packet_bodies(
+                    relayer, accuracy.profile_sigs(keep) - set(blk_bytes),
+                    win)
+            except Exception:
+                bodies = {}
+            # Orders the block could not price (they did not land) get
+            # their fee and tip from the packet log's bytes. Without
+            # RELAYER_URL, or a packet it never saw, the cell stays blank.
+            try:
+                accuracy.price_from_packets(relayer, sel, win, bodies=bodies)
             except Exception:
                 pass
             body += accuracy.selection_html(sel, slot)
+            try:
+                body += accuracy.profile_html(accuracy.offer_profile(
+                    keep, blk_bytes, rew, bodies))
+            except Exception as exc:
+                body += ('<div class="dmeta aqcap">the CU/reward profile '
+                         "could not be built: "
+                         f"{html.escape(str(exc)[:200])}</div>")
         except Exception as exc:
             body += ('<div class="dmeta aqcap">the selection diff could not '
                      f"be built: {html.escape(str(exc)[:200])}</div>")
