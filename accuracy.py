@@ -370,10 +370,20 @@ JITO_TIP_ACCOUNTS = ['96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5', 'HFqU5x63VT
 TIP_ACCOUNTS = frozenset(JITO_TIP_ACCOUNTS
                          + gbxdune.TITAN_TIP_ACCOUNTS
                          + gbxdune.BIFROST_TIP_ACCOUNTS)
+JITO_TIP_SET = frozenset(JITO_TIP_ACCOUNTS)
+
+
+def weigh(fee, jito, builder, bps):
+    """-> (tip, reward) the way the relay scores them: Jito tips at the
+    connector's Jito weight (bps / 10000), builder tips and fees at face
+    value. See score_sql."""
+    tip = int(jito) * int(bps) // 10000 + int(builder)
+    return tip, int(fee) + tip
 
 
 def block_rewards(rpc_url, slot):
-    """-> {signature: {"fee": int, "tip": int, "err": bool}} for one block.
+    """-> {signature: {"fee", "tip", "jito", "builder", "err"}} for one
+    block. `tip` = jito + builder, unweighted; see weigh().
 
     transactionDetails=accounts carries fee, err and the balance arrays
     without the instruction payloads -- 5.5 MB against 0.14 MB for
@@ -402,14 +412,18 @@ def block_rewards(rpc_url, slot):
         meta, inner = tx.get("meta") or {}, tx.get("transaction") or {}
         keys = inner.get("accountKeys") or []
         pre, post = meta.get("preBalances") or [], meta.get("postBalances") or []
-        tip = 0
+        tip = jito = 0
         for i, k in enumerate(keys):
             pk = k.get("pubkey") if isinstance(k, dict) else k
             if pk in TIP_ACCOUNTS and i < len(pre) and i < len(post):
                 # credits only -- a tip account that also pays a fee would
                 # otherwise net its own cost out of someone else's tip
-                tip += max(0, int(post[i]) - int(pre[i]))
-        rec = {"fee": int(meta.get("fee") or 0), "tip": tip,
+                got = max(0, int(post[i]) - int(pre[i]))
+                tip += got
+                if pk in JITO_TIP_SET:
+                    jito += got
+        rec = {"fee": int(meta.get("fee") or 0), "tip": tip, "jito": jito,
+               "builder": tip - jito,
                "err": meta.get("err") is not None}
         for sig in inner.get("signatures") or []:
             out[sig] = rec
@@ -901,7 +915,88 @@ TITAN_PREFIX = "TITAN"
 # -> builder_not_eligible), so including them doubles the row count and
 # adds no selection signal.
 MOCK_MARK = "MOCK"
-BID = "builder_payment + jito_tips + protocol_fees"
+BID = "builder_payment + jito_tips + protocol_fees"     # raw, for display
+
+# -------------------------------------------------- how the relay ranks
+#
+# Not by the raw sum. MiniBlockReward::score (relay messages.rs) is
+#   protocol_fees + jito_tips * weight / 10000 + builder_payment
+# with weight = the connector's Jito weight net of the relay's 600 bps Jito
+# fee. Cogent's is 400 bps, so 2.25M of Jito tips scored 89,835 and a
+# lower raw offer won (460514195 r0: AMS_2 raw 5.65M / score 3.49M lost to
+# TITAN_AMS_3 raw 4.42M / score 4.14M). relay.connector_handshakes records
+# the weight in effect; it changed for every connector at 2026-10-15
+# ~10:09Z (10,000 -> 9,400; Cogent 1,000 -> 400), so each offer is scored
+# with the weight in force at its own timestamp. Unknown connectors get
+# 10,000 - 600.
+DEFAULT_JITO_WEIGHT = 9400
+WEIGHT_TTL_S = 600
+_WEIGHTS = {"at": 0.0, "segs": {}}
+_WEIGHTS_LOCK = threading.Lock()
+
+
+def jito_weights(relay_q):
+    """connector -> [(from_timestamp, bps)], oldest first, cached."""
+    with _WEIGHTS_LOCK:
+        if _WEIGHTS["segs"] and time.time() - _WEIGHTS["at"] < WEIGHT_TTL_S:
+            return _WEIGHTS["segs"]
+    _, rows = relay_q(
+        "SELECT connector_identity, toString(timestamp), jito_tip_weight_bps "
+        "FROM relay.connector_handshakes "
+        "WHERE timestamp > now() - INTERVAL 60 DAY "
+        "ORDER BY connector_identity, timestamp")
+    segs = {}
+    for c, t, w in rows:
+        if not c:
+            continue
+        lst = segs.setdefault(c, [])
+        if not lst or lst[-1][1] != int(w):
+            lst.append((t, int(w)))
+    with _WEIGHTS_LOCK:
+        _WEIGHTS.update(at=time.time(), segs=segs)
+    return segs
+
+
+def round_weight(segs, rnd):
+    """The Jito weight the relay used for this round's offers."""
+    return weight_at(segs, rnd.get("connector", ""),
+                     rnd.get("sub_at") or rnd.get("at") or "")
+
+
+def weight_at(segs, connector, ts):
+    """The weight `connector` had at `ts` (relay timestamp string)."""
+    lst = (segs or {}).get(connector)
+    if not lst:
+        return DEFAULT_JITO_WEIGHT
+    w = lst[0][1]
+    for start, bps in lst:
+        if ts and start <= ts:
+            w = bps
+    return w
+
+
+def score_of(fees, jito, pay, bps):
+    return int(fees) + int(jito) * int(bps) // 10000 + int(pay)
+
+
+def score_sql(relay_q):
+    """SQL for the relay's score of a mini_block_events_v2 row."""
+    try:
+        segs = jito_weights(relay_q)
+    except Exception:
+        segs = {}
+    conds = []
+    for c, lst in segs.items():
+        for i in range(len(lst) - 1, -1, -1):
+            start, bps = lst[i]
+            cond = f"connector_identity = '{_q(c)}'"
+            if i:
+                cond += f" AND timestamp >= '{_q(start)}'"
+            conds.append(f"{cond}, {bps}")
+    w = (f"multiIf({', '.join(conds)}, {DEFAULT_JITO_WEIGHT})" if conds
+         else str(DEFAULT_JITO_WEIGHT))
+    return ("(protocol_fees + intDiv(jito_tips * toUInt64(" + w
+            + "), 10000) + builder_payment)")
 # A rejected rung never competed and the relay keeps no transaction rows for
 # it, so picking one as "our offer" silently diffs the winner against an
 # EMPTY set -- which reads as "Titan included 240 things we didn't" when the
@@ -909,7 +1004,7 @@ BID = "builder_payment + jito_tips + protocol_fees"
 # three reasons mean the offer was actually graded.
 ACCEPTED = "('best', 'not_best', 'tail')"
 
-SEL_COLS = ["fee", "tip", "reward",
+SEL_COLS = ["fee", "tip", "reward", "jito_raw", "jito_weight_bps",
             "slot", "round", "connector", "won_by", "we_won",
             "our_builder", "titan_builder", "builder_id", "verdict",
             "type", "signature", "sigprefix", "bundle_id",
@@ -965,13 +1060,14 @@ def best_offers(relay_q, slots, window, chosen_at=None):
     # close" cannot be expressed as argMax over a per-round bound without
     # a three-way join through round_chosen, which carries no slot
     rows = []
+    score = score_sql(relay_q)
     for i in range(0, len(slots), ENTITY_BATCH):
         lst = ", ".join(str(x) for x in slots[i:i + ENTITY_BATCH])
         _, part = relay_q(
             "SELECT slot, index_in_slot AS idx, builder_id, "
             "  toString(timestamp) AS t, "
             "  toString(mini_block_uuid) AS uuid, "
-            f"  {BID} AS bid, execution_cost AS cost, "
+            f"  {score} AS bid, execution_cost AS cost, "
             "  order_count AS n, reason "
             "FROM relay.mini_block_events_v2 "
             f"WHERE {tb}event = 'submitted' AND slot IN ({lst}) "
@@ -1246,7 +1342,7 @@ def _okey(o):
 
 
 def _sel_rows(rnd, titan_builder, titan_side, our_sides, contents,
-              blk_sigs, rewards=None):
+              blk_sigs, rewards=None, bps=None):
     """The diff itself, at SIGNATURE level.
 
     Not at order-ref level: a transaction can be standalone in one builder's
@@ -1269,7 +1365,7 @@ def _sel_rows(rnd, titan_builder, titan_side, our_sides, contents,
             "our_cost": our["cost"], "titan_cost": titan_side["cost"],
             "our_orders": our["n"], "titan_orders": titan_side["n"],
             "our_reason": our["reason"], "titan_reason": titan_side["reason"],
-            "is_last": rnd["is_last"]}
+            "is_last": rnd["is_last"], "jito_weight_bps": bps}
         if (our["accepted"] and titan_side["accepted"]
                 and not (oset and tset)):
             # Both offers were graded, but one has no stored content. Under
@@ -1301,7 +1397,11 @@ def _sel_rows(rnd, titan_builder, titan_side, our_sides, contents,
                                      titan_builder)):
             pool = oset if verdict == "us_inc_not_titan" else tset
             other = tset if verdict == "us_inc_not_titan" else oset
-            for key in src:
+            # execution order, not set order: set order changes per process
+            # (hash seed), and with it which rows fit under the display cap
+            for key in sorted(src, key=lambda k: (
+                    pool[k]["order_index"], pool[k]["bundle_tx_index"] or 0,
+                    k)):
                 o = pool[key]
                 # A bundle member is one row of the diff, but the reader
                 # needs the bundle it came from: which other members
@@ -1316,7 +1416,7 @@ def _sel_rows(rnd, titan_builder, titan_side, our_sides, contents,
                           "landed": _landed_mark(m, blk_sigs),
                           "in_diff": _okey(m) in src,
                           "shared": _okey(m) in other,
-                          **_reward_of(m, blk_sigs, rewards)}
+                          **_reward_of(m, blk_sigs, rewards, bps)}
                          for m in pool.values()
                          if m["bundle_id"] == o["bundle_id"]),
                         key=lambda m: (m["bundle_tx_index"] is None,
@@ -1329,11 +1429,11 @@ def _sel_rows(rnd, titan_builder, titan_side, our_sides, contents,
                                  bundle_tx_index=o["bundle_tx_index"],
                                  order_index=o["order_index"],
                                  landed=_landed_mark(o, blk_sigs),
-                                 **_reward_of(o, blk_sigs, rewards)))
+                                 **_reward_of(o, blk_sigs, rewards, bps)))
     return rows
 
 
-def _reward_of(o, blk_pfx, rewards):
+def _reward_of(o, blk_pfx, rewards, bps=None):
     """What this order paid, but only if it is in THIS block.
 
     Keyed on the full signature, not the prefix: the prefix is what proves
@@ -1345,14 +1445,17 @@ def _reward_of(o, blk_pfx, rewards):
     0 lamports is a real answer and must not be confused with "no data".
     """
     if not rewards or not o.get("sig"):
-        return {"fee": "", "tip": "", "reward": ""}
+        return {"fee": "", "tip": "", "jito_raw": "", "reward": ""}
     if blk_pfx is not None and o.get("prefix") and o["prefix"] not in blk_pfx:
-        return {"fee": "", "tip": "", "reward": ""}
+        return {"fee": "", "tip": "", "jito_raw": "", "reward": ""}
     rec = rewards.get(o["sig"])
     if not rec:
-        return {"fee": "", "tip": "", "reward": ""}
-    return {"fee": rec["fee"], "tip": rec["tip"],
-            "reward": rec["fee"] + rec["tip"]}
+        return {"fee": "", "tip": "", "jito_raw": "", "reward": ""}
+    bps = DEFAULT_JITO_WEIGHT if bps is None else bps
+    jito = rec.get("jito", 0)
+    tip, reward = weigh(rec["fee"], jito, rec["tip"] - jito, bps)
+    return {"fee": rec["fee"], "tip": tip, "jito_raw": jito,
+            "reward": reward}
 
 
 def packet_bodies(relayer_q, sigs, window=(None, None)):
@@ -1422,12 +1525,15 @@ def price_from_packets(relayer_q, rows, window=(None, None), bodies=None):
         if sig not in want:
             continue
         try:
-            pr = txprice.price(raw, TIP_ACCOUNTS)
+            pr = txprice.price(raw, TIP_ACCOUNTS, JITO_TIP_SET)
         except Exception:
             continue
         for x in want[sig]:
-            x.update(fee=pr["fee"], tip=pr["tip"],
-                     reward=pr["fee"] + pr["tip"], priced="bytes",
+            bps = x.get("jito_weight_bps")
+            tip, reward = weigh(pr["fee"], pr["jito"], pr["builder"],
+                                DEFAULT_JITO_WEIGHT if bps is None else bps)
+            x.update(fee=pr["fee"], tip=tip, jito_raw=pr["jito"],
+                     reward=reward, priced="bytes",
                      tip_lower_bound=bool(pr["lookups"]))
     return rows
 
@@ -1442,13 +1548,11 @@ def _landed_mark(o, blk_pfx):
     return "yes" if o["prefix"] in blk_pfx else "no"
 
 
-def selection_diff(relay_q, ch, rounds_, window, blocks=None,
-                   contents=None, rewards=None, keep=None):
-    """Every us-vs-titan content difference across these rounds.
-
-    `keep`, a dict, receives the compared offers (`plan`) and their full
-    contents, so the CU/reward profile reuses them instead of reading the
-    relay a second time."""
+def offer_plan(relay_q, ch, rounds_, window, blocks=None, contents=None):
+    """-> (plan, contents, pmaps): which offers each round compares --
+    [(round, titan_builder, titan_side, [(our_builder, our_side)])] --
+    and their full contents by uuid. Shared by the diff and the CU/reward
+    profile, so the profile can be built without the diff."""
     slots = {r["slot"] for r in rounds_}
     # The instant the round was decided is when the WINNING OFFER was
     # submitted, not when round_chosen fired. Measured on 457382947 r0
@@ -1479,14 +1583,31 @@ def selection_diff(relay_q, ch, rounds_, window, blocks=None,
     if contents is None:
         contents, _src = order_contents(relay_q, ch, sorted(need), window,
                                         flat)
+    return plan, contents, pmaps
+
+
+def selection_diff(relay_q, ch, rounds_, window, blocks=None,
+                   contents=None, rewards=None, keep=None):
+    """Every us-vs-titan content difference across these rounds.
+
+    `keep`, a dict, receives the compared offers (`plan`) and their full
+    contents, so the CU/reward profile reuses them instead of reading the
+    relay a second time."""
+    plan, contents, pmaps = offer_plan(relay_q, ch, rounds_, window, blocks,
+                                       contents)
     if keep is not None:
         keep.update(plan=plan, contents=contents)
+    try:
+        segs = jito_weights(relay_q)
+    except Exception:
+        segs = {}
     rows = []
     for rnd, tb, tv, ours in plan:
         rows.append(_sel_rows(rnd, tb, tv, ours, contents,
                               pmaps.get(rnd["slot"])
                               if rnd["slot"] in pmaps else None,
-                              (rewards or {}).get(rnd["slot"])))
+                              (rewards or {}).get(rnd["slot"]),
+                              round_weight(segs, rnd)))
     flat_rows = [x for part in rows for x in part]
     # the chunk's own window, so the scan stays narrow even over a range
     attach_notes(ch, flat_rows, *(window or (None, None)))
@@ -1988,7 +2109,11 @@ def _sched_panel(i):
 def _rw_cell(i):
     if i.get("reward") == "" or i.get("reward") is None:
         return '<span class="dim">&mdash;</span>'
-    t = (f' <span class="dim">+{i["tip"]:,} tip</span>' if i.get("tip")
+    jr, bps = i.get("jito_raw") or 0, i.get("jito_weight_bps")
+    tw = (f' title="Jito {jr:,} x {bps}/10000 = {jr * bps // 10000:,}, plus '
+          f'{i["tip"] - jr * bps // 10000:,} to Titan/Bifrost"'
+          if jr and bps is not None else "")
+    t = (f' <span class="dim"{tw}>+{i["tip"]:,} tip</span>' if i.get("tip")
          else "")
     if i.get("priced") == "bytes":
         # Not what changed hands -- what the offered transaction would
@@ -2158,7 +2283,8 @@ def profile_sigs(keep):
     return out
 
 
-def offer_profile(keep, blk_bytes=None, rewards=None, bodies=None):
+def offer_profile(keep, blk_bytes=None, rewards=None, bodies=None,
+                  segs=None):
     """-> [{round, winner, sides: [{kind, builder, won, n, n_sig, recs}]}].
 
     A tx is profiled only if its bytes are somewhere -- the block (landed
@@ -2171,27 +2297,33 @@ def offer_profile(keep, blk_bytes=None, rewards=None, bodies=None):
     blk_bytes, rewards, bodies = blk_bytes or {}, rewards or {}, bodies or {}
     memo = {}
 
-    def rec(sig):
-        if sig in memo:
-            return memo[sig]
+    def rec(sig, bps):
+        if (sig, bps) in memo:
+            return memo[(sig, bps)]
         raw = blk_bytes.get(sig) or bodies.get(sig)
         out = None
         if raw:
             try:
-                pr = txprice.price(raw, TIP_ACCOUNTS)
+                pr = txprice.price(raw, TIP_ACCOUNTS, JITO_TIP_SET)
                 got = rewards.get(sig)
-                fee, tip, src = ((got["fee"], got["tip"], "block") if got
-                                 else (pr["fee"], pr["tip"], "bytes"))
+                if got:
+                    jito = got.get("jito", 0)
+                    fee, builder, src = got["fee"], got["tip"] - jito, "block"
+                else:
+                    fee, jito, builder, src = (pr["fee"], pr["jito"],
+                                               pr["builder"], "bytes")
+                _tip, reward = weigh(fee, jito, builder, bps)
                 out = {"cu": pr["cu"], "explicit": pr["cu_explicit"],
-                       "reward": fee + tip, "src": src,
-                       "density": (fee + tip) / pr["cu"] if pr["cu"] else None}
+                       "reward": reward, "src": src,
+                       "density": reward / pr["cu"] if pr["cu"] else None}
             except Exception:
                 out = None
-        memo[sig] = out
+        memo[(sig, bps)] = out
         return out
 
     prof = []
     for rnd, tb, tv, ours in plan:
+        bps = round_weight(segs or {}, rnd)
         sides = []
         for kind, b, v in [("titan", tb, tv)] + [("ours", b, v)
                                                   for b, v in ours]:
@@ -2202,11 +2334,12 @@ def offer_profile(keep, blk_bytes=None, rewards=None, bodies=None):
             sides.append({"kind": kind, "builder": b,
                           "won": b == rnd["winner"], "n": len(items),
                           "n_sig": len(sigs),
-                          "recs": [r for r in map(rec, sigs) if r]})
+                          "recs": [r for r in (rec(x, bps) for x in sigs)
+                                   if r]})
         if (any(x["kind"] == "titan" for x in sides)
                 and any(x["kind"] == "ours" for x in sides)):
             prof.append({"round": rnd["idx"], "winner": rnd["winner"],
-                         "sides": sides})
+                         "jito_weight_bps": bps, "sides": sides})
     prof.sort(key=lambda r: r["round"])
     return prof
 
@@ -2359,7 +2492,8 @@ def profile_html(prof):
            '<div class="dmeta aqcap">Declared CU is the transaction\'s own '
            "SetComputeUnitLimit, or Agave's default when it sets none "
            "(3,000 per builtin instruction, 200,000 per other, capped at "
-           "1.4M). Reward is fee + tips to Jito/Titan/Bifrost tip accounts: "
+           "1.4M). Reward is scored the relay's way: fee + Titan/Bifrost tips "
+           "+ Jito tips &times; the connector's Jito weight / 10000 &mdash; "
            "what the block paid when it landed in this slot, otherwise what "
            "its bytes would pay. Only transactions whose bytes we have "
            "count &mdash; the block or our relayer's packet log; most "
@@ -2374,6 +2508,7 @@ def profile_html(prof):
         sides = r["sides"]
         out.append(f'<div class="selblk"><div class="selhead"><b>r{r["round"]}'
                    f'</b> &middot; won by {html.escape(r["winner"] or "?")} '
+                   f'&middot; Jito weight {r["jito_weight_bps"]:,} bps '
                    '&middot; <span class="pfkey ti"></span>Titan '
                    '<span class="pfkey us"></span>Astralane</div>'
                    '<div class="pfcharts">'
@@ -2406,7 +2541,8 @@ def copy_sel(rows, label):
 
 TL_SHOW = 80
 TL_COLS = ["slot", "round", "t_ms", "builder_id", "ours", "chosen",
-           "bid", "builder_payment", "jito_tips", "protocol_fees",
+           "relay_score", "raw_sum", "jito_weight_bps",
+           "builder_payment", "jito_tips", "protocol_fees",
            "execution_cost", "order_count", "reason", "uuid", "at"]
 
 
@@ -2460,7 +2596,7 @@ def timeline_slots(relay_q, r, cap=MAX_SLOTS, region="all", connector="",
     sub_w, _ = _bounds(r)[1], None
     _, rows = relay_q(
         "SELECT slot, index_in_slot AS idx, builder_id, count() AS offers, "
-        f"  max({BID}) AS best_bid, max(order_count) AS n, "
+        f"  max({score_sql(relay_q)}) AS best_bid, max(order_count) AS n, "
         "  toString(min(timestamp)) AS first_t, "
         "  toString(max(timestamp)) AS last_t "
         "FROM relay.mini_block_events_v2 "
@@ -2571,7 +2707,7 @@ def slot_timeline(relay_q, slot, window, region="all"):
         "  toString(timestamp) AS t, builder_payment AS pay, "
         "  jito_tips AS jito, protocol_fees AS fees, "
         "  execution_cost AS cost, order_count AS n, reason, "
-        "  toString(mini_block_uuid) AS uuid, is_last "
+        "  toString(mini_block_uuid) AS uuid, is_last, connector_identity "
         f"FROM relay.mini_block_events_v2 WHERE {tb} AND slot = {int(slot)}"
         f"{_region_sql(region)} ORDER BY idx, t")
     # round_chosen carries no slot, so the winner is the chosen uuid
@@ -2582,8 +2718,13 @@ def slot_timeline(relay_q, slot, window, region="all"):
         f"  AND event = 'round_chosen'{_region_sql(region)}")
     chosen = {u: t for u, t in ch_rows if u}
 
+    try:
+        segs = jito_weights(relay_q)
+    except Exception:
+        segs = {}
     rounds_ = {}
-    for idx, ev, bld, t, pay, jito, fees, cost, n, reason, uuid, is_last in rows:
+    for (idx, ev, bld, t, pay, jito, fees, cost, n, reason, uuid, is_last,
+         conn) in rows:
         i = int(idx)
         d = rounds_.setdefault(i, {"idx": i, "opened": "", "offers": [],
                                    "sealed": "", "tail": "",
@@ -2600,11 +2741,14 @@ def slot_timeline(relay_q, slot, window, region="all"):
         if ev != "submitted":
             continue
         d["is_last"] = d["is_last"] or str(is_last).lower() in ("1", "true")
+        bps = weight_at(segs, conn, t)
         d["offers"].append({
             "at": t, "builder": bld or "", "uuid": uuid or "",
             "pay": int(pay or 0), "jito": int(jito or 0),
-            "fees": int(fees or 0),
-            "bid": int(pay or 0) + int(jito or 0) + int(fees or 0),
+            "fees": int(fees or 0), "jito_w": bps,
+            # what the relay ranks on; `raw` is the plain sum
+            "bid": score_of(fees or 0, jito or 0, pay or 0, bps),
+            "raw": int(pay or 0) + int(jito or 0) + int(fees or 0),
             "cost": int(cost or 0), "n": int(n or 0),
             "reason": reason or ""})
     out = []
@@ -2769,10 +2913,12 @@ def race_html(tl):
         '<div class="racewrap"><div class="dtlhead">the race'
         f'<span class="note">{n:,} offers across {len(data)} rounds '
         "&middot; time runs down, one column per builder, one bullet per "
-        "offer &middot; hover a bullet for the bid and the order count"
+        "offer &middot; hover a bullet for the bid and the order count "
+        "&middot; every bid is the relay's score: Jito tips count at the "
+        "connector's Jito weight, not at face value"
         "</span></div>"
         f'<div class="olegend">{legend}'
-        '<span class="omark"><i class="omk ohalo2"></i>highest bid</span>'
+        '<span class="omark"><i class="omk ohalo2"></i>highest relay score</span>'
         '<span class="omark"><i class="omk owon2"></i>chosen by the relay'
         "</span></div>"
         '<div class="ozoomall"><span>zoom every round</span>'
@@ -2815,7 +2961,8 @@ def _tl_csv(slot, rnd):
             slot, rnd["idx"],
             "" if o["t_ms"] is None else f"{o['t_ms']:.1f}",
             o["builder"], "yes" if _is_ours(o["builder"]) else "no",
-            "yes" if o["chosen"] else "no", o["bid"], o["pay"], o["jito"],
+            "yes" if o["chosen"] else "no", o["bid"],
+            o.get("raw", o["bid"]), o.get("jito_w", ""), o["pay"], o["jito"],
             o["fees"], o["cost"], o["n"], o["reason"], o["uuid"], o["at"])))
     return "\n".join(lines)
 
@@ -2853,27 +3000,34 @@ def timeline_html(d):
         rowsh = []
         for o in _tl_window(rnd["offers"]):
             if o is None:                       # the elided middle
-                rowsh.append('<tr class="tlgap"><td colspan=7>'
+                rowsh.append('<tr class="tlgap"><td colspan=8>'
                              "&middot;&middot;&middot;</td></tr>")
                 continue
             pct = max(0.0, min(100.0, 100.0 * (o["t_ms"] or 0) / span))
             mine = _is_ours(o["builder"])
+            raw = o.get("raw", o["bid"])
+            why = (f"protocol fees {o.get('fees', 0):,} + Jito "
+                   f"{o.get('jito', 0):,} x {o.get('jito_w', '?')}/10000 + "
+                   f"builder payment {o.get('pay', 0):,}")
+            tms = "&mdash;" if o["t_ms"] is None else f"+{o['t_ms']:.0f}"
+            star = (' <span class="tlstar">chosen</span>' if o["chosen"]
+                    else "")
             rowsh.append(
-                "<tr%s><td class=\"n\">%s</td>"
-                '<td class="%s">%s</td><td class="n">%s</td>'
-                '<td class="n">%s</td><td class="n">%s</td>'
-                '<td>%s</td><td class="tlbar"><i style="width:%.1f%%"></i>'
-                "</td></tr>" % (
-                    ' class="tlwin"' if o["chosen"] else "",
-                    "&mdash;" if o["t_ms"] is None else f"+{o['t_ms']:.0f}",
-                    "ours" if mine else "",
-                    html.escape(o["builder"])
-                    + (' <span class="tlstar">chosen</span>'
-                       if o["chosen"] else ""),
-                    f"{o['bid']:,}", f"{o['cost']:,}", f"{o['n']:,}",
-                    html.escape(o["reason"]), pct))
+                f'<tr{" class=\"tlwin\"" if o["chosen"] else ""}>'
+                f'<td class="n">{tms}</td>'
+                f'<td class="{"ours" if mine else ""}">'
+                f'{html.escape(o["builder"])}{star}</td>'
+                f'<td class="n" title="{html.escape(why)}">{o["bid"]:,}</td>'
+                f'<td class="n dim">{raw:,}</td>'
+                f'<td class="n">{o["cost"]:,}</td><td class="n">{o["n"]:,}</td>'
+                f'<td>{html.escape(o["reason"])}</td>'
+                f'<td class="tlbar"><i style="width:{pct:.1f}%"></i></td></tr>')
         out.append('<table class="otab tltab"><tr><th>t +ms</th>'
-                   "<th>builder</th><th>bid</th><th>exec cost</th>"
+                   '<th>builder</th><th title="what the relay ranks on: '
+                   "protocol fees + Jito tips x the connector's Jito weight "
+                   '/ 10000 + builder payment">relay score</th>'
+                   '<th title="protocol fees + Jito tips + builder payment, '
+                   'Jito unweighted">raw</th><th>exec cost</th>'
                    "<th>orders</th><th>graded</th><th></th></tr>"
                    + "".join(rowsh) + "</table>")
         if n > TL_SHOW:
@@ -2926,7 +3080,7 @@ def timeline_table_html(r, slots, shown, total, ours_re, slot_ref=None):
            "round.</div>",
            '<table class="atab2"><tr><th>slot</th><th class="n">rounds</th>'
            '<th class="n">offers</th><th>builders</th>'
-           '<th class="n">best bid</th></tr>'
+           '<th class="n" title="the highest relay score offered: protocol fees + Jito tips x the connector\'s Jito weight / 10000 + builder payment">best score</th></tr>'
            '<tbody id="aqbody" data-metric="timeline" '
            'data-frag="/tech/offer-timelines/slot" '
            f'data-region="{html.escape(r["region"])}">']

@@ -236,8 +236,11 @@ def _parse_legacy_v0(raw):
             "cu_limit": cu_limit, "has_lookups": has_lookups}
 
 
-def price(raw, tip_accounts):
-    """-> {"fee", "tip", "version", "lookups", "cu", "cu_explicit", "sig"}.
+def price(raw, tip_accounts, jito_accounts=frozenset()):
+    """-> {"fee", "tip", "jito", "builder", "version", "lookups", "cu",
+    "cu_explicit", "sig"}. `jito`/`builder` split `tip` by whether the
+    destination is in `jito_accounts` -- the relay weighs only the Jito
+    part (by the connector's Jito weight).
 
     `fee` is what the payer pays: base fee per signature plus the priority
     fee -- the same quantity `getBlock` reports as meta.fee for a landed
@@ -246,7 +249,7 @@ def price(raw, tip_accounts):
     resolves accounts through address tables, in which case a tip to one of
     those cannot be seen from the packet and `tip` is a lower bound."""
     t = parse(raw)
-    tip = 0
+    tip = jito = 0
     for prog, accts, data in t["instructions"]:
         if prog != SYSTEM_PROGRAM or len(data) < 12 or len(accts) < 2:
             continue
@@ -254,8 +257,12 @@ def price(raw, tip_accounts):
             continue
         dest = accts[1]
         if dest < len(t["keys"]) and t["keys"][dest] in tip_accounts:
-            tip += struct.unpack("<Q", data[4:12])[0]
+            amount = struct.unpack("<Q", data[4:12])[0]
+            tip += amount
+            if t["keys"][dest] in jito_accounts:
+                jito += amount
     return {"fee": LAMPORTS_PER_SIGNATURE * t["n_sigs"] + t["priority_fee"],
-            "tip": tip, "version": t["version"], "lookups": t["has_lookups"],
+            "tip": tip, "jito": jito, "builder": tip - jito,
+            "version": t["version"], "lookups": t["has_lookups"],
             "cu": t["declared_cu"], "cu_explicit": t["cu_limit"] is not None,
             "sig": t["sig"]}
