@@ -1004,7 +1004,8 @@ def score_sql(relay_q):
 # three reasons mean the offer was actually graded.
 ACCEPTED = "('best', 'not_best', 'tail')"
 
-SEL_COLS = ["fee", "tip", "reward", "jito_raw", "jito_weight_bps",
+SEL_COLS = ["kind", "received_by_us",
+            "fee", "tip", "reward", "jito_raw", "jito_weight_bps",
             "wait_us",
             "slot", "round", "connector", "won_by", "we_won",
             "our_builder", "titan_builder", "builder_id", "verdict",
@@ -1277,10 +1278,6 @@ def attach_recv(ch, rows, slot, lo=None, hi=None, round_of=lambda x: x["round"],
     means it arrived before that round opened -- normal for a round that
     is not the slot's first."""
     marks = round_marks(ch, slot, lo, hi)
-    if not marks:
-        for x in rows:
-            x.setdefault("recv", {})
-        return rows
     ents = set()
     for x in rows:
         ents.update(k for k in (prefix_of(x), bundle_of(x)) if k)
@@ -1291,6 +1288,8 @@ def attach_recv(ch, rows, slot, lo=None, hi=None, round_of=lambda x: x["round"],
             for inst, (t, w, src) in (recv.get(key) or {}).items():
                 if inst not in got or t < got[inst][0]:
                     got[inst] = (t, w, src, kind)
+        # any builder instance at all, round marks or not: "did we get it"
+        x["received_by_us"] = bool(got)
         rec = {}
         for inst, (t, w, src, kind) in got.items():
             m = marks.get((inst, int(round_of(x))))
@@ -1342,6 +1341,72 @@ def _recv_cells(x, prefer=None):
     return (cell(after, " neg" if after < 0 else " pos")
             + cell(before, " neg" if before is not None and before < 0 else "")
             + wcell)
+
+
+def _sched_key(x):
+    """The row's scheduler verdicts as filter keys, "event:reason|..."."""
+    pairs = _sched_pairs(x)
+    return "|".join(f"{e}:{r}" for e, r in pairs) if pairs else "__none"
+
+
+def _sched_label(k):
+    if k == "__none":
+        return "nothing logged"
+    e, _, r = k.partition(":")
+    return f"{e} {r}".strip()
+
+
+def _kind_mix(group, verdict="titan_inc_not_us"):
+    """One line: what share of this verdict's rows were bundle / txn,
+    and how many of them any builder of ours received."""
+    rows = [i for i in group if i["verdict"] == verdict]
+    if not rows:
+        return ""
+    n = len(rows)
+    c = collections.Counter(i.get("kind") or "txn" for i in rows)
+    got = sum(1 for i in rows if i.get("received_by_us"))
+    mix = " &middot; ".join(
+        f'<span class="kd {k}">{k}</span> {c[k]:,} ({100 * c[k] / n:.0f}%)'
+        for k in ("txn", "bundle") if c[k])
+    return (f'<div class="selcnt"><span class="vd ti">{verdict}</span> '
+            f"by type: {mix} &middot; received by us "
+            f'<b>{got:,}</b> of {n:,} ({100 * got / n:.0f}%) '
+            '<span class="dim">(a scheduler/received on any builder of '
+            "ours, for the tx or its bundle)</span></div>")
+
+
+def _sel_filters(rows):
+    """Per-slot filters over every diff row: verdict, kind, and what the
+    scheduler said -- each option with its count. Applied in the browser
+    (ACCURACY_JS); while one is set the 40-row cap is lifted."""
+    real = [i for i in rows
+            if i["verdict"] in ("titan_inc_not_us", "us_inc_not_titan")]
+    if not real:
+        return ""
+    vc = collections.Counter(i["verdict"] for i in real)
+    kc = collections.Counter(i.get("kind") or "txn" for i in real)
+    sc = collections.Counter()
+    for i in real:
+        for k in _sched_key(i).split("|"):
+            sc[k] += 1
+    vopts = "".join(f'<option value="{v}">{v} ({vc[v]:,})</option>'
+                    for v in ("titan_inc_not_us", "us_inc_not_titan")
+                    if vc[v])
+    kbox = "".join(
+        f'<label class="sfk"><input type="checkbox" class="sf-t" '
+        f'value="{k}" checked> <span class="kd {k}">{k}</span> '
+        f'({kc[k]:,})</label>' for k in ("txn", "bundle") if kc[k])
+    sopts = "".join(
+        f'<option value="{html.escape(k, quote=True)}">'
+        f"{html.escape(_sched_label(k))} ({n:,})</option>"
+        for k, n in sorted(sc.items(), key=lambda kv: -kv[1]))
+    return ('<div class="selfilt"><span class="dim">filter</span> '
+            f'<label>verdict <select class="sf-v"><option value="">both '
+            f"({len(real):,})</option>{vopts}</select></label> "
+            f'<span class="sfks">{kbox}</span> '
+            '<label>scheduler said <select class="sf-s"><option value="">'
+            f"anything</option>{sopts}</select></label> "
+            '<span class="sf-n dim"></span></div>')
 
 
 def _sched_pairs(x):
@@ -1638,6 +1703,9 @@ def selection_diff(relay_q, ch, rounds_, window, blocks=None,
     lo, hi = window or (None, None)
     for sl in {x["slot"] for x in flat_rows}:
         attach_recv(ch, [x for x in flat_rows if x["slot"] == sl], sl, lo, hi)
+    for x in flat_rows:
+        x["kind"] = ("bundle" if x.get("bundle_id") or x.get("type") == "bundle"
+                     else "txn")
     return flat_rows
 
 
@@ -2055,9 +2123,15 @@ def _sel_table(group):
         # of the same bundle -- see the hover handler in ACCURACY_JS.
         battr = (f' data-b="{html.escape(i["bundle_id"], quote=True)}"'
                  if i["bundle_id"] else "")
+        kind = i.get("kind") or "txn"
+        battr += (f' data-v="{i["verdict"]}" data-k="{kind}" '
+                  f'data-s="{html.escape(_sched_key(i), quote=True)}"')
         out.append(f'<tr{battr}{extra}><td class="n">{i["order_index"]}</td>'
                    f'<td><span class="vd {vcls}">{i["verdict"]}</span></td>'
-                   f'<td>{html.escape(i["type"])}</td>'
+                   f'<td class="kd {kind}"'
+                   + ('' if i.get("received_by_us") else
+                      ' title="no scheduler/received on any of our builders"')
+                   + f'>{kind}{"" if i.get("received_by_us") else " <i>unseen</i>"}</td>'
                    f'<td>{copy_val(i["signature"])}</td>'
                    f'<td>{copy_val(i["sigprefix"])}</td>'
                    f"<td>{bid}</td>"
@@ -2249,7 +2323,8 @@ def selection_html(rows, slot):
 
     out = ['<div class="selsec"><div class="seltitle">winner_inc_metric '
            '<span class="dim">&mdash; every round, both directions</span> '
-           + copy_sel(rows, f"copy {len(rows):,} as CSV") + "</div>"]
+           + copy_sel(rows, f"copy {len(rows):,} as CSV") + "</div>"
+           + _sel_filters(rows)]
     for key in sorted(groups):
         g = groups[key]
         extra = ""
@@ -2260,7 +2335,7 @@ def selection_html(rows, slot):
                      "rival's losing rung</div>")
         out.append('<div class="selblk">' + _sel_head(g[0])
                    + f'<div class="selcnt">{_sel_counts(g)}</div>'
-                   + extra + _sel_table(g) + "</div>")
+                   + _kind_mix(g) + extra + _sel_table(g) + "</div>")
     out.append("</div>")
 
     lost = [x for x in rows if not x["we_won"]]
@@ -3504,6 +3579,14 @@ CSS = """
 .redn{color:#fca5a5}
 .otab td.neg{color:#fbbf24}
 .otab td.held{color:#c4b5fd}
+.kd{font:11px ui-monospace,Menlo,monospace}
+.kd.bundle{color:#c4b5fd}.kd.txn{color:#dbe4ee}
+td.kd i{font-style:normal;color:#f87171;font-size:10px;margin-left:4px}
+.selfilt{display:flex;flex-wrap:wrap;gap:10px 14px;align-items:center;
+  margin:6px 0 10px;padding:6px 10px;border:1px solid #1e293b;
+  border-radius:6px;font-size:12px}
+.selfilt select{margin-left:4px;max-width:340px}
+.sfk{cursor:pointer;white-space:nowrap}
 .pfcharts{display:flex;flex-wrap:wrap;gap:18px;margin:6px 0 8px}
 .pfchart{min-width:0}
 .pftitle{font-size:12px;color:#dbe4ee;margin-bottom:2px}
@@ -3837,6 +3920,51 @@ ACCURACY_JS = r'''
   });
 })();
 
+
+(function(){
+  // Per-slot diff filters (verdict, kind, what the scheduler said). The
+  // diff ships with a 40-row cap; while any filter is set the cap is
+  // lifted and rows are shown by the filter alone. Back at the defaults,
+  // the cap comes back unless "show all" was already pressed.
+  function apply(bar){
+    var sec = bar.closest('.selsec');
+    if (!sec) return;
+    var v = bar.querySelector('.sf-v').value;
+    var s = bar.querySelector('.sf-s').value;
+    var boxes = bar.querySelectorAll('.sf-t');
+    var kinds = [].filter.call(boxes, function(b){ return b.checked; })
+                  .map(function(b){ return b.value; });
+    var active = !!(v || s || kinds.length !== boxes.length);
+    var shown = 0, total = 0;
+    sec.querySelectorAll('table.otab').forEach(function(tab){
+      var note = tab.nextElementSibling;
+      var capped = !!(note && note.classList.contains('more'));
+      if (capped) note.hidden = active;
+      var parentHidden = false;
+      tab.querySelectorAll('tr').forEach(function(tr){
+        if (tr.hasAttribute('data-v')) {
+          total++;
+          var ok = (!v || tr.getAttribute('data-v') === v)
+            && kinds.indexOf(tr.getAttribute('data-k')) >= 0
+            && (!s || ('|' + tr.getAttribute('data-s') + '|')
+                        .indexOf('|' + s + '|') >= 0);
+          if (active) tr.hidden = !ok;
+          else tr.hidden = capped && tr.classList.contains('selx');
+          parentHidden = tr.hidden;
+          if (!tr.hidden && (!active || ok)) shown++;
+        } else if (tr.classList.contains('sxrow') && parentHidden) {
+          tr.hidden = true;       // an open panel goes with its row
+        }
+      });
+    });
+    var n = bar.querySelector('.sf-n');
+    if (n) n.textContent = active ? (shown + ' of ' + total + ' rows match') : '';
+  }
+  document.addEventListener('change', function(ev){
+    var bar = ev.target.closest && ev.target.closest('.selfilt');
+    if (bar) apply(bar);
+  });
+})();
 '''
 
 
