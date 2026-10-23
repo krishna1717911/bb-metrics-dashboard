@@ -9445,15 +9445,18 @@ def accuracy_slot_html(qs):
     if metric not in accuracy.METRICS:
         metric = accuracy.LANDING
     body, sigs, rew = "", None, None
-    # One block fetch for every metric: transactionDetails=accounts carries
-    # the signatures as well, so it answers "did it land" and "what did it
-    # pay" together -- and the CU/reward profile, shown under every metric,
-    # needs the payments.
-    try:
-        rew = accuracy.block_rewards(SOLANA_RPC, slot)
-        sigs = set(rew) or None
-    except Exception:
-        rew = None
+    win = accuracy._chunk_window(rows)
+    if metric == accuracy.PROFILE:
+        return _profile_slot_html(slot, rows, win)
+    if metric in (accuracy.SELECTION, accuracy.BOTH):
+        # one fetch, not two: transactionDetails=accounts carries the
+        # signatures as well, so it answers "did it land" and "what did it
+        # pay" together
+        try:
+            rew = accuracy.block_rewards(SOLANA_RPC, slot)
+            sigs = set(rew) or None
+        except Exception:
+            rew = None
     if metric in (accuracy.LANDING, accuracy.BOTH):
         # its own block read, not `sigs`: the reward map is keyed on EVERY
         # signature of a multi-signer tx (745 keys for 677 txs) and carries
@@ -9462,28 +9465,41 @@ def accuracy_slot_html(qs):
                                  rows, None)
         sigs = d.get("block_sigs") or sigs
         body += accuracy.detail_html(d)
-    win = accuracy._chunk_window(rows)
-    keep, sel = {}, None
     if metric in (accuracy.SELECTION, accuracy.BOTH):
         try:
             sel = accuracy.slot_selection(relay, clickhouse_main,
-                                          SOLANA_RPC, slot, rows, sigs, rew,
-                                          keep=keep)
+                                          SOLANA_RPC, slot, rows, sigs, rew)
+            # Orders the block could not price (they did not land) get
+            # their fee and tip from our relayer's packet log. Without
+            # RELAYER_URL, or a packet it never saw, the cell stays blank.
+            try:
+                accuracy.price_from_packets(relayer, sel, win)
+            except Exception:
+                pass
+            body += accuracy.selection_html(sel, slot)
         except Exception as exc:
             body += ('<div class="dmeta aqcap">the selection diff could not '
                      f"be built: {html.escape(str(exc)[:200])}</div>")
-    if not keep:
-        # landing-only view: the same offer pairing the diff uses, without
-        # the diff's annotation lookups
-        try:
-            plan, contents, _pm = accuracy.offer_plan(
-                relay, clickhouse_main, rows, win, blocks={slot: sigs})
-            keep = {"plan": plan, "contents": contents}
-        except Exception:
-            keep = {}
-    # Bytes for the CU/reward profile: the block for what landed here, our
-    # relayer's packet log for the rest. Both optional -- without them the
-    # profile just prices fewer transactions.
+    return body
+
+
+def _profile_slot_html(slot, rows, win):
+    """The "declared CU / reward graph" metric: only the profile -- the
+    same offer pairing the diff uses, without the diff."""
+    try:
+        rew = accuracy.block_rewards(SOLANA_RPC, slot)
+    except Exception:
+        rew = None
+    try:
+        plan, contents, _pm = accuracy.offer_plan(
+            relay, clickhouse_main, rows, win,
+            blocks={slot: (set(rew) or None) if rew else None})
+        keep = {"plan": plan, "contents": contents}
+    except Exception as exc:
+        return ('<div class="dmeta aqcap">the offers could not be read: '
+                f"{html.escape(str(exc)[:200])}</div>")
+    # bytes: the block for what landed here, our relayer's packet log for
+    # the rest; both optional, without them fewer transactions are priced
     try:
         blk_bytes = accuracy.block_tx_bytes(SOLANA_RPC, slot)
     except Exception:
@@ -9493,26 +9509,16 @@ def accuracy_slot_html(qs):
             relayer, accuracy.profile_sigs(keep) - set(blk_bytes), win)
     except Exception:
         bodies = {}
-    if sel is not None:
-        # Orders the block could not price (they did not land) get their
-        # fee and tip from the packet log's bytes. Without RELAYER_URL, or
-        # a packet it never saw, the cell stays blank.
-        try:
-            accuracy.price_from_packets(relayer, sel, win, bodies=bodies)
-        except Exception:
-            pass
-        body += accuracy.selection_html(sel, slot)
     try:
-        try:
-            segs = accuracy.jito_weights(relay)
-        except Exception:
-            segs = {}
-        body += accuracy.profile_html(accuracy.offer_profile(
+        segs = accuracy.jito_weights(relay)
+    except Exception:
+        segs = {}
+    try:
+        return accuracy.profile_html(accuracy.offer_profile(
             keep, blk_bytes, rew, bodies, segs))
     except Exception as exc:
-        body += ('<div class="dmeta aqcap">the CU/reward profile could not '
-                 f"be built: {html.escape(str(exc)[:200])}</div>")
-    return body
+        return ('<div class="dmeta aqcap">the CU/reward profile could not '
+                f"be built: {html.escape(str(exc)[:200])}</div>")
 
 
 def _slot_ref():

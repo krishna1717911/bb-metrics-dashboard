@@ -1680,6 +1680,7 @@ def relay_tx_lag(relay_q):
 LANDING = "landing"
 SELECTION = "selection"
 BOTH = "both"
+PROFILE = "profile"
 # The wording is the user's: "won but not landed" and "winner txn vs ours
 # diff". Kept verbatim so the control reads the way the question is asked.
 TIMELINE = "timeline"
@@ -1891,7 +1892,8 @@ def _region_select(cur):
     return f"<label>region<select name=region>{opts}</select></label>"
 METRICS = {LANDING: "won but not landed",
            SELECTION: "winner txn vs ours diff",
-           BOTH: "both"}
+           BOTH: "both",
+           PROFILE: "declared CU / reward graph"}
 # which export kind each metric offers
 METRIC_KIND = {LANDING: "misses", SELECTION: "selection"}
 
