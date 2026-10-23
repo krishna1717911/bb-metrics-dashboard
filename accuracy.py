@@ -1392,6 +1392,11 @@ def _sel_filters(rows):
     vopts = "".join(f'<option value="{v}">{v} ({vc[v]:,})</option>'
                     for v in ("titan_inc_not_us", "us_inc_not_titan")
                     if vc[v])
+    oc = collections.Counter(i.get("our_builder") or "" for i in real)
+    oopts = "".join(
+        f'<option value="{html.escape(b, quote=True)}" '
+        f'data-l="{html.escape(b, quote=True)}">{html.escape(b)} '
+        f"({n:,})</option>" for b, n in sorted(oc.items()) if b)
     kbox = "".join(
         f'<label class="sfk"><input type="checkbox" class="sf-t" '
         f'value="{k}" checked> <span class="kd {k}">{k}</span> '
@@ -1405,6 +1410,9 @@ def _sel_filters(rows):
     return ('<div class="selfilt"><span class="dim">filter</span> '
             f'<label>verdict <select class="sf-v"><option value="">both '
             f"({len(real):,})</option>{vopts}</select></label> "
+            '<label>our builder <select class="sf-o"><option value="">'
+            f"all</option>{oopts}"
+            "</select></label> "
             f'<span class="sfks">{kbox}</span> '
             '<label>scheduler said <select class="sf-s"><option value="">'
             f"anything</option>{sopts}</select></label> "
@@ -2127,6 +2135,7 @@ def _sel_table(group):
                  if i["bundle_id"] else "")
         kind = i.get("kind") or "txn"
         battr += (f' data-v="{i["verdict"]}" data-k="{kind}" '
+                  f'data-o="{html.escape(i.get("our_builder") or "", quote=True)}" '
                   f'data-s="{html.escape(_sched_key(i), quote=True)}"')
         out.append(f'<tr{battr}{extra}><td class="n">{i["order_index"]}</td>'
                    f'<td><span class="vd {vcls}">{i["verdict"]}</span></td>'
@@ -2335,7 +2344,9 @@ def selection_html(rows, slot):
                      "the losing side &mdash; our own store keeps the "
                      "winner announcement and our offers, never a "
                      "rival's losing rung</div>")
-        out.append('<div class="selblk">' + _sel_head(g[0])
+        out.append('<div class="selblk" data-o="'
+                   + html.escape(g[0].get("our_builder") or "", quote=True)
+                   + '">' + _sel_head(g[0])
                    + f'<div class="selcnt">{_sel_counts(g)}</div>'
                    + _kind_mix(g) + extra + _sel_table(g) + "</div>")
     out.append("</div>")
@@ -3933,10 +3944,15 @@ ACCURACY_JS = r'''
     if (!sec) return;
     var v = bar.querySelector('.sf-v').value;
     var s = bar.querySelector('.sf-s').value;
+    var ob = bar.querySelector('.sf-o');
+    var o = ob ? ob.value : '';
+    sec.querySelectorAll('.selblk[data-o]').forEach(function(blk){
+      blk.hidden = !!o && blk.getAttribute('data-o') !== o;
+    });
     var boxes = bar.querySelectorAll('.sf-t');
     var kinds = [].filter.call(boxes, function(b){ return b.checked; })
                   .map(function(b){ return b.value; });
-    var active = !!(v || s || kinds.length !== boxes.length);
+    var active = !!(v || s || o || kinds.length !== boxes.length);
     var shown = 0, total = 0;
     sec.querySelectorAll('table.otab').forEach(function(tab){
       var note = tab.nextElementSibling;
@@ -3947,6 +3963,7 @@ ACCURACY_JS = r'''
         if (tr.hasAttribute('data-v')) {
           total++;
           var ok = (!v || tr.getAttribute('data-v') === v)
+            && (!o || tr.getAttribute('data-o') === o)
             && kinds.indexOf(tr.getAttribute('data-k')) >= 0
             && (!s || ('|' + tr.getAttribute('data-s') + '|')
                         .indexOf('|' + s + '|') >= 0);
@@ -3961,14 +3978,18 @@ ACCURACY_JS = r'''
     });
     var n = bar.querySelector('.sf-n');
     if (n) n.textContent = active ? (shown + ' of ' + total + ' rows match') : '';
-    recount(bar, sec, v);
+    recount(bar, sec, v, o);
   }
-  // Verdict is the population: type and scheduler counts are taken over
-  // the rows of the chosen verdict alone, not narrowed by each other.
-  function recount(bar, sec, v){
-    var kc = {}, sc = {};
+  // Verdict and our builder are the population: type and scheduler counts
+  // are taken over those rows alone, not narrowed by each other. The
+  // builder counts follow the verdict.
+  function recount(bar, sec, v, o){
+    var kc = {}, sc = {}, oc = {};
     sec.querySelectorAll('tr[data-v]').forEach(function(tr){
       if (v && tr.getAttribute('data-v') !== v) return;
+      var ob = tr.getAttribute('data-o');
+      oc[ob] = (oc[ob] || 0) + 1;
+      if (o && ob !== o) return;
       var k = tr.getAttribute('data-k');
       kc[k] = (kc[k] || 0) + 1;
       tr.getAttribute('data-s').split('|').forEach(function(x){
@@ -3979,10 +4000,15 @@ ACCURACY_JS = r'''
       var c = b.parentNode.querySelector('.sf-c');
       if (c) c.textContent = (kc[b.value] || 0).toLocaleString();
     });
-    bar.querySelectorAll('.sf-s option[data-l]').forEach(function(o){
-      var c = sc[o.value] || 0;
-      o.textContent = o.getAttribute('data-l') + ' (' + c.toLocaleString() + ')';
-      o.disabled = c === 0 && !o.selected;
+    bar.querySelectorAll('.sf-s option[data-l]').forEach(function(op){
+      var c = sc[op.value] || 0;
+      op.textContent = op.getAttribute('data-l') + ' (' + c.toLocaleString() + ')';
+      op.disabled = c === 0 && !op.selected;
+    });
+    bar.querySelectorAll('.sf-o option[data-l]').forEach(function(op){
+      var c = oc[op.value] || 0;
+      op.textContent = op.getAttribute('data-l') + ' (' + c.toLocaleString() + ')';
+      op.disabled = c === 0 && !op.selected;
     });
   }
   document.addEventListener('change', function(ev){
