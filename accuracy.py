@@ -1005,6 +1005,7 @@ def score_sql(relay_q):
 ACCEPTED = "('best', 'not_best', 'tail')"
 
 SEL_COLS = ["fee", "tip", "reward", "jito_raw", "jito_weight_bps",
+            "wait_us",
             "slot", "round", "connector", "won_by", "we_won",
             "our_builder", "titan_builder", "builder_id", "verdict",
             "type", "signature", "sigprefix", "bundle_id",
@@ -1232,8 +1233,11 @@ def round_marks(ch, slot, lo=None, hi=None):
 
 
 def received_at(ch, entities, lo=None, hi=None):
-    """{entity: {instance: first scheduler/received ts}} for SigPrefixes
-    and bundle ids -- an order is logged once per instance at admission."""
+    """{entity: {instance: (first scheduler/received ts, wait_us, source)}}
+    for SigPrefixes and bundle ids -- an order is logged once per instance
+    at admission. wait_us is the relay's hold (nums['wait_us'], builder
+    main >= #117); None when that admission did not log the key, which is
+    not the same as a zero hold."""
     out = {}
     ents = sorted({e for e in entities if e})
     if not ents:
@@ -1245,14 +1249,18 @@ def received_at(ch, entities, lo=None, hi=None):
         lst = ", ".join("'%s'" % _q(e) for e in ents[i:i + ENTITY_BATCH])
         try:
             _, rows = ch(
-                "SELECT entity, instance_id, toString(min(ts)) "
+                "SELECT entity, instance_id, toString(min(ts)), "
+                "  argMin(if(has(mapKeys(nums), 'wait_us'), "
+                "            toString(nums['wait_us']), ''), ts), "
+                "  argMin(attrs['source'], ts) "
                 f"FROM bifrost_events WHERE {tb}stage = 'scheduler' "
                 f"  AND event = 'received' AND entity IN ({lst}) "
                 "GROUP BY entity, instance_id")
         except Exception:
             continue
-        for ent, inst, t in rows:
-            out.setdefault(ent, {})[inst] = t
+        for ent, inst, t, w, src in rows:
+            out.setdefault(ent, {})[inst] = (
+                t, int(w) if w not in ("", None) else None, src or "")
     return out
 
 
@@ -1279,45 +1287,61 @@ def attach_recv(ch, rows, slot, lo=None, hi=None, round_of=lambda x: x["round"],
     recv = received_at(ch, ents, lo, hi)
     for x in rows:
         got = {}
-        for key in (prefix_of(x), bundle_of(x)):
-            for inst, t in (recv.get(key) or {}).items():
-                if inst not in got or t < got[inst]:
-                    got[inst] = t
+        for key, kind in ((prefix_of(x), "tx"), (bundle_of(x), "bundle")):
+            for inst, (t, w, src) in (recv.get(key) or {}).items():
+                if inst not in got or t < got[inst][0]:
+                    got[inst] = (t, w, src, kind)
         rec = {}
-        for inst, t in got.items():
+        for inst, (t, w, src, kind) in got.items():
             m = marks.get((inst, int(round_of(x))))
             if not m or "open" not in m:
                 continue
             after = _ms(m["open"], t)
             before = _ms(t, m["win"]) if "win" in m else None
             if after is not None:
-                rec[inst] = (after, before)
+                rec[inst] = (after, before, w, src, kind)
         x["recv"] = rec
     return rows
 
 
 def _recv_cells(x, prefer=None):
-    """Two cells: ms after the round opened, ms before its winner. One
-    instance is shown -- `prefer` (the row's own builder) if it logged the
-    order, else the earliest admission -- and every instance is in the
-    title."""
+    """Three cells: ms after the round opened, ms before its winner, and
+    the relay's hold (wait_us) on that admission. One instance is shown --
+    `prefer` (the row's own builder) if it logged the order, else the
+    earliest admission -- and every instance is in the title."""
     rec = x.get("recv") or {}
     if not rec:
-        return '<td class="n dim">&mdash;</td><td class="n dim">&mdash;</td>'
+        return ('<td class="n dim">&mdash;</td>' * 3)
     inst = prefer if prefer in rec else min(rec, key=lambda k: rec[k][0])
-    after, before = rec[inst]
+    after, before, wait, _src, _kind = rec[inst]
     title = html.escape("; ".join(
         f"{k}: {v[0]:+.1f} ms after open" +
         (f", {v[1]:.1f} ms before winner" if v[1] is not None else "")
         for k, v in sorted(rec.items())))
+
     def cell(v, cls=""):
         if v is None:
             return '<td class="n dim">&mdash;</td>'
         return (f'<td class="n m{cls}" title="{title}">'
                 f'{v:+.1f}</td>' if cls else
                 f'<td class="n m" title="{title}">{v:.1f}</td>')
+
+    def hold(k, v):
+        a, _b, w, src, kind = v
+        if w is None:
+            return f"{k}: no wait_us logged ({kind} via {src or '?'})"
+        return (f"{k}: {w / 1000:.3f} ms hold on the {kind} via "
+                f"{src or '?'}, extendable at {a + w / 1000:+.1f} ms after "
+                "open")
+    wtitle = html.escape("; ".join(hold(k, v) for k, v in sorted(rec.items())))
+    if wait is None:
+        wcell = f'<td class="n dim" title="{wtitle}">&mdash;</td>'
+    else:
+        wcell = (f'<td class="n m{" held" if wait else ""}" '
+                 f'title="{wtitle}">{wait / 1000:.1f}</td>')
     return (cell(after, " neg" if after < 0 else " pos")
-            + cell(before, " neg" if before is not None and before < 0 else ""))
+            + cell(before, " neg" if before is not None and before < 0 else "")
+            + wcell)
 
 
 def _sched_pairs(x):
@@ -1618,7 +1642,14 @@ def selection_diff(relay_q, ch, rounds_, window, blocks=None,
 
 
 def _sel_flat(x, col):
-    """The three scheduler columns are derived, not stored."""
+    """The three scheduler columns and wait_us are derived, not stored."""
+    if col == "wait_us":
+        rec = x.get("recv") or {}
+        if not rec:
+            return ""
+        b = x.get("our_builder")
+        k = b if b in rec else min(rec, key=lambda i: rec[i][0])
+        return "" if rec[k][2] is None else rec[k][2]
     if col == "sched_event":
         return ";".join(dict.fromkeys(e for e, _r in _sched_pairs(x)))
     if col == "sched_reason":
@@ -1978,6 +2009,7 @@ def _sel_table(group):
            'for an order that did not land here">reward</th>'
            '<th class="n" title="ms from this round&#39;s round_started to the builder admitting the order (scheduler/received), same clock; negative = it arrived before the round opened">recv +open</th>'
            '<th class="n" title="ms from the builder admitting the order to this round&#39;s round_winner">win &minus;recv</th>'
+           '<th class="n" title="the relay&#39;s hold on the order (scheduler/received nums wait_us), ms: the builder may not extend it before admission + wait. 0 = no hold (votes, non-nonce bundles, searcher flow); blank = not logged">wait</th>'
            "<th>scheduler said</th></tr>"]
     real = [i for i in group
             if i["verdict"] not in ("no_accepted_offer", "no_content")]
@@ -1999,7 +2031,7 @@ def _sel_table(group):
             bid += (f' <span class="scopen bxo" data-sx="{bxid}" role="button" '
                     f'tabindex="0" title="every member of this bundle">'
                     f'#{pos or "?"} of {n}</span>')
-            bx = (f'<tr class="sxrow" id="{bxid}" hidden><td colspan=11>'
+            bx = (f'<tr class="sxrow" id="{bxid}" hidden><td colspan=12>'
                   + _bundle_panel(i) + "</td></tr>")
         vcls = "us" if i["verdict"] == "us_inc_not_titan" else "ti"
         pairs = _sched_pairs(i)
@@ -2037,7 +2069,7 @@ def _sel_table(group):
         if bx:
             out.append(bx)
         if pairs:
-            out.append(f'<tr class="sxrow" id="{rid}" hidden><td colspan=11>'
+            out.append(f'<tr class="sxrow" id="{rid}" hidden><td colspan=12>'
                        + _sched_panel(i) + "</td></tr>")
     out.append("</table>")
     if len(real) > len(shown):
@@ -3471,6 +3503,7 @@ CSS = """
 .srow.noours:hover td{background:#3a1317}
 .redn{color:#fca5a5}
 .otab td.neg{color:#fbbf24}
+.otab td.held{color:#c4b5fd}
 .pfcharts{display:flex;flex-wrap:wrap;gap:18px;margin:6px 0 8px}
 .pfchart{min-width:0}
 .pftitle{font-size:12px;color:#dbe4ee;margin-bottom:2px}
@@ -4056,6 +4089,7 @@ def detail_html(d):
                    "<th>held</th><th>landed elsewhere</th>"
                    '<th class="n" title="ms from this round&#39;s round_started to the builder admitting the order (scheduler/received), same clock; negative = it arrived before the round opened">recv +open</th>'
            '<th class="n" title="ms from the builder admitting the order to this round&#39;s round_winner">win &minus;recv</th>'
+           '<th class="n" title="the relay&#39;s hold on the order (scheduler/received nums wait_us), ms: the builder may not extend it before admission + wait. 0 = no hold (votes, non-nonce bundles, searcher flow); blank = not logged">wait</th>'
                    "<th>validator said</th></tr>"
                    + "".join(rowsh) + "</table>")
         if len(miss) > SIG_CAP:
