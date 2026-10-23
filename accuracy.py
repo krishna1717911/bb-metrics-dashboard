@@ -2431,6 +2431,32 @@ def timeline_slots(relay_q, r, cap=MAX_SLOTS, region="all", connector="",
     # or every one-slot query dies on a missing win_lo.
     if r["slot"] is not None and "win_lo" not in r:
         r["win_lo"], r["win_hi"] = slot_window(relay_q, r["slot"])
+    if r["slot"] is not None and r.get("win_lo") is None and ch is not None:
+        # A slot only our own relay served has no rows in Gattaca's store,
+        # so its window has to come from ours or the page stays empty.
+        try:
+            _, w = ch("SELECT toString(min(ts)), toString(max(ts)) "
+                      "FROM bifrost_miniblocks WHERE ts > now() - INTERVAL "
+                      f"14 DAY AND slot = {int(r['slot'])}")
+            if w and w[0][0] and not w[0][0].startswith("1970"):
+                pad = dt.timedelta(minutes=2)
+                r["win_lo"] = dt.datetime.fromisoformat(w[0][0][:26]) - pad
+                r["win_hi"] = dt.datetime.fromisoformat(w[0][1][:26]) + pad
+        except Exception:
+            pass
+    if r["slot"] is not None and r.get("win_lo") is None:
+        # nobody's store has it (no builder offered): the chain's block time
+        try:
+            _, w = relay_q("SELECT toString(estimated_slot_time) FROM "
+                           "solana.block_summary WHERE estimated_slot_time > "
+                           "now() - INTERVAL 14 DAY AND slot = "
+                           f"{int(r['slot'])} LIMIT 1")
+            if w and w[0][0]:
+                t = dt.datetime.fromisoformat(w[0][0][:26])
+                pad = dt.timedelta(minutes=2)
+                r["win_lo"], r["win_hi"] = t - pad, t + pad
+        except Exception:
+            pass
     sub_w, _ = _bounds(r)[1], None
     _, rows = relay_q(
         "SELECT slot, index_in_slot AS idx, builder_id, count() AS offers, "
@@ -2464,11 +2490,16 @@ def timeline_slots(relay_q, r, cap=MAX_SLOTS, region="all", connector="",
         hi = r.get("win_hi") if r["slot"] is not None else r["hi"]
         if lo and hi:
             f = "%Y-%m-%d %H:%M:%S"
+            # in slot mode only that slot -- the window is padded by two
+            # minutes, which otherwise pulls in the validator's
+            # neighbouring slots too (45 rows for one slot)
             _, blocks = relay_q(
                 "SELECT slot FROM solana.block_summary "
                 f"WHERE estimated_slot_time >= '{lo:{f}}' "
                 f"  AND estimated_slot_time <= '{hi:{f}}' "
-                f"  AND leader = '{connector}'")
+                f"  AND leader = '{connector}'"
+                + (f" AND slot = {int(r['slot'])}"
+                   if r["slot"] is not None else ""))
             for (slot,) in blocks:
                 led.setdefault(int(slot), {"rounds_opened": 0,
                                            "produced": False})["produced"] = True
@@ -2492,14 +2523,28 @@ def timeline_slots(relay_q, r, cap=MAX_SLOTS, region="all", connector="",
                     f"WHERE ts >= '{lo - dt.timedelta(minutes=2):{f}}' "
                     f"  AND ts <= '{hi + dt.timedelta(minutes=2):{f}}' "
                     f"  AND connector_identity = '{connector}' "
-                    "GROUP BY slot, idx, local_builder_id")
+                    + (f"  AND slot = {int(r['slot'])} "
+                       if r["slot"] is not None else "")
+                    + "GROUP BY slot, idx, local_builder_id")
             except Exception:
                 mine = []
+            # Only slots the relay's store knows NOTHING about -- no offer,
+            # no round opened. Merging per (round, builder) tagged slots
+            # Gattaca did serve: a round where one of our builders logged
+            # the winner but made no offer has no `submitted` row for it,
+            # which read as "the relay never saw this round" (7 slots of
+            # Ledger by Figment in 6 h, 2026-10-23). Slots past the
+            # relay's newest are its ~12 s ingest lag, not another relay.
+            relay_slots = ({sl for sl, rs in by.items() if rs}
+                           | {sl for sl, v in led.items()
+                              if v.get("rounds_opened")})
+            relay_tip = max(relay_slots) if relay_slots else None
             for slot, idx, bld, offers, bid, n, ft, lt, won in mine:
                 slot, idx = int(slot), int(idx)
-                rounds_ = by.setdefault(slot, {})
-                if any(b["builder"] == bld for b in rounds_.get(idx, [])):
+                if slot in relay_slots or (relay_tip is not None
+                                           and slot > relay_tip):
                     continue
+                rounds_ = by.setdefault(slot, {})
                 if int(offers or 0):
                     rounds_.setdefault(idx, []).append({
                         "builder": bld or "", "offers": int(offers or 0),
