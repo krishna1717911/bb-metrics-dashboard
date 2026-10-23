@@ -1395,9 +1395,11 @@ def _sel_filters(rows):
     kbox = "".join(
         f'<label class="sfk"><input type="checkbox" class="sf-t" '
         f'value="{k}" checked> <span class="kd {k}">{k}</span> '
-        f'({kc[k]:,})</label>' for k in ("txn", "bundle") if kc[k])
+        f'(<span class="sf-c">{kc[k]:,}</span>)</label>'
+        for k in ("txn", "bundle") if kc[k])
     sopts = "".join(
-        f'<option value="{html.escape(k, quote=True)}">'
+        f'<option value="{html.escape(k, quote=True)}" '
+        f'data-l="{html.escape(_sched_label(k), quote=True)}">'
         f"{html.escape(_sched_label(k))} ({n:,})</option>"
         for k, n in sorted(sc.items(), key=lambda kv: -kv[1]))
     return ('<div class="selfilt"><span class="dim">filter</span> '
@@ -3959,6 +3961,29 @@ ACCURACY_JS = r'''
     });
     var n = bar.querySelector('.sf-n');
     if (n) n.textContent = active ? (shown + ' of ' + total + ' rows match') : '';
+    recount(bar, sec, v);
+  }
+  // Verdict is the population: type and scheduler counts are taken over
+  // the rows of the chosen verdict alone, not narrowed by each other.
+  function recount(bar, sec, v){
+    var kc = {}, sc = {};
+    sec.querySelectorAll('tr[data-v]').forEach(function(tr){
+      if (v && tr.getAttribute('data-v') !== v) return;
+      var k = tr.getAttribute('data-k');
+      kc[k] = (kc[k] || 0) + 1;
+      tr.getAttribute('data-s').split('|').forEach(function(x){
+        sc[x] = (sc[x] || 0) + 1;
+      });
+    });
+    bar.querySelectorAll('.sf-t').forEach(function(b){
+      var c = b.parentNode.querySelector('.sf-c');
+      if (c) c.textContent = (kc[b.value] || 0).toLocaleString();
+    });
+    bar.querySelectorAll('.sf-s option[data-l]').forEach(function(o){
+      var c = sc[o.value] || 0;
+      o.textContent = o.getAttribute('data-l') + ' (' + c.toLocaleString() + ')';
+      o.disabled = c === 0 && !o.selected;
+    });
   }
   document.addEventListener('change', function(ev){
     var bar = ev.target.closest && ev.target.closest('.selfilt');
