@@ -603,13 +603,43 @@ def _expand_bundles(ch, by_uuid, window=None):
     return by_uuid
 
 
+def market_ticks(relay_q, window=None):
+    """SigPrefixes of the relay's market ticks opened in `window`.
+
+    Since 2026-10-23 12:57Z sol-relay-2-lat-ams signs one tick per round
+    and sends it to every builder as the round's mandatory prefix, so our
+    offers carry it at order_index 0 (Titan's don't; the relay does not
+    enforce it yet). It is the relay's transaction, not a builder's
+    choice, and most never land (460768261/0: 4ot9Yzam..., nowhere on
+    chain), so left in it reads as a miss and as a diff row on every
+    round we bid. Keyed on the prefix so it filters both content sources.
+    The column is Nullable(FixedString(64)) -- base58Encode needs
+    assumeNotNull."""
+    if window and window[0] and window[1]:
+        f = "%Y-%m-%d %H:%M:%S"
+        bound = (f"timestamp >= '{window[0] - dt.timedelta(minutes=2):{f}}' "
+                 f"AND timestamp <= '{window[1] + dt.timedelta(minutes=2):{f}}'")
+    else:
+        bound = "timestamp > now() - INTERVAL 14 DAY"
+    _, rows = relay_q(
+        "SELECT DISTINCT base58Encode(substring(assumeNotNull("
+        "  market_tick_signature), 1, 16)) "
+        f"FROM relay.mini_block_events_v2 WHERE {bound} "
+        "  AND event IN ('round_opened', 'tail_opened') "
+        "  AND market_tick_signature IS NOT NULL")
+    return {r[0] for r in rows if r and r[0]}
+
+
 def order_contents(relay_q, ch, uuids, window, pmap=None):
     """-> (contents, source). The relay if it has them, our store if not.
 
     Automatic rather than a switch: relay.mini_block_transactions stopped
     taking rows at 2026-10-15 10:47:46 UTC with no warning and the other
     three relay tables carried on, so "is it up" is a per-query fact, not
-    a setting anyone can be expected to keep current."""
+    a setting anyone can be expected to keep current.
+
+    The relay's market ticks are dropped from either source -- see
+    market_ticks()."""
     uuids = [u for u in uuids if u]
     if not uuids:
         return {}, RELAY_SRC
@@ -617,9 +647,19 @@ def order_contents(relay_q, ch, uuids, window, pmap=None):
         got = winner_orders(relay_q, uuids, window)
     except Exception:
         got = {}
-    if got:
-        return got, RELAY_SRC
-    return ours_orders(ch, uuids, pmap, window), OURS_SRC
+    src = RELAY_SRC
+    if not got:
+        got, src = ours_orders(ch, uuids, pmap, window), OURS_SRC
+    try:
+        ticks = market_ticks(relay_q, window)
+    except Exception:
+        ticks = set()
+    if ticks:
+        got = {u: [i for i in items
+                   if (i.get("prefix") or (sigprefix(i["sig"]) if i.get("sig")
+                                           else "")) not in ticks]
+               for u, items in got.items()}
+    return got, src
 
 
 def block_signatures(rpc_url, slot):
