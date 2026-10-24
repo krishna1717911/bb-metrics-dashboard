@@ -267,10 +267,12 @@ def _pool_cu(days, dates, side):
     could not be pooled across days any more than percentiles could.
     """
     grid = [[0.0] * 10 for _ in range(100)]
+    have = []
     for d in dates:
         cu = days[d][side].get("cu")
         if not cu:
             continue
+        have.append(d)
         for p in range(100):
             for b in range(10):
                 grid[p][b] += cu[p][b]
@@ -279,7 +281,11 @@ def _pool_cu(days, dates, side):
         t = sum(grid[p])
         totals.append(t)
         out.append([(v / t * 100 if t else 0.0) for v in grid[p]])
-    return out, totals
+    # Which days actually contributed. A day with no CU grid is skipped, so
+    # this surface can silently cover a shorter window than every other panel
+    # -- the caller states the difference rather than letting it pass as the
+    # selected range.
+    return out, totals, have
 
 
 
@@ -342,6 +348,8 @@ details.rw-more .body{color:#6b7f96;font-size:11px;line-height:1.6;
   gap:4px 18px;margin-top:10px;padding-top:10px;border-top:1px solid #1e2937}
 .rw-key div{color:#6b7f96;font-size:11px;line-height:1.55}
 .rw-key b{color:#9fb2c8;font-weight:600}
+.rw-warn{background:#2a2112;border:1px solid #5a4418;color:#e0c07a;
+  border-radius:6px;padding:7px 10px;font-size:11.5px;line-height:1.5;margin:4px 0 6px}
 .rw-note{color:#6b7f96;font-size:11px;margin-top:9px;line-height:1.65}
 .rw-ctl{display:flex;gap:16px;flex-wrap:wrap;align-items:center;margin:-2px 0 8px}
 .rw-ctl .g{display:flex;gap:4px;align-items:center}
@@ -512,7 +520,7 @@ def _fig_gap(qg, qh):
 
 def _fig_cu3d(days, dates, side, render, hscale, inspect):
     """The compute-unit field as a real 3-D scene -- Plotly supplies the orbit."""
-    grid, _ = _pool_cu(days, dates, side)
+    grid, _, _cu_days = _pool_cu(days, dates, side)
     zmax = max((v for row in grid for v in row), default=1.0) or 1.0
     z = [[((v / zmax) ** 0.5 * zmax if hscale == "sqrt" else v) for v in row]
          for row in grid]
@@ -743,9 +751,19 @@ def rewards_page(CSS, purl, d_from=None, d_to=None, opts=None,
         f'{ctl("hscale", hscale, [("linear","Linear"),("sqrt","Square root")])}</span>'
         f'</div>')
 
-    cu_grid, _ = _pool_cu(days, dates, cu_side)
+    cu_grid, _, cu_days = _pool_cu(days, dates, cu_side)
     insp_row = "".join(f'<td>{cu_grid[inspect-1][b]:.1f}%</td>' for b in range(10))
-    cu_slots = sum(days[d][cu_side]["slots"] for d in dates)
+    # Only the days that carry a CU grid, not every day in the range.
+    cu_slots = sum(days[d][cu_side]["slots"] for d in cu_days)
+    cu_cover = (
+        "" if len(cu_days) == len(dates) else
+        f'<div class="rw-warn">This surface covers {len(cu_days)} of the '
+        f'{len(dates)} selected days ({html.escape(cu_days[0])} to '
+        f'{html.escape(cu_days[-1])}) &mdash; the rest carry no compute-unit '
+        f'grid, so they are not in it. Every other panel uses all '
+        f'{len(dates)}.</div>' if cu_days else
+        f'<div class="rw-warn">No day in this range carries a compute-unit '
+        f'grid, so this surface is empty.</div>')
     cu_side_label = "GBX" if cu_side == "gbx" else "Agave Harmonic"
 
     rows = []
@@ -839,14 +857,15 @@ def rewards_page(CSS, purl, d_from=None, d_to=None, opts=None,
       100%. Drag to orbit, scroll to zoom. Aggregated over every slot in the
       band, not the one slot at the cut.</div>
     {cu_ctl}
+    {cu_cover}
     <div id="fig-cu3d"></div>
     <table class="rw-tbl" style="margin-top:4px">
       <thead><tr><th>p{inspect} &mdash; the highlighted slice</th>
         {"".join(f"<th>{l}</th>" for l in CU_LABELS)}</tr></thead>
       <tbody><tr><td>share of priority fee</td>{insp_row}</tr></tbody>
     </table>
-    <div class="rw-note">{cu_side_label}, {len(dates)} day{"s" if len(dates)!=1 else ""},
-      {cu_slots:,} slots &mdash; about {cu_slots//100:,} per percentile band.</div>
+    <div class="rw-note">{cu_side_label}, {len(cu_days)} day{"s" if len(cu_days)!=1 else ""},
+      {cu_slots:,} slots &mdash; about {cu_slots//100 if cu_days else 0:,} per percentile band.</div>
   </div>
 
   <div class="rw-grid">
