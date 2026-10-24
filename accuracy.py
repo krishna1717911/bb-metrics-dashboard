@@ -2890,13 +2890,18 @@ def timeline_slots(relay_q, r, cap=MAX_SLOTS, region="all", connector="",
         "SELECT slot, index_in_slot AS idx, builder_id, count() AS offers, "
         f"  max({score_sql(relay_q)}) AS best_bid, max(order_count) AS n, "
         "  toString(min(timestamp)) AS first_t, "
-        "  toString(max(timestamp)) AS last_t "
+        "  toString(max(timestamp)) AS last_t, "
+        "  any(connector_identity) AS conn "
         "FROM relay.mini_block_events_v2 "
         f"WHERE {sub_w} AND event = 'submitted'{_region_sql(region)}"
         f"{_connector_sql(connector)} "
         "GROUP BY slot, idx, builder_id ORDER BY slot DESC, idx ASC")
     by = {}
-    for slot, idx, bld, offers, bid, n, ft, lt in rows:
+    # the slot's leader: one connector per slot, whichever relay served it
+    conn_of = {}
+    for slot, idx, bld, offers, bid, n, ft, lt, conn in rows:
+        if conn:
+            conn_of.setdefault(int(slot), conn)
         by.setdefault(int(slot), {}).setdefault(int(idx), []).append({
             "builder": bld or "", "offers": int(offers or 0),
             "bid": int(bid or 0), "n": int(n or 0),
@@ -2984,7 +2989,9 @@ def timeline_slots(relay_q, r, cap=MAX_SLOTS, region="all", connector="",
     slots = sorted(by, reverse=True)
     total = len(slots)
     slots = slots[:cap]
-    return ([{"slot": sl, "rounds": by[sl], "led": led.get(sl)} for sl in slots],
+    return ([{"slot": sl, "rounds": by[sl], "led": led.get(sl),
+              "connector": conn_of.get(sl) or connector or ""}
+             for sl in slots],
             len(slots), total)
 
 
@@ -3015,9 +3022,13 @@ def slot_timeline(relay_q, slot, window, region="all"):
     except Exception:
         segs = {}
     rounds_ = {}
+    leader, leader_w = "", None
     for (idx, ev, bld, t, pay, jito, fees, cost, n, reason, uuid, is_last,
          conn) in rows:
         i = int(idx)
+        if conn and not leader:
+            leader = conn
+            leader_w = weight_at(segs, conn, t)
         d = rounds_.setdefault(i, {"idx": i, "opened": "", "offers": [],
                                    "sealed": "", "tail": "",
                                    "is_last": False})
@@ -3060,7 +3071,8 @@ def slot_timeline(relay_q, slot, window, region="all"):
         d["sealed_ms"] = _ms(anchor, d["sealed"]) if anchor and d["sealed"] else None
         d["builders"] = sorted({o["builder"] for o in d["offers"]})
         out.append(d)
-    return {"slot": slot, "rounds": out}
+    return {"slot": slot, "rounds": out, "connector": leader,
+            "jito_w": leader_w}
 
 
 def slot_timeline_ours(ch, slot, connector=""):
@@ -3074,7 +3086,7 @@ def slot_timeline_ours(ch, slot, connector=""):
     _, mb = ch(
         "SELECT kind, index_in_slot AS idx, local_builder_id, toString(ts), "
         "  uuid, ifNull(reward, 0), ifNull(execution_cost, 0), order_count, "
-        "  won_by_us FROM bifrost_miniblocks "
+        "  won_by_us, connector_identity FROM bifrost_miniblocks "
         "WHERE ts >= now() - INTERVAL 7 DAY "
         f"  AND slot = {int(slot)}"
         + (f" AND connector_identity = '{connector}'" if connector else "")
@@ -3094,7 +3106,9 @@ def slot_timeline_ours(ch, slot, connector=""):
             opened.setdefault(int(idx), t)
     rounds_ = {}
     winners = {}
-    for kind, idx, bld, t, uuid, reward, cost, n, won in mb:
+    leader = connector
+    for kind, idx, bld, t, uuid, reward, cost, n, won, conn in mb:
+        leader = leader or conn
         i = int(idx)
         d = rounds_.setdefault(i, {"idx": i, "opened": opened.get(i, ""),
                                    "offers": [], "sealed": "", "tail": "",
@@ -3125,7 +3139,8 @@ def slot_timeline_ours(ch, slot, connector=""):
         d["sealed_ms"] = None
         d["builders"] = sorted({o["builder"] for o in d["offers"]})
         out.append(d)
-    return {"slot": slot, "rounds": out, "source": "ours"}
+    return {"slot": slot, "rounds": out, "source": "ours",
+            "connector": leader or ""}
 
 
 # ------------------------------------------------------------- the race
@@ -3259,12 +3274,33 @@ def _tl_csv(slot, rnd):
     return "\n".join(lines)
 
 
-def timeline_html(d):
+def _validator_cell(pubkey, name=""):
+    """The slot's leader: its name where the Firedancer report knows it,
+    then the pubkey, shortened but copied whole."""
+    if not pubkey:
+        return '<span class="dim">&mdash;</span>'
+    lab = (f'<span class="vname">{html.escape(name)}</span> ' if name else "")
+    return lab + copy_val(pubkey, pubkey[:8] + "\u2026")
+
+
+def timeline_html(d, names=None):
     """The race first, then the same offers as numbers underneath."""
     if not d["rounds"]:
         return ('<div class="dmeta">the relay recorded no offer for this '
                 "slot in the window</div>")
-    out = [race_html(d)]
+    out = []
+    conn = d.get("connector") or ""
+    if conn:
+        w = d.get("jito_w")
+        out.append(
+            '<div class="rhead">validator '
+            + _validator_cell(conn, (names or {}).get(conn) or "")
+            + stakingfac_link(conn)
+            + (f' &middot; <span class="dim" title="the weight the relay '
+               "scored this slot's Jito tips at, net of its 600 bps Jito "
+               f'fee">Jito weight {w:,} bps</span>' if w is not None else "")
+            + "</div>")
+    out.append(race_html(d))
     for rnd in d["rounds"]:
         n = len(rnd["offers"])
         head = (f'<div class="rhead">round {rnd["idx"]} &middot; '
@@ -3335,7 +3371,8 @@ def _copy_raw(text, label):
             f'tabindex="0" title="copy as CSV">{label}</span>')
 
 
-def timeline_table_html(r, slots, shown, total, ours_re, slot_ref=None):
+def timeline_table_html(r, slots, shown, total, ours_re, slot_ref=None,
+                        names=None):
     """The slot list for the timeline metric: who OFFERED, not who won."""
     if r["err"]:
         return (f'<div class="herr" style="margin:20px 28px">'
@@ -3370,7 +3407,9 @@ def timeline_table_html(r, slots, shown, total, ours_re, slot_ref=None):
            f"{what}{note}{cap}. Click a slot for the "
            "offers in arrival order, timed from when the relay opened the "
            "round.</div>",
-           '<table class="atab2"><tr><th>slot</th><th class="n">rounds</th>'
+           '<table class="atab2"><tr><th>slot</th>'
+           '<th title="the slot\'s leader: the connector the relay opened its rounds for">validator</th>'
+           '<th class="n">rounds</th>'
            '<th class="n">offers</th><th>builders</th>'
            '<th class="n" title="the highest relay score offered: protocol fees + Jito tips x the connector\'s Jito weight / 10000 + builder payment">best score</th></tr>'
            '<tbody id="aqbody" data-metric="timeline" '
@@ -3405,9 +3444,10 @@ def timeline_table_html(r, slots, shown, total, ours_re, slot_ref=None):
             f'<tr class="{cls}" data-slot="{sl}"'
             + (f' title="{html.escape(why)}"' if why else "") + ">"
             f'<td class="m">{copy_val(str(sl))}{slot_age_html(sl, slot_ref)}</td>'
+            f'<td class="m">{_validator_cell(srow.get("connector") or "", (names or {}).get(srow.get("connector") or "") or "")}</td>'
             f'<td class="n">{len(rs)}</td><td class="n">{offers:,}</td>'
             f"<td>{tags}</td><td class=\"n\">{best:,}</td></tr>"
-            f'<tr class="drow" id="d{sl}" hidden><td colspan=5>'
+            f'<tr class="drow" id="d{sl}" hidden><td colspan=6>'
             '<div class="dbox"></div></td></tr>')
     out.append("</tbody></table>")
     return "".join(out)
@@ -3803,6 +3843,7 @@ td.kd i{font-style:normal;color:#f87171;font-size:10px;margin-left:4px}
 .ours{color:#5eead4;font-weight:600}
 .wtag{font:10.5px ui-monospace,Menlo,monospace;padding:1px 7px;
   border-radius:4px;border:1px solid #22303f;color:#8fa6bf}
+.vname{font:12px system-ui,sans-serif;color:#cbd5e1}
 .wtag.us{border-color:#14b8a6;color:#5eead4;background:#0f766e22}
 .drow>td{padding:0 0 0 0;background:#0a1118}
 .dbox{padding:12px 28px 16px 20px}

@@ -9590,7 +9590,8 @@ def offer_timeline_page(qs):
                 relay, r, region=r["region"], connector=r["connector"],
                 ch=clickhouse_main)
             body += accuracy.timeline_table_html(r, slots, shown, total,
-                                                 OURS_RE, slot_ref=_slot_ref())
+                                                 OURS_RE, slot_ref=_slot_ref(),
+                                                 names=names)
         except Exception as exc:
             body += ('<div class="herr" style="margin:20px 28px">the relay '
                      f"could not be read: {html.escape(str(exc)[:300])}</div>")
@@ -9623,7 +9624,7 @@ def offer_timeline_slot_html(qs):
         if not d.get("rounds"):
             return ('<div class="dmeta">no builder offered into this slot, '
                     "in the relay's store or in ours</div>")
-    return accuracy.timeline_html(d)
+    return accuracy.timeline_html(d, names=_validator_names())
 
 
 def accuracy_export_start(qs):
