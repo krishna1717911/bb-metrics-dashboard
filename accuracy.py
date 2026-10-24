@@ -1343,6 +1343,170 @@ def _recv_cells(x, prefer=None):
             + wcell)
 
 
+# ------------------------------------------- our own API's view of an order
+#
+# A diff row none of our builders received can still have come in through
+# our own APIs (txn-router): as an MEV bundle, or as a plain transaction
+# wrapped into one. The quant store keeps both. API keys are credentials:
+# only their first 8 characters are ever rendered.
+
+API_SIG_BATCH = 100        # signatures per query; the SQL travels in the URL
+
+
+def _row_sigs(x):
+    """Every signature the row stands for: a bundle row's members (as the
+    offer carried them), else its own."""
+    if x.get("members"):
+        return [m["sig"] for m in x["members"] if m.get("sig")]
+    return [x["signature"]] if x.get("signature") else []
+
+
+def _key8(k):
+    return (k[:8] + "…") if k else ""
+
+
+def attach_api(quant_q, rows, window):
+    """Hang `api_bundles` / `api_txs` on each diff row nobody of ours
+    received, from db_sync.inbound_mev_bundles_enriched and
+    inbound_transactions_enriched. Both are ReplacingMergeTrees sorted on
+    created_at first, so the window bound is what makes this cheap; the
+    newest version of each submission wins."""
+    want = [x for x in rows if not x.get("received_by_us")
+            and x.get("verdict") in ("titan_inc_not_us", "us_inc_not_titan")]
+    sigs = sorted({s_ for x in want for s_ in _row_sigs(x)})
+    if not sigs:
+        return rows
+    lo, hi = window or (None, None)
+    f = "%Y-%m-%d %H:%M:%S"
+    tb = (f"created_at >= '{lo:{f}}' AND created_at <= '{hi:{f}}'"
+          if lo and hi else "created_at >= now() - INTERVAL 1 HOUR")
+    bundles, txs = {}, {}
+    for i in range(0, len(sigs), API_SIG_BATCH):
+        part = sigs[i:i + API_SIG_BATCH]
+        lst = ", ".join("'%s'" % _q(x) for x in part)
+        _, rb = quant_q(
+            "SELECT bundle_submission_id, ifNull(toString(api_key), ''), toString(created_at), "
+            "  mev_variant, num_transactions, ifNull(toString(tip_wallet), ''), tip_wallet_type, "
+            "  ifNull(toString(total_wire_tip_lamports), ''), ifNull(toString(provider_direct_tip_lamports), ''), "
+            "  bundle_landing_status, ifNull(toString(slot_landed), ''), "
+            "  ifNull(toString(gravity_blocks_landing_status), ''), ifNull(toString(gravity_blocks_slot_landed), ''), "
+            "  ifNull(toString(gravity_blocks_egress_tip), ''), ifNull(toString(gravity_blocks_bundle_id), ''), "
+            "  arrayStringConcat(signatures, ' ') "
+            "FROM db_sync.inbound_mev_bundles_enriched "
+            f"WHERE {tb} AND hasAny(signatures, [{lst}]) "
+            "ORDER BY updated_at DESC LIMIT 1 BY bundle_submission_id")
+        for r in rb:
+            bundles[r[0]] = {
+                "id": r[0], "key": _key8(r[1] or ""), "at": r[2],
+                "variant": r[3], "n": r[4], "tip_wallet": r[5] or "",
+                "tip_wallet_type": r[6] or "", "wire_tip": r[7],
+                "direct_tip": r[8], "status": r[9] or "", "slot": r[10],
+                "gb_status": r[11] or "", "gb_slot": r[12],
+                "gb_tip": r[13], "gb_bundle": r[14] or "",
+                "sigs": (r[15] or "").split()}
+        _, rt = quant_q(
+            "SELECT signature, transaction_type, ifNull(toString(api_key), ''), "
+            "  bundle_submission_id, status, ifNull(toString(slot_landed), ''), leader, "
+            "  ifNull(toString(gravity_blocks_landing_status), ''), ifNull(toString(gravity_blocks_slot_landed), ''), "
+            "  ifNull(toString(gravity_blocks_egress_tip), ''), ifNull(toString(gravity_blocks_egress_tip_signature), ''), "
+            "  ifNull(toString(gravity_blocks_bundle_id), ''), toString(created_at) "
+            "FROM db_sync.inbound_transactions_enriched "
+            f"WHERE {tb} AND signature IN ({lst}) "
+            "ORDER BY updated_at DESC LIMIT 1 BY id")
+        for r in rt:
+            txs.setdefault(r[0], []).append({
+                "sig": r[0], "type": r[1] or "", "key": _key8(r[2] or ""),
+                "bsid": r[3] or "", "status": r[4] or "", "slot": r[5],
+                "leader": r[6] or "", "gb_status": r[7] or "",
+                "gb_slot": r[8], "gb_tip": r[9], "gb_tip_sig": r[10] or "",
+                "gb_bundle": r[11] or "", "at": r[12]})
+    for x in want:
+        mine = set(_row_sigs(x))
+        x["api_checked"] = True
+        x["api_bundles"] = [b for b in bundles.values()
+                            if mine.intersection(b["sigs"])]
+        x["api_txs"] = [t for s_ in sorted(mine) for t in txs.get(s_, [])]
+    return rows
+
+
+def _api_tag(i, rid):
+    """The opener in the type cell; '' when nothing was looked up."""
+    if not i.get("api_checked"):
+        return ""
+    nb, nt = len(i.get("api_bundles") or []), len(i.get("api_txs") or [])
+    if not nb and not nt:
+        return ('<br><span class="dim" title="no MEV bundle or transaction '
+                'carrying these signatures in our API logs (quant db_sync) '
+                'around this slot">not via our API</span>')
+    bits = []
+    if nb:
+        bits.append(f"{nb} bundle{'s' if nb > 1 else ''}")
+    if nt:
+        bits.append(f"{nt} tx{'s' if nt > 1 else ''}")
+    return (f'<br><span class="scopen apio" data-sx="{rid}" role="button" '
+            f'tabindex="0" title="sent to our own API (txn-router), from '
+            f'db_sync">our API: {", ".join(bits)}</span>')
+
+
+def _api_panel(i):
+    mine = set(_row_sigs(i))
+    out = []
+    v = lambda x: "&mdash;" if x in (None, "", "\\N") else html.escape(str(x))
+    if i.get("api_bundles"):
+        out.append('<div class="sxh">MEV bundles sent to our API that '
+                   "carry this order &middot; db_sync.inbound_mev_bundles_"
+                   "enriched</div>"
+                   '<table class="otab"><tr><th>bundle_submission_id</th>'
+                   "<th>api key</th><th>created</th><th>variant</th>"
+                   "<th>txs</th><th>tip wallet</th><th>wallet type</th>"
+                   '<th class="n">wire tip</th><th class="n">direct tip</th>'
+                   "<th>landing</th><th>slot</th><th>gravity status</th>"
+                   '<th>gravity slot</th><th class="n">gravity egress tip</th>'
+                   "<th>gravity bundle</th><th>signatures</th></tr>")
+        for b in i["api_bundles"]:
+            sigs = "".join(
+                f'<div class="{"apimatch" if sg in mine else ""}">'
+                f"{copy_val(sg, sg[:20] + chr(8230))} "
+                f'<span class="dim">{copy_val(sigprefix(sg))}</span></div>'
+                for sg in b["sigs"])
+            out.append(
+                f'<tr><td>{copy_val(b["id"], b["id"][:12] + chr(8230))}</td>'
+                f'<td class="m">{v(b["key"])}</td><td>{v(b["at"][11:23])}</td>'
+                f'<td class="n">{v(b["variant"])}</td><td class="n">{v(b["n"])}</td>'
+                f'<td>{copy_val(b["tip_wallet"], b["tip_wallet"][:10] + chr(8230)) if b["tip_wallet"] else v("")}</td>'
+                f'<td>{v(b["tip_wallet_type"])}</td><td class="n">{v(b["wire_tip"])}</td>'
+                f'<td class="n">{v(b["direct_tip"])}</td><td>{v(b["status"])}</td>'
+                f'<td class="n">{v(b["slot"])}</td><td>{v(b["gb_status"])}</td>'
+                f'<td class="n">{v(b["gb_slot"])}</td><td class="n">{v(b["gb_tip"])}</td>'
+                f'<td>{copy_val(b["gb_bundle"], b["gb_bundle"][:12] + chr(8230)) if b["gb_bundle"] else v("")}</td>'
+                f"<td>{sigs}</td></tr>")
+        out.append("</table>")
+    if i.get("api_txs"):
+        out.append('<div class="sxh">transactions sent to our API (plain, '
+                   "wrapped as bundles) &middot; db_sync.inbound_"
+                   "transactions_enriched</div>"
+                   '<table class="otab"><tr><th>signature</th><th>sigprefix</th>'
+                   "<th>type</th><th>api key</th><th>created</th>"
+                   "<th>bundle_submission_id</th><th>status</th><th>slot</th>"
+                   "<th>leader</th><th>gravity status</th><th>gravity slot</th>"
+                   '<th class="n">gravity egress tip</th><th>egress tip sig</th>'
+                   "<th>gravity bundle</th></tr>")
+        for t in i["api_txs"]:
+            out.append(
+                f'<tr><td>{copy_val(t["sig"], t["sig"][:20] + chr(8230))}</td>'
+                f'<td>{copy_val(sigprefix(t["sig"]))}</td><td>{v(t["type"])}</td>'
+                f'<td class="m">{v(t["key"])}</td><td>{v(t["at"][11:23])}</td>'
+                f'<td>{copy_val(t["bsid"], t["bsid"][:12] + chr(8230)) if t["bsid"] else v("")}</td>'
+                f'<td>{v(t["status"])}</td><td class="n">{v(t["slot"])}</td>'
+                f'<td>{copy_val(t["leader"], t["leader"][:8] + chr(8230)) if t["leader"] else v("")}</td>'
+                f'<td>{v(t["gb_status"])}</td><td class="n">{v(t["gb_slot"])}</td>'
+                f'<td class="n">{v(t["gb_tip"])}</td>'
+                f'<td>{copy_val(t["gb_tip_sig"], t["gb_tip_sig"][:16] + chr(8230)) if t["gb_tip_sig"] else v("")}</td>'
+                f'<td>{copy_val(t["gb_bundle"], t["gb_bundle"][:12] + chr(8230)) if t["gb_bundle"] else v("")}</td></tr>')
+        out.append("</table>")
+    return '<div class="sxbox apibox">' + "".join(out) + "</div>"
+
+
 def _sched_key(x):
     """The row's scheduler verdicts as filter keys, "event:reason|..."."""
     pairs = _sched_pairs(x)
@@ -2137,12 +2301,15 @@ def _sel_table(group):
         battr += (f' data-v="{i["verdict"]}" data-k="{kind}" '
                   f'data-o="{html.escape(i.get("our_builder") or "", quote=True)}" '
                   f'data-s="{html.escape(_sched_key(i), quote=True)}"')
+        aid = "ap" + rid[2:]
+        atag = _api_tag(i, aid)
         out.append(f'<tr{battr}{extra}><td class="n">{i["order_index"]}</td>'
                    f'<td><span class="vd {vcls}">{i["verdict"]}</span></td>'
                    f'<td class="kd {kind}"'
                    + ('' if i.get("received_by_us") else
                       ' title="no scheduler/received on any of our builders"')
-                   + f'>{kind}{"" if i.get("received_by_us") else " <i>unseen</i>"}</td>'
+                   + f'>{kind}{"" if i.get("received_by_us") else " <i>unseen</i>"}'
+                   + atag + '</td>'
                    f'<td>{copy_val(i["signature"])}</td>'
                    f'<td>{copy_val(i["sigprefix"])}</td>'
                    f"<td>{bid}</td>"
@@ -2156,6 +2323,9 @@ def _sel_table(group):
         if pairs:
             out.append(f'<tr class="sxrow" id="{rid}" hidden><td colspan=12>'
                        + _sched_panel(i) + "</td></tr>")
+        if i.get("api_bundles") or i.get("api_txs"):
+            out.append(f'<tr class="sxrow" id="{aid}" hidden><td colspan=12>'
+                       + _api_panel(i) + "</td></tr>")
     out.append("</table>")
     if len(real) > len(shown):
         sm = sum(1 for i in shown if i["verdict"] == "us_inc_not_titan")
@@ -3595,6 +3765,9 @@ CSS = """
 .kd{font:11px ui-monospace,Menlo,monospace}
 .kd.bundle{color:#c4b5fd}.kd.txn{color:#dbe4ee}
 td.kd i{font-style:normal;color:#f87171;font-size:10px;margin-left:4px}
+.apio{font-size:10px;color:#93c5fd;cursor:pointer;white-space:nowrap}
+.apibox .otab{margin:4px 0 10px}
+.apibox .apimatch{color:#fbbf24}
 .selfilt{display:flex;flex-wrap:wrap;gap:10px 14px;align-items:center;
   margin:6px 0 10px;padding:6px 10px;border:1px solid #1e293b;
   border-radius:6px;font-size:12px}

@@ -9476,6 +9476,12 @@ def accuracy_slot_html(qs):
                 accuracy.price_from_packets(relayer, sel, win)
             except Exception:
                 pass
+            # orders none of our builders received: did they reach our
+            # own API instead? Optional -- needs QUANT_CH_URL.
+            try:
+                accuracy.attach_api(clickhouse_quant, sel, win)
+            except Exception:
+                pass
             body += accuracy.selection_html(sel, slot)
         except Exception as exc:
             body += ('<div class="dmeta aqcap">the selection diff could not '
