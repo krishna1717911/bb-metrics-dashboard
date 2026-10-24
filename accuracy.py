@@ -1252,8 +1252,11 @@ def attach_notes(ch, rows, lo=None, hi=None):
 
 def round_marks(ch, slot, lo=None, hi=None):
     """{(instance, round): {"open": ts, "win": ts}} -- each builder
-    instance's own round_started / round_winner for this slot, on that
-    instance's clock."""
+    instance's own round_started, and the ts of its own `winner` row in
+    bifrost_miniblocks for this slot and round, on that instance's clock.
+    round_winner stands in where the instance wrote no winner row; the
+    two are ~2 us apart (460768261, every round, all three AMS
+    instances)."""
     f = "%Y-%m-%d %H:%M:%S"
     tb = (f"ts >= '{lo:{f}}' AND ts <= '{hi:{f}}' AND " if lo and hi
           else "ts > now() - INTERVAL 2 HOUR AND ")
@@ -1270,6 +1273,15 @@ def round_marks(ch, slot, lo=None, hi=None):
     for inst, idx, e, t in rows:
         out.setdefault((inst, int(idx)), {})["open" if e == "round_started"
                                             else "win"] = t
+    try:
+        _, wins = ch(
+            "SELECT instance_id, index_in_slot, toString(min(ts)) "
+            f"FROM bifrost_miniblocks WHERE {tb}kind = 'winner' "
+            f"  AND slot = {int(slot)} GROUP BY instance_id, index_in_slot")
+    except Exception:
+        wins = []
+    for inst, idx, t in wins:
+        out.setdefault((inst, int(idx)), {})["win"] = t
     return out
 
 
@@ -1309,7 +1321,8 @@ def attach_recv(ch, rows, slot, lo=None, hi=None, round_of=lambda x: x["round"],
                 prefix_of=lambda x: x.get("sigprefix"),
                 bundle_of=lambda x: x.get("bundle_id")):
     """Hang, on each row, when the builder admitted the order relative to
-    its round: {instance: (ms after round_started, ms before round_winner)}.
+    its round: {instance: (ms after round_started, ms before that
+    instance's `winner` row in bifrost_miniblocks -- see round_marks)}.
 
     The order is looked up by its SigPrefix and, for a bundle member, by
     the bundle id (that is the entity a bundle's `received` carries); the
@@ -2290,7 +2303,7 @@ def _sel_table(group):
            'block. offered: from the transaction bytes in the relay packet log, '
            'for an order that did not land here">reward</th>'
            '<th class="n" title="ms from this round&#39;s round_started to the builder admitting the order (scheduler/received), same clock; negative = it arrived before the round opened">recv +open</th>'
-           '<th class="n" title="ms from the builder admitting the order to this round&#39;s round_winner">win &minus;recv</th>'
+           '<th class="n" title="ms from the builder admitting the order to that builder&#39;s own winner row (bifrost_miniblocks kind = winner) for this slot and round, same clock">win &minus;recv</th>'
            '<th class="n" title="the relay&#39;s hold on the order (scheduler/received nums wait_us), ms: the builder may not extend it before admission + wait. 0 = no hold (votes, non-nonce bundles, searcher flow); blank = not logged">wait</th>'
            "<th>scheduler said</th></tr>"]
     real = [i for i in group
@@ -4521,7 +4534,7 @@ def detail_html(d):
                    "<th>signature</th><th>sigprefix</th><th>bundle</th>"
                    "<th>held</th><th>landed elsewhere</th>"
                    '<th class="n" title="ms from this round&#39;s round_started to the builder admitting the order (scheduler/received), same clock; negative = it arrived before the round opened">recv +open</th>'
-           '<th class="n" title="ms from the builder admitting the order to this round&#39;s round_winner">win &minus;recv</th>'
+           '<th class="n" title="ms from the builder admitting the order to that builder&#39;s own winner row (bifrost_miniblocks kind = winner) for this slot and round, same clock">win &minus;recv</th>'
            '<th class="n" title="the relay&#39;s hold on the order (scheduler/received nums wait_us), ms: the builder may not extend it before admission + wait. 0 = no hold (votes, non-nonce bundles, searcher flow); blank = not logged">wait</th>'
                    "<th>validator said</th></tr>"
                    + "".join(rowsh) + "</table>")
