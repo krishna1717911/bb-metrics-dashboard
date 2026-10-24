@@ -9402,6 +9402,8 @@ def accuracy_page(qs):
     body = nextlead + accuracy.form_html(r, ACCURACY_PATH, region=True,
                               connectors=[(c, names.get(c) or "", n, src)
                                           for c, n, src in conns])
+    if not r["err"] and r.get("metric") in (accuracy.SELECTION, accuracy.BOTH):
+        body += accuracy.global_filter_html(_our_builders(r["region"]))
     if r["err"]:
         body += accuracy.table_html(r, [], 0, 0, OURS_RE)
     else:
@@ -9525,6 +9527,28 @@ def _profile_slot_html(slot, rows, win):
     except Exception as exc:
         return ('<div class="dmeta aqcap">the CU/reward profile could not '
                 f"be built: {html.escape(str(exc)[:200])}</div>")
+
+
+_OUR_BUILDERS = {}
+
+
+def _our_builders(region):
+    """Our builder ids that offered in the last day, for the page-wide
+    filter. Cached 10 minutes; empty if the store does not answer (the
+    list then fills from the slots as they open)."""
+    hit = _OUR_BUILDERS.get(region)
+    if hit and time.time() - hit[0] < 600:
+        return hit[1]
+    try:
+        _, rows = clickhouse_main(
+            "SELECT DISTINCT local_builder_id FROM bifrost_miniblocks "
+            "WHERE ts > now() - INTERVAL 1 DAY AND kind = 'selected'"
+            f"{accuracy._our_region_sql(region)} ORDER BY 1")
+        got = [r[0] for r in rows if r and r[0]]
+    except Exception:
+        got = []
+    _OUR_BUILDERS[region] = (time.time(), got)
+    return got
 
 
 def _slot_ref():

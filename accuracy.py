@@ -1317,9 +1317,66 @@ def received_at(ch, entities, lo=None, hi=None):
     return out
 
 
+def received_events(ch, entities, lo=None, hi=None):
+    """{entity: {instance: event}} -- each instance's FIRST
+    scheduler/received for the entity, with its attrs and nums verbatim
+    (toJSONString, see scheduler_notes) plus the three fields worth a
+    column: source, route and wait_us (None when not logged)."""
+    out = {}
+    ents = sorted({e for e in entities if e})
+    if not ents:
+        return out
+    f = "%Y-%m-%d %H:%M:%S"
+    tb = (f"ts >= '{lo:{f}}' AND ts <= '{hi:{f}}' AND " if lo and hi
+          else "ts > now() - INTERVAL 2 HOUR AND ")
+    for i in range(0, len(ents), ENTITY_BATCH):
+        lst = ", ".join("'%s'" % _q(e) for e in ents[i:i + ENTITY_BATCH])
+        try:
+            _, rows = ch(
+                "SELECT entity, instance_id, toString(min(ts)), "
+                "  argMin(attrs['source'], ts), argMin(attrs['route'], ts), "
+                "  argMin(if(has(mapKeys(nums), 'wait_us'), "
+                "            toString(nums['wait_us']), ''), ts), "
+                "  argMin(toJSONString(attrs), ts), "
+                "  argMin(toJSONString(nums), ts) "
+                f"FROM bifrost_events WHERE {tb}stage = 'scheduler' "
+                f"  AND event = 'received' AND entity IN ({lst}) "
+                "GROUP BY entity, instance_id")
+        except Exception:
+            continue
+        for ent, inst, t, src, route, w, a, n in rows:
+            out.setdefault(ent, {})[inst] = {
+                "at": t, "source": src or "", "route": route or "",
+                "wait": int(w) if w not in ("", None) else None,
+                "attrs": a or "{}", "nums": n or "{}"}
+    return out
+
+
+def attach_member_recv(ch, rows, marks, lo=None, hi=None):
+    """On every member of a bundle row, its own scheduler/received -- the
+    member's SigPrefix as an entity, i.e. the transaction arriving on its
+    own (the relay's feed, mostly), not inside this bundle. `recv_alone`
+    is [(instance, ms after that instance's round_started or None,
+    event)], one per instance that logged it; empty = never alone."""
+    pfx = {m["prefix"] for x in rows for m in (x.get("members") or [])
+           if m.get("prefix")}
+    if not pfx:
+        return rows
+    got = received_events(ch, pfx, lo, hi)
+    for x in rows:
+        for m in x.get("members") or []:
+            out = []
+            for inst, ev in sorted((got.get(m.get("prefix")) or {}).items()):
+                mk = marks.get((inst, int(x["round"]))) or {}
+                after = _ms(mk["open"], ev["at"]) if "open" in mk else None
+                out.append((inst, after, ev))
+            m["recv_alone"] = out
+    return rows
+
+
 def attach_recv(ch, rows, slot, lo=None, hi=None, round_of=lambda x: x["round"],
                 prefix_of=lambda x: x.get("sigprefix"),
-                bundle_of=lambda x: x.get("bundle_id")):
+                bundle_of=lambda x: x.get("bundle_id"), marks=None):
     """Hang, on each row, when the builder admitted the order relative to
     its round: {instance: (ms after round_started, ms before that
     instance's `winner` row in bifrost_miniblocks -- see round_marks)}.
@@ -1330,7 +1387,8 @@ def attach_recv(ch, rows, slot, lo=None, hi=None, round_of=lambda x: x["round"],
     instance's clock, so no correction applies. Negative "after open"
     means it arrived before that round opened -- normal for a round that
     is not the slot's first."""
-    marks = round_marks(ch, slot, lo, hi)
+    if marks is None:
+        marks = round_marks(ch, slot, lo, hi)
     ents = set()
     for x in rows:
         ents.update(k for k in (prefix_of(x), bundle_of(x)) if k)
@@ -1633,7 +1691,37 @@ def _sel_filters(rows):
             f'<span class="sfks">{kbox}</span> '
             '<label>scheduler said <select class="sf-s"><option value="">'
             f"anything</option>{sopts}</select></label> "
-            '<span class="sf-n dim"></span></div>')
+            '<span class="sf-n dim"></span> '
+            '<span class="sf-use" role="button" tabindex="0" hidden '
+            'title="drop this slot\'s own filter and follow the page '
+            'filter again">use page filter</span></div>')
+
+
+def global_filter_html(builders=()):
+    """The page-wide default for every slot's diff filter. Set here, it is
+    pushed into each slot as it opens and into every open slot that has
+    not been changed by hand; a slot's own filter, once touched, wins until
+    "use page filter". Remembered in the browser. The scheduler list fills
+    from the slots opened so far -- its values are per-slot verdicts."""
+    bopts = "".join(f'<option value="{html.escape(b, quote=True)}">'
+                    f"{html.escape(b)}</option>" for b in builders)
+    kbox = "".join(
+        f'<label class="sfk"><input type="checkbox" class="gf-t" '
+        f'value="{k}" checked> <span class="kd {k}">{k}</span></label>'
+        for k in ("txn", "bundle"))
+    return ('<div class="selfilt gfilt"><span class="dim">filter for every '
+            "slot</span> "
+            '<label>verdict <select class="gf-v"><option value="">both</option>'
+            '<option value="titan_inc_not_us">titan_inc_not_us</option>'
+            '<option value="us_inc_not_titan">us_inc_not_titan</option>'
+            "</select></label> "
+            '<label>our builder <select class="gf-o"><option value="">all'
+            f"</option>{bopts}</select></label> "
+            f'<span class="sfks">{kbox}</span> '
+            '<label>scheduler said <select class="gf-s"><option value="">'
+            "anything</option></select></label> "
+            '<span class="gfnote dim">a slot\'s own filter overrides this '
+            "once changed</span></div>")
 
 
 def _sched_pairs(x):
@@ -1929,7 +2017,10 @@ def selection_diff(relay_q, ch, rounds_, window, blocks=None,
     attach_notes(ch, flat_rows, *(window or (None, None)))
     lo, hi = window or (None, None)
     for sl in {x["slot"] for x in flat_rows}:
-        attach_recv(ch, [x for x in flat_rows if x["slot"] == sl], sl, lo, hi)
+        part = [x for x in flat_rows if x["slot"] == sl]
+        marks = round_marks(ch, sl, lo, hi)
+        attach_recv(ch, part, sl, lo, hi, marks=marks)
+        attach_member_recv(ch, part, marks, lo, hi)
     for x in flat_rows:
         x["kind"] = ("bundle" if x.get("bundle_id") or x.get("type") == "bundle"
                      else "txn")
@@ -2408,15 +2499,45 @@ def _bundle_panel(i):
             f'<td>{copy_val(m["prefix"]) if m["prefix"] else "&mdash;"}</td>'
             f'<td class="land {"y" if m["landed"] == "yes" else "n"}">'
             f'{m["landed"] or "?"}</td>'
-            f'<td class="n">{_rw_cell(m)}</td><td>{tag}</td></tr>')
+            f'<td class="n">{_rw_cell(m)}</td><td>{tag}</td>'
+            f"<td>{_alone_cell(m)}</td></tr>")
     return ('<div class="sxbox"><div class="sxh">bundle '
             + copy_val(i["bundle_id"], i["bundle_id"][:16] + "\u2026")
             + f' &middot; {len(i["members"])} member'
             + ("" if len(i["members"]) == 1 else "s") + "</div>"
             '<table class="otab"><tr><th>#</th><th>signature</th>'
             "<th>sigprefix</th><th>landed</th>"
-            '<th class="n">reward</th><th></th></tr>'
+            '<th class="n">reward</th><th></th>'
+            '<th title="scheduler/received for the member\'s own SigPrefix: '
+            "the transaction arriving on its own, outside this bundle -- "
+            "per instance, ms after that instance's round_started, "
+            "source/route and the relay's hold. Hover a line for the raw "
+            'attrs and nums">received on its own</th></tr>'
             + "".join(rows) + "</table></div>")
+
+
+def _alone_cell(m):
+    got = m.get("recv_alone")
+    if got is None:
+        return '<span class="dim">&mdash;</span>'
+    if not got:
+        return '<span class="dim">never on its own</span>'
+    out = []
+    for inst, after, ev in got:
+        raw = html.escape(f"{ev['at']}\nattrs {ev['attrs']}\nnums  {ev['nums']}",
+                          quote=True)
+        when = (f"{after:+.1f} ms" if after is not None
+                else html.escape(ev["at"][11:23]))
+        hold = ("no wait_us" if ev["wait"] is None
+                else f"hold {ev['wait'] / 1000:.1f} ms")
+        out.append(f'<div class="alone" title="{raw}">'
+                   f'{html.escape(inst.replace("ASTRALANE_", ""))} '
+                   f'<span class="m">{when}</span> &middot; '
+                   f'{html.escape(ev["source"] or "?")}/'
+                   f'{html.escape(ev["route"] or "?")} &middot; '
+                   f'<span class="{"held" if ev["wait"] else "dim"}">{hold}</span>'
+                   "</div>")
+    return "".join(out)
 
 
 def _sched_panel(i):
@@ -3866,6 +3987,10 @@ td.kd i{font-style:normal;color:#f87171;font-size:10px;margin-left:4px}
   border-radius:6px;font-size:12px}
 .selfilt select{margin-left:4px;max-width:340px}
 .sfk{cursor:pointer;white-space:nowrap}
+.alone{white-space:nowrap;font-size:11.5px}
+.gfilt{margin:10px 28px 0}
+.gfilt .gfnote{font-size:11px}
+.sf-use{font-size:11px;color:#93c5fd;cursor:pointer}
 .pfcharts{display:flex;flex-wrap:wrap;gap:18px;margin:6px 0 8px}
 .pfchart{min-width:0}
 .pftitle{font-size:12px;color:#dbe4ee;margin-bottom:2px}
@@ -4008,6 +4133,8 @@ ACCURACY_JS = r'''
       .then(function(r){ return r.text(); })
       .then(function(t){
         box.innerHTML = t;
+        // the page-wide diff filter, if this page has one
+        if (window.__selGlobal) window.__selGlobal(box);
         // the panel ships its data as a <script type="application/json">,
         // which innerHTML inserts but never executes -- so the renderer
         // has to be called by hand once the node is in the DOM
@@ -4278,9 +4405,97 @@ ACCURACY_JS = r'''
       op.disabled = c === 0 && !op.selected;
     });
   }
+  window.__selApply = apply;
   document.addEventListener('change', function(ev){
     var bar = ev.target.closest && ev.target.closest('.selfilt');
-    if (bar) apply(bar);
+    if (!bar || bar.classList.contains('gfilt')) return;
+    // changed by hand: this slot stops following the page filter
+    bar.setAttribute('data-local', '1');
+    var u = bar.querySelector('.sf-use');
+    if (u) u.hidden = false;
+    apply(bar);
+  });
+})();
+
+(function(){
+  // The page-wide filter. Pushed into each slot's bar when the slot
+  // loads, and into every loaded bar not changed by hand when it changes.
+  var g = document.querySelector('.gfilt');
+  if (!g) return;
+  var KEY = 'accuracy.pagefilter.v1';
+  var gv = g.querySelector('.gf-v'), go = g.querySelector('.gf-o'),
+      gs = g.querySelector('.gf-s');
+  function state(){
+    var so = gs.selectedOptions[0];
+    return {v: gv.value, o: go.value, s: gs.value,
+            sl: (so && so.getAttribute('data-l')) || gs.value,
+            k: [].filter.call(g.querySelectorAll('.gf-t'),
+                              function(b){ return b.checked; })
+                 .map(function(b){ return b.value; })};
+  }
+  // a value the select does not list yet gets an option, so a filter for
+  // a builder or verdict absent from this slot shows 0 rows, not all
+  function ensure(sel, val, label){
+    if (!sel || !val) return;
+    var has = [].some.call(sel.options, function(o){ return o.value === val; });
+    if (!has){
+      var op = document.createElement('option');
+      op.value = val;
+      op.setAttribute('data-l', label || val);
+      // a slot's own select shows counts (recount fills them in)
+      op.textContent = (label || val) + (sel.closest('.gfilt') ? '' : ' (0)');
+      sel.appendChild(op);
+    }
+  }
+  function push(bar){
+    if (bar.getAttribute('data-local') === '1') return;
+    var st = state();
+    var v = bar.querySelector('.sf-v'), o = bar.querySelector('.sf-o'),
+        s = bar.querySelector('.sf-s');
+    ensure(v, st.v); if (v) v.value = st.v;
+    ensure(o, st.o); if (o) o.value = st.o;
+    ensure(s, st.s, st.sl); if (s) s.value = st.s;
+    bar.querySelectorAll('.sf-t').forEach(function(b){
+      b.checked = st.k.indexOf(b.value) >= 0;
+    });
+    if (window.__selApply) window.__selApply(bar);
+  }
+  // the scheduler verdicts are per slot: collect them as slots load
+  function harvest(bar){
+    bar.querySelectorAll('.sf-s option[data-l]').forEach(function(op){
+      ensure(gs, op.value, op.getAttribute('data-l'));
+    });
+    bar.querySelectorAll('.sf-o option[data-l]').forEach(function(op){
+      ensure(go, op.value, op.getAttribute('data-l'));
+    });
+  }
+  function save(){
+    try { localStorage.setItem(KEY, JSON.stringify(state())); } catch(e) {}
+  }
+  function all(){ document.querySelectorAll('.selfilt:not(.gfilt)').forEach(push); }
+  try {
+    var st = JSON.parse(localStorage.getItem(KEY) || 'null');
+    if (st){
+      ensure(gv, st.v); gv.value = st.v || '';
+      ensure(go, st.o); go.value = st.o || '';
+      ensure(gs, st.s, st.sl || st.s); gs.value = st.s || '';
+      g.querySelectorAll('.gf-t').forEach(function(b){
+        b.checked = !st.k || st.k.indexOf(b.value) >= 0;
+      });
+    }
+  } catch(e) {}
+  g.addEventListener('change', function(){ save(); all(); });
+  window.__selGlobal = function(root){
+    (root || document).querySelectorAll('.selfilt:not(.gfilt)')
+      .forEach(function(bar){ harvest(bar); push(bar); });
+  };
+  document.addEventListener('click', function(ev){
+    var u = ev.target.closest && ev.target.closest('.sf-use');
+    if (!u) return;
+    var bar = u.closest('.selfilt');
+    bar.removeAttribute('data-local');
+    u.hidden = true;
+    push(bar);
   });
 })();
 '''
