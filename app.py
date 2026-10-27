@@ -81,6 +81,12 @@ RELAY_URL = os.environ.get("RELAY_URL", "")
 RELAY_USER = os.environ.get("RELAY_USER", "")
 RELAY_PASS = os.environ.get("RELAY_PASS", "")
 RELAY_DS_UID = os.environ.get("RELAY_DS_UID", "")
+# The relay's ClickHouse directly (Gattaca's read-only partner login): every
+# relay table, ~1 min behind, no Grafana proxy in the way. Optional -- the
+# win-rate panel falls back to the Grafana datasource without it.
+RELAY_CH_URL = os.environ.get("RELAY_CH_URL", "")
+RELAY_CH_USER = os.environ.get("RELAY_CH_USER", "")
+RELAY_CH_PASS = os.environ.get("RELAY_CH_PASS", "")
 # our builder_id as the relay knows it; usually the same as dep()["builder"]
 RELAY_OUR_BUILDER = os.environ.get("RELAY_OUR_BUILDER", "")
 
@@ -294,6 +300,25 @@ def relay(sql):
     frame = frames[0]
     return ([f["name"] for f in frame["schema"]["fields"]],
             list(zip(*frame["data"]["values"])))
+
+
+def relay_direct(sql):
+    """-> (columns, rows) from the relay's ClickHouse over the partner login,
+    the same shape relay() returns."""
+    if not RELAY_CH_URL:
+        raise RuntimeError("RELAY_CH_URL not configured")
+    tok = base64.b64encode(f"{RELAY_CH_USER}:{RELAY_CH_PASS}".encode()).decode()
+    req = urllib.request.Request(
+        RELAY_CH_URL.rstrip("/") + "/?default_format=JSONCompact",
+        data=sql.encode(), headers={"Authorization": "Basic " + tok})
+    with urllib.request.urlopen(req, timeout=90) as resp:
+        d = json.loads(resp.read())
+    return [m["name"] for m in d.get("meta", [])], [tuple(r) for r in d.get("data", [])]
+
+
+def relay_fast(sql):
+    """The direct login when it is configured, Grafana otherwise."""
+    return relay_direct(sql) if RELAY_CH_URL else relay(sql)
 
 
 def _relay_post(sql, uid):
@@ -3268,11 +3293,18 @@ def winrate_html():
     marks anything carrying the house prefix, because the fleet is wider than
     what this dashboard instruments.
     """
-    if not (RELAY_URL and RELAY_DS_UID):
-        return ('<div class="none">win rates need the relay: set RELAY_URL '
-                "and RELAY_DS_UID</div>")
+    if not (RELAY_CH_URL or (RELAY_URL and RELAY_DS_UID)):
+        return ('<div class="none">win rates need the relay: set RELAY_CH_URL, '
+                "or RELAY_URL and RELAY_DS_UID</div>")
     ours = [d.get("relay_builder") for d in instances() if d.get("relay_builder")]
-    return winrate.render(winrate.cached(lambda sql: relay(sql), our_builders=ours))
+    return winrate.render(winrate.cached(relay_fast, our_builders=ours))
+
+
+def winrate_history_html():
+    """The panel's history toggle: win% per builder per UTC hour."""
+    ours = [d.get("relay_builder") for d in instances() if d.get("relay_builder")]
+    return winrate.render_history(winrate.cached_history(relay_fast,
+                                                         our_builders=ours))
 
 
 def perf_stats():
@@ -7200,6 +7232,27 @@ WINRATE_JS = r'''
   }
   box.addEventListener('toggle', load);
   load();
+  // the history toggle under the table: fetched on first open, then shown
+  // and hidden without another request
+  box.addEventListener('click', function(ev){
+    var b = ev.target.closest && ev.target.closest('.wr-histbtn');
+    if (!b) return;
+    var h = b.nextElementSibling;
+    if (!h) return;
+    var open = h.hidden;
+    h.hidden = !open;
+    b.setAttribute('aria-expanded', open ? 'true' : 'false');
+    if (!open || h.dataset.loaded !== '0') return;
+    h.dataset.loaded = '1';
+    h.innerHTML = '<div class="none">loading the last 24 hours\u2026</div>';
+    fetch('/winrate/history' + location.search)
+      .then(function(r){ return r.text(); })
+      .then(function(t){ h.innerHTML = t; })
+      .catch(function(e){
+        h.dataset.loaded = '0';
+        h.innerHTML = '<div class="err">could not load: ' + e + '</div>';
+      });
+  });
 })();
 '''
 
@@ -10011,6 +10064,13 @@ class Handler(BaseHTTPRequestHandler):
             return ('<div class="err">win rates unavailable: '
                     f"{html.escape(str(exc))[:200]}</div>")
 
+    def _frag_winrate_history(self, q):
+        try:
+            return winrate_history_html()
+        except Exception as exc:
+            return ('<div class="err">win-rate history unavailable: '
+                    f"{html.escape(str(exc))[:200]}</div>")
+
     def _frag_perf(self, q):
         try:
             return perf_stats_html()
@@ -10044,6 +10104,7 @@ class Handler(BaseHTTPRequestHandler):
             REWARDS_PATH: (self._page_rewards, False),
             REF_PATH: (self._page_reference, False),
             "/winrate": (self._frag_winrate, True),
+            "/winrate/history": (self._frag_winrate_history, True),
             "/perf": (self._frag_perf, True),
             "/analysis/orders": (self._frag_orders, True),
             "/api/valcomp/status": (self._api_valcomp_status, "json"),
