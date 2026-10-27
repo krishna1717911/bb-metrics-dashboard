@@ -3155,6 +3155,7 @@ REWARDS_PATH = "/econ/rewards"
 # page, which is the same invisible-state problem the explicit parameter
 # exists to solve, just pointing the other way.
 DEP_FREE_PATHS = {HEALTH_PATH, ACCURACY_PATH, ACCURACY_PATH + '/slot',
+                  HEALTH_PATH + '/winrate-history',
                   HOME_PATH, DEPLOYHIST_PATH, VALCOMP_PATH,
                   ACCURACY_PATH + '/export.csv',
                   '/tech/offer-timelines', '/tech/offer-timelines/slot',
@@ -3298,6 +3299,22 @@ def winrate_html():
                 "or RELAY_URL and RELAY_DS_UID</div>")
     ours = [d.get("relay_builder") for d in instances() if d.get("relay_builder")]
     return winrate.render(winrate.cached(relay_fast, our_builders=ours))
+
+
+def health_winrate_history(qs):
+    """The health page's win-rate card toggle: one builder's win% per UTC
+    hour over 24 h, or per UTC day over 7 d."""
+    b = (qs.get("builder", [""])[0] or "").strip()
+    if not re.match(r"^[A-Za-z0-9_\-]{1,64}$", b):
+        return '<div class="herr">not a builder id</div>'
+    unit = "day" if (qs.get("unit", [""])[0] or "") == "day" else "hour"
+    n = health.WRH_DAYS if unit == "day" else 24
+    try:
+        data = winrate.cached_history(relay_fast, hours=n, unit=unit)
+    except Exception as exc:
+        return ('<div class="herr">the relay could not be read: '
+                f"{html.escape(str(exc))[:200]}</div>")
+    return health.winrate_history_html(b, data)
 
 
 def winrate_history_html():
@@ -9411,8 +9428,11 @@ def health_page():
     # relay_analyst credential (rotated 2026-10-17). The Grafana datasource
     # reads mini_block_events_v2 directly and is the only live path to the
     # relay's own store.
-    body = health.body(clickhouse_main, influx_series, otel_or_explain, relay,
-                       SOLANA_RPC, HEALTH_PATH)
+    # relay_fast: every relay query here reads relay.mini_block_events_v2,
+    # which the direct login serves without Grafana's proxy -- whose TLS
+    # handshake times out now and then and blanked the win-rate card.
+    body = health.body(clickhouse_main, influx_series, otel_or_explain,
+                       relay_fast, SOLANA_RPC, HEALTH_PATH)
     return shell(body, here="health",
                  subtitle="connector &amp; relay health",
                  extra_css=health.CSS)
@@ -10105,6 +10125,7 @@ class Handler(BaseHTTPRequestHandler):
             REF_PATH: (self._page_reference, False),
             "/winrate": (self._frag_winrate, True),
             "/winrate/history": (self._frag_winrate_history, True),
+            HEALTH_PATH + "/winrate-history": (health_winrate_history, True),
             "/perf": (self._frag_perf, True),
             "/analysis/orders": (self._frag_orders, True),
             "/api/valcomp/status": (self._api_valcomp_status, "json"),

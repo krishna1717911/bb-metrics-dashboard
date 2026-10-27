@@ -13,11 +13,13 @@ builder's submissions; our `bifrost_miniblocks.won_by_us` can only ever say
 Three things this gets right that a naive count does not, each learned the
 hard way and each worth keeping:
 
-  * TAIL ROUNDS COUNT AS WINS. They are exclusive -- one builder owns a tail
-    round -- so they are counted as distinct (slot, index_in_slot) graded
-    `tail`, never as accepted offers: one tail round absorbs
-    many accepted offers from its single owner. Leaving them out silently
-    undercounts the winner.
+  * TAIL ROUNDS ARE NOT WINS. Only the previous round's winner may bid in
+    a tail and the relay chooses nothing, so win% and share% count chosen
+    rounds only; a tail round stays in "rounds bid on". Tails are still
+    counted -- as distinct (slot, index_in_slot) graded `tail`, never as
+    accepted offers, since one tail round absorbs many -- and shown in
+    their own column. (They used to be added to wins, which read FRA_1 at
+    31.1% instead of 29.9% over 24 h on 2026-10-27.)
 
   * TWO DENOMINATORS, because one is misleading on its own. `win% contested`
     is wins over rounds that builder actually bid in; `share%` is wins over
@@ -99,10 +101,16 @@ def _chosen_sql(where, pad_where):
     submitted side is read over a padded window -- the winning offer comes
     a few ms before round_chosen, and a round at the window's start would
     otherwise lose its owner."""
+    chosen = (f"SELECT mini_block_uuid FROM {TABLE} "
+              f"WHERE {where} AND event = 'round_chosen'")
+    # Only the winning uuids' submitted rows are grouped: grouping every
+    # offer in the window by uuid ran Gattaca's ClickHouse out of memory
+    # (14.9 GiB limit) at 21 days.
     return (f"(SELECT mini_block_uuid, timestamp AS t FROM {TABLE} "
             f" WHERE {where} AND event = 'round_chosen') AS c "
             "INNER JOIN (SELECT mini_block_uuid, any(builder_id) AS b "
             f" FROM {TABLE} WHERE {pad_where} AND event = 'submitted' "
+            f"   AND mini_block_uuid IN ({chosen}) "
             " GROUP BY mini_block_uuid) AS s "
             "ON c.mini_block_uuid = s.mini_block_uuid")
 
@@ -155,14 +163,17 @@ def collect(relay, hours=WINDOW_H, our_builders=(), keep_cogent=False):
         builder = r[0]
         offered, contested, tail_wins, rejected, cbne = (_int(v) for v in r[1:6])
         rw = round_wins.get(builder, 0)
+        # win% and share% count chosen rounds only: a tail round has no
+        # contest (only the previous winner may bid, nothing is chosen), so
+        # it is shown in its own column and never counted as a win
         wins = rw + tail_wins
         top = sorted(reasons.get(builder, {}).items(), key=lambda kv: -kv[1])[:1]
         out.append({
             "builder": builder, "offered": offered, "contested": contested,
             "round_wins": rw, "tail_wins": tail_wins, "wins": wins,
             "rejected": rejected, "cogent_bne": cbne,
-            "win_pct": _pct(wins, contested),
-            "share_pct": _pct(wins, winnable),
+            "win_pct": _pct(rw, contested),
+            "share_pct": _pct(rw, regular),
             "rej_pct": _pct(rejected, offered),
             "top_reason": (f"{top[0][0]} ({top[0][1]:,})" if top else "-"),
             "ours": is_ours(builder),
@@ -173,34 +184,44 @@ def collect(relay, hours=WINDOW_H, our_builders=(), keep_cogent=False):
             "keep_cogent": keep_cogent}
 
 
-def collect_history(relay, hours=WINDOW_H, our_builders=()):
-    """win% contested per builder per UTC hour, the current (partial) hour
-    last. A round is bucketed by when it was bid in (its submitted rows) and,
-    for the win, by its round_chosen / tail row -- the two land in the same
-    hour except for a round straddling the boundary."""
-    start = f"toStartOfHour(now()) - INTERVAL {int(hours) - 1} HOUR"
+# The relay's v2 round log starts 2026-10-06 15:41Z; older days come back
+# empty, not wrong.
+MAX_DAYS = 30
+
+
+def collect_history(relay, hours=WINDOW_H, our_builders=(), unit="hour"):
+    """win% contested per builder per UTC hour (or day, unit="day", with
+    `hours` then counting days), the current partial bucket last. A round
+    is bucketed by when it was bid in (its submitted rows) and, for the
+    win, by its round_chosen / tail row -- the two land in the same bucket
+    except for a round straddling the boundary."""
+    day = unit == "day"
+    fn = "toStartOfDay" if day else "toStartOfHour"
+    span = "DAY" if day else "HOUR"
+    start = f"{fn}(now()) - INTERVAL {int(hours) - 1} {span}"
     where = f"timestamp >= {start}"
     pad = f"timestamp >= {start} - INTERVAL 5 MINUTE"
     _, rows = relay(
         "SELECT assumeNotNull(builder_id) AS b,"
-        " toString(toStartOfHour(timestamp)) AS h,"
+        f" toString({fn}(timestamp)) AS h,"
         f" uniqExact({ROUND}) AS contested,"
         f" uniqExactIf({ROUND}, reason = 'tail') AS tail_wins"
         f" FROM {TABLE} WHERE {where} AND event = 'submitted'"
         "   AND builder_id != '' GROUP BY b, h")
-    _, won = relay(f"SELECT s.b, toString(toStartOfHour(c.t)) AS h, count() "
+    _, won = relay(f"SELECT s.b, toString({fn}(c.t)) AS h, count() "
                    f"FROM {_chosen_sql(where, pad)} GROUP BY s.b, h")
-    _, now_h = relay("SELECT toString(toStartOfHour(now()))")
+    _, now_h = relay(f"SELECT toString({fn}(now()))")
     cells = {}
-    for b, h, contested, tw in rows:
+    # wins = chosen rounds only; tail rounds count as bid on, never won
+    for b, h, contested, _tw in rows:
         c = cells.setdefault(b, {}).setdefault(h[:16], [0, 0])
         c[0] += _int(contested)
-        c[1] += _int(tw)
     for b, h, n in won:
         cells.setdefault(b, {}).setdefault(h[:16], [0, 0])[1] += _int(n)
     import datetime as dt
     last = dt.datetime.fromisoformat(now_h[0][0][:19]) if now_h else None
-    hrs = ([(last - dt.timedelta(hours=k)).strftime("%Y-%m-%d %H:%M")
+    one = dt.timedelta(days=1) if day else dt.timedelta(hours=1)
+    hrs = ([(last - one * k).strftime("%Y-%m-%d %H:%M")
             for k in range(int(hours) - 1, -1, -1)] if last else
            sorted({h for v in cells.values() for h in v}))
     ours = {b for b in our_builders if b}
@@ -219,16 +240,18 @@ def collect_history(relay, hours=WINDOW_H, our_builders=()):
     # ours first, then by wins; builders that never win (mocks, idle
     # fallbacks) last
     builders.sort(key=lambda r: (not r["ours"], r["wins"] == 0, -r["wins"]))
-    return {"hours": int(hours), "hrs": hrs, "builders": builders}
+    return {"hours": int(hours), "hrs": hrs, "builders": builders,
+            "unit": "day" if day else "hour"}
 
 
-def cached_history(relay, our_builders=(), hours=WINDOW_H):
-    key = ("hist", hours, tuple(sorted(our_builders)))
+def cached_history(relay, our_builders=(), hours=WINDOW_H, unit="hour"):
+    key = ("hist", unit, hours, tuple(sorted(our_builders)))
     with _lock:
         hit = _cache.get(key)
         if hit and time.time() - hit[0] < TTL_S:
             return hit[1]
-    data = collect_history(relay, hours=hours, our_builders=our_builders)
+    data = collect_history(relay, hours=hours, our_builders=our_builders,
+                           unit=unit)
     with _lock:
         _cache[key] = (time.time(), data)
     return data
@@ -275,7 +298,7 @@ CSS = """
 """
 
 COLS = [("b", "builder"), ("", "offered"), ("", "contested"),
-        ("", "round wins"), ("", "tail wins"), ("", "wins"),
+        ("", "round wins"), ("", "tail rounds"), ("", "wins + tails"),
         ("", "win% contested"), ("", "share%"), ("", "rejected"),
         ("", "rej%"), ("", "cogent_bne"), ("b", "top reject reason")]
 
@@ -382,8 +405,11 @@ def render(data):
         '<div class="wr-hist" hidden data-loaded="0"></div>' +
         '<div class="wr-note">&#9733; = ours. '
         '<b>win% contested</b> is wins over rounds that builder actually bid '
-        'in; <b>share%</b> is wins over every winnable round in the window. '
-        'Builders serve different connectors, so only win% compares across '
-        'regions. <b>tail wins</b> are counted as distinct rounds, not as '
-        'accepted offers &mdash; one tail round absorbs many. '
+        'in; <b>share%</b> is wins over every round the relay chose a winner '
+        'for in the window. A win is a round the relay chose that builder '
+        'for. <b>tail rounds</b> are not wins &mdash; only the previous '
+        'winner may bid in one and nothing is chosen &mdash; so they count '
+        'as bid on but never as won; "wins + tails" is kept only so the '
+        'column still sums to every round. Builders serve different '
+        'connectors, so only win% compares across regions. '
         + cogent_note + '</div>')

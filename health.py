@@ -38,6 +38,9 @@ import threading
 import time
 import urllib.request
 
+# the charting library and version the rewards page already loads
+from rewards import PLOTLY_CDN
+
 
 # ======================================================== CONFIG -- SWAP ME
 #
@@ -718,8 +721,14 @@ def win_rates(relay):
         for b, wins in rows:
             if b in out:
                 out[b]["round_wins"] = int(wins or 0)
+        # A win is a round the relay chose this builder for. Tail rounds
+        # are not wins: only the previous round's winner may bid in one and
+        # nothing is chosen, so they stay in "rounds bid on" and are shown
+        # on their own line, but never in the numerator (FRA_1 24 h to
+        # 2026-10-27: 9,725 chosen + 382 tail; counting both read 31.1%
+        # where the real rate is 29.9%).
         for v in out.values():
-            v["wins"] = v["round_wins"] + v["tail_wins"]
+            v["wins"] = v["round_wins"]
             v["pct"] = (100.0 * v["wins"] / v["contested"]
                         if v["contested"] else None)
         return out
@@ -810,6 +819,25 @@ CSS = """
 .hsel button{background:#0f766e;border:1px solid #14b8a6;color:#eafffb;
   border-radius:6px;padding:6px 14px;font-size:12px;cursor:pointer}
 .bpanel[hidden]{display:none}
+.wrh-btn{margin-top:10px;background:#0c141b;border:1px solid #22303f;
+  color:#9fb3c8;border-radius:6px;padding:4px 10px;font-size:11.5px;cursor:pointer}
+.wrh-btn:hover,.wrh-btn[aria-expanded=true]{border-color:#14b8a6;color:#5eead4}
+.wrh[hidden]{display:none}
+.wrh{margin:0 28px 14px}
+.wrh-box{border:1px solid #1e2937;border-radius:8px;padding:12px 14px 8px;
+  background:#0b1016;position:relative}
+.wrh-head{color:#8fa6bf;font-size:12px;margin-bottom:6px;line-height:1.5}
+.wrh-plot{min-height:300px}
+.wrh-ctl{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:8px}
+.wrh-mode{background:#0c141b;border:1px solid #22303f;color:#9fb3c8;
+  border-radius:6px;padding:3px 9px;font-size:11.5px;cursor:pointer}
+.wrh-mode:hover{border-color:#14b8a6}
+.wrh-mode.on{border-color:#14b8a6;color:#5eead4;background:#0f766e33}
+.wrh-tab{margin-top:6px;font-size:11px;color:#8fa6bf}
+.wrh-tab table{border-collapse:collapse;margin-top:4px}
+.wrh-tab td,.wrh-tab th{padding:2px 10px 2px 0;text-align:right;
+  font:11px ui-monospace,Menlo,monospace;color:#cfe0f0}
+.wrh-tab th{color:#6b7f96;font-weight:600}
 .hsel .lagn{color:#4d5c70;font-size:11px}
 /* Four cards, one row, on any screen wide enough to hold them. The grid was
    capped at 1180px with a 330px minimum, so the fourth card always wrapped
@@ -971,6 +999,66 @@ def picker(insts, cur):
 
 HEALTH_JS = r'''
 (function(){
+  // The win-rate card's "hourly history": the chart lives in a full-width
+  // slot under the card row, fetched on first open, then only shown/hidden.
+  document.addEventListener('click', function(ev){
+    var b = ev.target.closest && ev.target.closest('.wrh-btn');
+    if (!b) return;
+    var panel = b.closest('.bpanel');
+    var box = panel && panel.querySelector('.wrh');
+    if (!box) return;
+    var open = box.hidden;
+    box.hidden = !open;
+    b.setAttribute('aria-expanded', open ? 'true' : 'false');
+    if (!open || box.getAttribute('data-loaded') !== '0') return;
+    box.setAttribute('data-loaded', '1');
+    wrhLoad(box, b.getAttribute('data-b'), 'hour', 24);
+  });
+  function wrhLoad(box, builder, unit, n){
+    box.innerHTML = '<div class="none">loading the last ' + n +
+      (unit === 'day' ? ' days' : ' hours') + '\u2026</div>';
+    fetch('/tech/health/winrate-history?builder=' + encodeURIComponent(builder)
+          + '&unit=' + unit + '&n=' + n)
+      .then(function(r){ return r.text(); })
+      .then(function(t){ box.innerHTML = t; return plotly(); })
+      .then(function(){
+        var spec = box.querySelector('.wrh-fig'),
+            el = box.querySelector('.wrh-plot');
+        if (!spec || !el) return;
+        var f = JSON.parse(spec.textContent);
+        Plotly.newPlot(el, f.data, f.layout, f.config);
+      })
+      .catch(function(e){
+        box.setAttribute('data-loaded', '0');
+        box.innerHTML = '<div class="herr">could not load: ' + e + '</div>';
+      });
+  }
+  // Plotly, the library the rewards page already uses, fetched once on the
+  // first chart rather than on every health page load
+  var plotlyP = null;
+  function plotly(){
+    if (window.Plotly) return Promise.resolve();
+    if (!plotlyP) plotlyP = new Promise(function(ok, bad){
+      var sc = document.createElement('script');
+      sc.src = '__PLOTLY_CDN__';
+      sc.charset = 'utf-8';
+      sc.onload = ok;
+      sc.onerror = function(){ plotlyP = null; bad('Plotly did not load'); };
+      document.head.appendChild(sc);
+    });
+    return plotlyP;
+  }
+  // hourly / daily-for-n-days switch inside the chart
+  document.addEventListener('click', function(ev){
+    var m = ev.target.closest && ev.target.closest('.wrh-mode');
+    if (!m) return;
+    var box = m.closest('.wrh');
+    if (box) wrhLoad(box, m.getAttribute('data-b'),
+                     m.getAttribute('data-unit'), m.getAttribute('data-n'));
+  });
+})();
+
+(function(){
   // Every builder's cards are already in the DOM -- one fleet-wide query
   // per store built them all. Switching is show/hide: no request, and
   // nothing that can wait on a store.
@@ -1029,7 +1117,7 @@ HEALTH_JS = r'''
 '''
 
 
-def _card(title, big, grade, sub, rows=(), note="", err=""):
+def _card(title, big, grade, sub, rows=(), note="", err="", foot=""):
     out = [f'<div class="hcard"><h3>{title}</h3>'
            f'<div class="hbig {grade}">{big}</div>']
     if sub:
@@ -1040,7 +1128,7 @@ def _card(title, big, grade, sub, rows=(), note="", err=""):
         out.append(f'<div class="herr">{err}</div>')
     if note:
         out.append(f'<div class="hnote">{note}</div>')
-    return "".join(out) + "</div>"
+    return "".join(out) + foot + "</div>"
 
 
 def building_card(d):
@@ -1135,7 +1223,7 @@ def winrate_card(me, peers):
     rows = [("offered", f'{me["offered"]:,}'),
             ("rounds bid on", f'{me["contested"]:,}'),
             ("round wins", f'{me["round_wins"]:,}'),
-            ("tail wins", f'{me["tail_wins"]:,}')]
+            ("tail rounds (uncontested, not wins)", f'{me["tail_wins"]:,}')]
     same = sorted((v for b, v in peers.items()
                    if v["region"] == me["region"] and v["pct"] is not None),
                   key=lambda v: -v["pct"])
@@ -1153,7 +1241,122 @@ def winrate_card(me, peers):
         rows, note=note or
         "Contested denominator: rounds this builder actually bid on. A "
         "window-wide one counts rounds on connectors it never sees, which "
-        "makes a smaller market look worse than it is.")
+        "makes a smaller market look worse than it is.",
+        foot=(f'<button type="button" class="wrh-btn" aria-expanded="false" '
+              f'data-b="{html.escape(me["builder"])}">hourly history '
+              "&#9662;</button>"))
+
+
+# --------------------------------------------- win rate, hour by hour
+#
+# Behind the win-rate card's toggle: this builder's win% over time, one
+# line, hourly for 24 h or daily for 7 d. Teal as for "ours" elsewhere.
+WRH_OURS = "#0d9488"
+
+
+WRH_DAYS = 7
+
+
+def _wrh_controls(builder, unit, n):
+    """hourly (24 h) / daily (7 d) switch."""
+    b = html.escape(builder, quote=True)
+    def btn(u, k, label):
+        on = u == unit and (u == "hour" or k == n)
+        return (f'<button type="button" class="wrh-mode{" on" if on else ""}" '
+                f'data-b="{b}" data-unit="{u}" data-n="{k}">{label}</button>')
+    return ('<div class="wrh-ctl">' + btn("hour", 24, "hourly &middot; 24h")
+            + btn("day", WRH_DAYS, f"daily &middot; {WRH_DAYS}d") + "</div>")
+
+
+def _wrh_figure(series, hrs, day):
+    """A Plotly figure (data, layout, config) -- the same library and the same
+    dark styling as the rewards page."""
+    traces = []
+    for r, col, _k in series:
+        ys, cd = [], []
+        for h in hrs:
+            c, w = r["by"].get(h, (0, 0))
+            ys.append(round(100.0 * w / c, 2) if c else None)
+            cd.append([w, c])
+        traces.append({
+            "type": "scatter", "mode": "lines+markers", "name": r["builder"],
+            "x": hrs, "y": ys, "customdata": cd, "connectgaps": False,
+            "line": {"color": col, "width": 2},
+            "marker": {"color": col, "size": 8,
+                       "line": {"color": "#0b1016", "width": 2}},
+            "hovertemplate": "%{y:.1f}%  (%{customdata[0]:,} of "
+                             "%{customdata[1]:,})<extra>" + r["builder"]
+                             + "</extra>"})
+    axis = {"gridcolor": "#1a2431", "zerolinecolor": "#243242",
+            "linecolor": "#243242", "tickfont": {"color": "#6b7f96", "size": 11}}
+    layout = {
+        "paper_bgcolor": "#0b1016", "plot_bgcolor": "#0b1016", "height": 300,
+        "font": {"color": "#c3d3e6",
+                 "family": "ui-sans-serif,-apple-system,Segoe UI,sans-serif"},
+        "margin": {"l": 52, "r": 16, "t": 8, "b": 40},
+        "hovermode": "x unified",
+        "hoverlabel": {"bgcolor": "#0d151d", "bordercolor": "#2f4256",
+                       "font": {"color": "#c3d3e6", "size": 12}},
+        "showlegend": False,          # one series: the heading names it
+        "xaxis": dict(axis, type="date",
+                      tickformat="%d/%m" if day else "%H:%M",
+                      hoverformat="%Y-%m-%d (UTC day)" if day
+                      else "%Y-%m-%d %H:%M UTC"),
+        "yaxis": dict(axis, ticksuffix="%", rangemode="tozero",
+                      title={"text": "win% contested",
+                             "font": {"color": "#8fa6bf", "size": 12}}),
+    }
+    config = {"displaylogo": False, "responsive": True,
+              "modeBarButtonsToRemove": ["lasso2d", "select2d"],
+              "toImageButtonOptions": {"format": "png", "scale": 2}}
+    return {"data": traces, "layout": layout, "config": config}
+
+
+def winrate_history_html(builder, data):
+    """data: winrate.collect_history() -- every builder, by UTC hour or day.
+    The chart itself is drawn in the browser by Plotly from the figure
+    shipped as JSON; see HEALTH_JS."""
+    day = data.get("unit") == "day"
+    span = f"{data['hours']} days" if day else f"{data['hours']}h"
+    ctl = _wrh_controls(builder, data.get("unit", "hour"), data["hours"])
+    me = next((r for r in data["builders"] if r["builder"] == builder), None)
+    if not me:
+        return (ctl + '<div class="none">the relay recorded no rounds this '
+                f"builder bid on in the last {span}</div>")
+    hrs = data["hrs"]
+    series = [(me, WRH_OURS, "me")]
+
+    def pct(r, h):
+        c, w = r["by"].get(h, (0, 0))
+        return 100.0 * w / c if c else None
+
+    fig = json.dumps(_wrh_figure(series, hrs, day)).replace("</", "<\\/")
+    totals = " &middot; ".join(
+        f'{html.escape(r["builder"])} {r["win_pct"]}% over {span}'
+        for r, _c, _k in series)
+    rows = "".join(
+        f"<tr><td>{html.escape(h[:10] if day else h[5:16])}</td>"
+        + "".join(f"<td>{'' if v is None else f'{v:.1f}%'}</td>"
+                  for r, _c, _k in series for v in [pct(r, h)])
+        + "</tr>" for h in hrs)
+    table = ('<details class="wrh-tab"><summary>as a table</summary><table>'
+             f"<tr><th>{'day' if day else 'hour'} (UTC)</th>"
+             + "".join(f"<th>{html.escape(r['builder'])}</th>"
+                       for r, _c, _k in series)
+             + f"</tr>{rows}</table></details>")
+    head = (f"win% contested per UTC day, last {span}; today is still "
+            "filling." if day else
+            f"win% contested per UTC hour, last {span}; the last hour is "
+            "still filling.")
+    return (f'<div class="wrh-box">{ctl}<div class="wrh-head">{head}<br>'
+            f'<span class="dim">{totals}</span></div>'
+            '<div class="wrh-plot"></div>'
+            f'<script type="application/json" class="wrh-fig">{fig}</script>'
+            + table + "</div>")
+
+
+def _short(b):
+    return re.sub(r"^(ASTRALANE|TITAN)_", "", b or "")
 
 
 def panic_card(d):
@@ -1464,6 +1667,8 @@ def body(ch, ix, ot, relay, rpc_url, path):
             + ("" if i == inst else " hidden") + ">"
             + '<h2 class="hsec">builder health</h2>'
             + f'<div class="hgrid g3">{"".join(row1)}</div>'
+            + f'<div class="wrh" data-b="{html.escape(i)}" data-loaded="0" '
+            'hidden></div>'
             + f'<div class="hgrid g2">{"".join(row2)}</div>'
             + '<h2 class="hsec">restarts, last '
             + f"{PANIC_DAYS} days</h2>"
@@ -1473,4 +1678,5 @@ def body(ch, ix, ot, relay, rpc_url, path):
             + "</div>")
     return (picker(insts, inst) + "".join(panels)
             + '<h2 class="hsec">relay health</h2>' + relay_section(relay)
-            + f"<script>{HEALTH_JS}</script>")
+            + "<script>" + HEALTH_JS.replace("__PLOTLY_CDN__", PLOTLY_CDN)
+            + "</script>")
