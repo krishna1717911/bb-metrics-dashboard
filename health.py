@@ -721,14 +721,13 @@ def win_rates(relay):
         for b, wins in rows:
             if b in out:
                 out[b]["round_wins"] = int(wins or 0)
-        # A win is a round the relay chose this builder for. Tail rounds
-        # are not wins: only the previous round's winner may bid in one and
-        # nothing is chosen, so they stay in "rounds bid on" and are shown
-        # on their own line, but never in the numerator (FRA_1 24 h to
-        # 2026-10-27: 9,725 chosen + 382 tail; counting both read 31.1%
-        # where the real rate is 29.9%).
+        # A win is a round the relay chose this builder for, or a tail round
+        # it owned: the tail's offers go into the block, so they are wins
+        # (decided 2026-10-28). A tail round has no contest -- only the
+        # previous round's winner may bid in it -- which lifts the rate a
+        # little: FRA_1 24 h, 9,725 chosen + 382 tail = 31.1% vs 29.9%.
         for v in out.values():
-            v["wins"] = v["round_wins"]
+            v["wins"] = v["round_wins"] + v["tail_wins"]
             v["pct"] = (100.0 * v["wins"] / v["contested"]
                         if v["contested"] else None)
         return out
@@ -1223,7 +1222,7 @@ def winrate_card(me, peers):
     rows = [("offered", f'{me["offered"]:,}'),
             ("rounds bid on", f'{me["contested"]:,}'),
             ("round wins", f'{me["round_wins"]:,}'),
-            ("tail rounds (uncontested, not wins)", f'{me["tail_wins"]:,}')]
+            ("tail wins", f'{me["tail_wins"]:,}')]
     same = sorted((v for b, v in peers.items()
                    if v["region"] == me["region"] and v["pct"] is not None),
                   key=lambda v: -v["pct"])

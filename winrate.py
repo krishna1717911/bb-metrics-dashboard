@@ -13,13 +13,12 @@ builder's submissions; our `bifrost_miniblocks.won_by_us` can only ever say
 Three things this gets right that a naive count does not, each learned the
 hard way and each worth keeping:
 
-  * TAIL ROUNDS ARE NOT WINS. Only the previous round's winner may bid in
-    a tail and the relay chooses nothing, so win% and share% count chosen
-    rounds only; a tail round stays in "rounds bid on". Tails are still
-    counted -- as distinct (slot, index_in_slot) graded `tail`, never as
-    accepted offers, since one tail round absorbs many -- and shown in
-    their own column. (They used to be added to wins, which read FRA_1 at
-    31.1% instead of 29.9% over 24 h on 2026-10-27.)
+  * TAIL ROUNDS COUNT AS WINS. The tail owner's offers go into the block,
+    so a tail round it owned is a win (decided 2026-10-28). It is counted
+    as a distinct (slot, index_in_slot) graded `tail`, never as accepted
+    offers -- one tail round absorbs many. A tail has no contest (only the
+    previous round's winner may bid), so this lifts win% a little: FRA_1
+    24 h to 2026-10-27, 9,725 chosen + 382 tail = 31.1% vs 29.9%.
 
   * TWO DENOMINATORS, because one is misleading on its own. `win% contested`
     is wins over rounds that builder actually bid in; `share%` is wins over
@@ -163,17 +162,14 @@ def collect(relay, hours=WINDOW_H, our_builders=(), keep_cogent=False):
         builder = r[0]
         offered, contested, tail_wins, rejected, cbne = (_int(v) for v in r[1:6])
         rw = round_wins.get(builder, 0)
-        # win% and share% count chosen rounds only: a tail round has no
-        # contest (only the previous winner may bid, nothing is chosen), so
-        # it is shown in its own column and never counted as a win
-        wins = rw + tail_wins
+        wins = rw + tail_wins           # chosen rounds + tail rounds owned
         top = sorted(reasons.get(builder, {}).items(), key=lambda kv: -kv[1])[:1]
         out.append({
             "builder": builder, "offered": offered, "contested": contested,
             "round_wins": rw, "tail_wins": tail_wins, "wins": wins,
             "rejected": rejected, "cogent_bne": cbne,
-            "win_pct": _pct(rw, contested),
-            "share_pct": _pct(rw, regular),
+            "win_pct": _pct(wins, contested),
+            "share_pct": _pct(wins, winnable),
             "rej_pct": _pct(rejected, offered),
             "top_reason": (f"{top[0][0]} ({top[0][1]:,})" if top else "-"),
             "ours": is_ours(builder),
@@ -212,10 +208,11 @@ def collect_history(relay, hours=WINDOW_H, our_builders=(), unit="hour"):
                    f"FROM {_chosen_sql(where, pad)} GROUP BY s.b, h")
     _, now_h = relay(f"SELECT toString({fn}(now()))")
     cells = {}
-    # wins = chosen rounds only; tail rounds count as bid on, never won
-    for b, h, contested, _tw in rows:
+    # wins = chosen rounds + tail rounds owned
+    for b, h, contested, tw in rows:
         c = cells.setdefault(b, {}).setdefault(h[:16], [0, 0])
         c[0] += _int(contested)
+        c[1] += _int(tw)
     for b, h, n in won:
         cells.setdefault(b, {}).setdefault(h[:16], [0, 0])[1] += _int(n)
     import datetime as dt
@@ -298,7 +295,7 @@ CSS = """
 """
 
 COLS = [("b", "builder"), ("", "offered"), ("", "contested"),
-        ("", "round wins"), ("", "tail rounds"), ("", "wins + tails"),
+        ("", "round wins"), ("", "tail wins"), ("", "wins"),
         ("", "win% contested"), ("", "share%"), ("", "rejected"),
         ("", "rej%"), ("", "cogent_bne"), ("b", "top reject reason")]
 
@@ -405,11 +402,9 @@ def render(data):
         '<div class="wr-hist" hidden data-loaded="0"></div>' +
         '<div class="wr-note">&#9733; = ours. '
         '<b>win% contested</b> is wins over rounds that builder actually bid '
-        'in; <b>share%</b> is wins over every round the relay chose a winner '
-        'for in the window. A win is a round the relay chose that builder '
-        'for. <b>tail rounds</b> are not wins &mdash; only the previous '
-        'winner may bid in one and nothing is chosen &mdash; so they count '
-        'as bid on but never as won; "wins + tails" is kept only so the '
-        'column still sums to every round. Builders serve different '
+        'in; <b>share%</b> is wins over every winnable round in the window. '
+        'A win is a round the relay chose that builder for, or a tail round '
+        'it owned (counted as distinct rounds, not as accepted offers '
+        '&mdash; one tail round absorbs many). Builders serve different '
         'connectors, so only win% compares across regions. '
         + cogent_note + '</div>')
