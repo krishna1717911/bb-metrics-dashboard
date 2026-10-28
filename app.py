@@ -36,6 +36,7 @@ import winrate
 import health
 import valcomp
 import accuracy
+import lookup
 
 # ------------------------------------------------------------------- clients
 
@@ -3155,6 +3156,7 @@ REWARDS_PATH = "/econ/rewards"
 # page, which is the same invisible-state problem the explicit parameter
 # exists to solve, just pointing the other way.
 DEP_FREE_PATHS = {HEALTH_PATH, ACCURACY_PATH, ACCURACY_PATH + '/slot',
+                  lookup.LOOKUP_PATH,
                   HEALTH_PATH + '/winrate-history',
                   HOME_PATH, DEPLOYHIST_PATH, VALCOMP_PATH,
                   ACCURACY_PATH + '/export.csv',
@@ -9239,6 +9241,13 @@ PAGES = [
                "Before/after on the headline metrics across a cutover.",
                "The instances that exist in ClickHouse but in no config — "
                "today that is FRA_1 and the city-client hosts."]),
+    dict(id="lookup", section="tech", path=lookup.LOOKUP_PATH,
+         title="order lookup",
+         blurb="One transaction or bundle across every store: the chain, "
+               "every event our builders logged, the relay's ingestion, "
+               "offers and execution results, our API's records, and what "
+               "our relayer received and streamed to searchers.",
+         ready=True),
     dict(id="slots", section="tech", path=SLOTS_PATH,
          title="per slot analysis",
          blurb="One slot, end to end: every auction round, what we offered "
@@ -9643,6 +9652,19 @@ def _validator_names():
                 for v in valcomp.fd_report().get("validators") or []}
     except Exception:
         return {}
+
+
+def lookup_page(qs):
+    """Order lookup: one id across every store. See lookup.py."""
+    src = {"ch": clickhouse_main, "relay": relay_fast,
+           "quant": clickhouse_quant,
+           "relayer": relayer if os.environ.get("RELAYER_URL") else None,
+           "rpc": SOLANA_RPC,
+           "tips": (accuracy.JITO_TIP_SET, accuracy.TIP_ACCOUNTS)}
+    return shell(lookup.page_body(qs, src, accuracy.copy_val,
+                                  _validator_names()),
+                 here="lookup", subtitle="order lookup",
+                 extra_css=accuracy.CSS + lookup.CSS)
 
 
 def offer_timeline_page(qs):
@@ -10117,6 +10139,7 @@ class Handler(BaseHTTPRequestHandler):
             OFFERTL_PATH: (self._page_offertl, False),
             OFFERTL_PATH_SLOT: (self._frag_offertl_slot, True),
             DEPLOYHIST_PATH: (self._page_deployments, False),
+            lookup.LOOKUP_PATH: (lambda q: lookup_page(q), False),
             SLOTS_PATH: (self._page_slots, False),
             RANGE_PATH: (self._page_range, False),
             VALCOMP_PATH: (self._page_valcomp, False),
