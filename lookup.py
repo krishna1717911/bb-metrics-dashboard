@@ -425,8 +425,8 @@ def summary_jobs(src, focal, lo, hi):
     def _relay():
         offers = _rows(relay(
             "SELECT builder_id, slot, index_in_slot, connector_identity, "
-            "ifNull(bundle_id, ''), groupUniqArray(toString(mini_block_uuid)) "
-            "FROM relay.mini_block_transactions_v2 WHERE ingested_at >= "
+            "ifNull(bundle_id, ''), groupUniqArray(toString(mini_block_uuid)), "
+            "toString(min(ingested_at)) FROM relay.mini_block_transactions_v2 WHERE ingested_at >= "
             f"'{lo:{F}}' AND ingested_at <= '{hi:{F}}' AND signature IN "
             f"({dec}) GROUP BY 1, 2, 3, 4, 5 ORDER BY 2, 3, 1 LIMIT 600"))
         slots = {int(r[1]) for r in offers}
@@ -768,7 +768,45 @@ def gather(src, kind, ident, lo, hi):
         out["s_members"] = _member_events(src, out, lo, hi)
     except Exception as exc:
         out["s_members"] = f"could not be read: {str(exc)[:200]}"
+    try:
+        out["s_first"] = _our_first_offers(src, out, lo, hi)
+    except Exception:
+        out["s_first"] = {}
     return ids, notes, out
+
+
+def _our_first_offers(src, out, lo, hi):
+    """bundle id -> (ts, instance, slot, round, relay receipt) of the first
+    offer of ours that carried it, from our builders' own record
+    (bifrost_miniblocks, 'selected'): our clock. The relay's receipt of
+    that same offer (by uuid) rides along, because the two clocks can sit
+    hundreds of ms apart (FRA_1 -509 ms on 10-26)."""
+    rel = out.get("s_relay")
+    if not isinstance(rel, tuple):
+        return {}
+    bids = sorted({r[4] for r in rel[0] if r[4]})[:300]
+    if not bids:
+        return {}
+    rows = _rows(src["ch"](
+        "SELECT b, instance_id, slot, index_in_slot, toString(min(ts)) t, "
+        "toString(argMin(uuid, ts)) "
+        "FROM bifrost_miniblocks ARRAY JOIN order_bundle_ids AS b WHERE "
+        f"ts >= '{lo:{F}}' AND ts <= '{hi:{F}}' AND kind = 'selected' AND "
+        f"hasAny(order_bundle_ids, [{_lst(bids)}]) AND has([{_lst(bids)}], b) "
+        "GROUP BY 1, 2, 3, 4 ORDER BY t LIMIT 1 BY b"))
+    got = {}
+    uuids = sorted({r[5] for r in rows if r[5]})
+    if uuids:
+        try:
+            got = dict(_rows(src["relay"](
+                "SELECT toString(mini_block_uuid), toString(min(ingested_at)) "
+                "FROM relay.mini_block_transactions_v2 WHERE ingested_at >= "
+                f"'{lo:{F}}' AND ingested_at <= '{hi:{F}}' AND "
+                f"mini_block_uuid IN ({_lst(uuids)}) GROUP BY 1")))
+        except Exception:
+            got = None              # unknown, not "absent at the relay"
+    return {r[0]: (r[4], r[1], r[2], r[3],
+                   got.get(r[5]) if got is not None else "") for r in rows}
 
 
 def _member_events(src, out, lo, hi):
@@ -1348,10 +1386,46 @@ def render_summary(ids, data, copy_val, names):
         mem = {}
         for bid_, ix, sig in members:
             mem.setdefault(bid_, {})[int(ix or 0)] = sig
-        where = {}
-        for b, slot, rnd, _c, bid_, _u in offers:
+        # first offer per bundle and family: the relay's receipt for
+        # everyone, replaced by our own record for ours below
+        where, first = {}, {}
+        for b, slot, rnd, _c, bid_, _u, at in offers:
             if bid_:
                 where.setdefault(bid_, set()).add(f"{_bshort(b)} {slot}/{rnd}")
+                k = (bid_, _family(b))
+                if k not in first or at < first[k][0]:
+                    first[k] = (at, f"{_bshort(b)} {slot}/{rnd}")
+        ourfirst = data.get("s_first") or {}
+
+        def first_html(bid_):
+            out_ = []
+            o = ourfirst.get(bid_)
+            if o:
+                rr = ""
+                if o[4]:
+                    gap = (_parse_time(o[4]) - _parse_time(o[0])).total_seconds()
+                    rr = (f"; the relay received that offer at "
+                          f"{_tcv(copy_val, o[4], 11, 26)} ({gap * 1000:+,.1f} ms: "
+                          "clock offset + latency)")
+                elif o[4] is None:
+                    rr = "; that offer is not in the relay's record"
+                out_.append(
+                    f"first offered by us {_tcv(copy_val, o[0], 0, 26)} "
+                    f'<span class="dim">{e(_bshort(o[1]))} {e(o[2])}/{e(o[3])} '
+                    f"&middot; our builder's clock (bifrost_miniblocks){rr}</span>")
+            elif (bid_, "us") in first:
+                t, w = first[(bid_, "us")]
+                out_.append(
+                    f"first offered by us {_tcv(copy_val, t, 0, 26)} "
+                    f'<span class="dim">{e(w)} &middot; relay receipt; not in '
+                    "our builders' record (7-day retention)</span>")
+            for fam, lab in (("titan", "Titan"), ("other", "others")):
+                if (bid_, fam) in first:
+                    t, w = first[(bid_, fam)]
+                    out_.append(
+                        f"first offered by {lab} {_tcv(copy_val, t, 0, 26)} "
+                        f'<span class="dim">{e(w)} &middot; relay receipt</span>')
+            return "".join(f"<div>{x}</div>" for x in out_)
 
         def bundle_box(bid_, label):
             """A bundle id that opens to its members on click (and copies
@@ -1366,9 +1440,11 @@ def render_summary(ids, data, copy_val, names):
             return (f'<details class="lkinl"><summary>{label}</summary>'
                     f'<div class="lkbox"><div>{_cv(copy_val, bid_)} '
                     f'<span class="dim">{e(", ".join(sorted(where.get(bid_, ()))))}'
-                    f"</span></div><ol>{inner or '<li class=dim>members not in the relay record</li>'}"
+                    "</span>"
+                    + first_html(bid_)
+                    + f"</div><ol>{inner or '<li class=dim>members not in the relay record</li>'}"
                     "</ol></div></details>")
-        for b, slot, rnd, conn, bid, uuids in offers:
+        for b, slot, rnd, conn, bid, uuids, _at in offers:
             key = (int(slot), int(rnd))
             d = rounds.setdefault(key, {"conn": conn, "us": {}, "titan": {},
                                         "other": {}, "carried": None})

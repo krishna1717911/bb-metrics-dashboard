@@ -2205,6 +2205,49 @@ def _connector_select(cur, options):
             f'<select name=connector>{"".join(opts)}</select></label>')
 
 
+# The validator picker: Tom Select over the plain <select> above, so the
+# page still works if the CDN is unreachable. Typing filters on name and
+# identity; a full identity not in the list can be entered as is; picking
+# one runs the query straight away.
+TOM_SELECT = "https://cdn.jsdelivr.net/npm/tom-select@2.3.1/dist"
+CONNECTOR_PICKER = (
+    f'<link rel="stylesheet" href="{TOM_SELECT}/css/tom-select.css">'
+    f'<script src="{TOM_SELECT}/js/tom-select.complete.min.js"></script>'
+    """<script>(function(){
+  var s = document.querySelector('.aqform select[name=connector]');
+  if (!s || !window.TomSelect) return;
+  new TomSelect(s, {
+    plugins: ['dropdown_input'],
+    create: true,
+    // a well-formed identity that is not already listed
+    createFilter: function(v){
+      return /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(v) && !this.options[v];
+    },
+    searchField: ['text', 'value'],
+    maxOptions: null,
+    allowEmptyOption: true,
+    selectOnTab: true,
+    placeholder: 'type a name or identity',
+    render: {
+      option: function(d, esc){
+        return '<div>' + esc(d.text) + (d.value ?
+          ' <span class="dim">' + esc(d.value) + '</span>' : '') + '</div>';
+      },
+      option_create: function(d, esc){
+        return '<div class="create">use identity <b>' + esc(d.input) + '</b></div>';
+      },
+      no_results: function(){
+        return '<div class="no-results">no match &middot; paste a full identity to use it</div>';
+      }
+    },
+    onChange: function(){
+      var f = s.form;
+      if (f.requestSubmit) f.requestSubmit(); else f.submit();
+    }
+  });
+})();</script>""")
+
+
 SLOT_MS = 200          # nominal since SIMD-0525; measured 204-217
 
 
@@ -3953,6 +3996,25 @@ CSS = """
 .aqform button{background:#0f766e;border:1px solid #14b8a6;color:#eafffb;
   border-radius:6px;padding:7px 16px;font-size:12px;cursor:pointer}
 .aqform button:hover{background:#14b8a6}
+.aqform .ts-wrapper{min-width:360px;text-transform:none;letter-spacing:0}
+.aqform .ts-control{background:#0c141b;border:1px solid #22303f;
+  border-radius:6px;color:#cfe0f0;padding:6px 10px;min-height:0;
+  box-shadow:none;font:12px ui-monospace,Menlo,monospace}
+.aqform .ts-wrapper.focus .ts-control{border-color:#5eead4;box-shadow:none}
+.aqform .ts-control>input{background:none;border:0;padding:0;
+  color:#cfe0f0;font:inherit}
+.aqform .ts-dropdown{background:#0c141b;border:1px solid #22303f;
+  color:#cfe0f0;font:12px ui-monospace,Menlo,monospace;
+  text-transform:none;letter-spacing:0}
+.aqform .ts-dropdown-content{max-height:380px}
+.aqform .ts-dropdown .active{background:#123a37;color:#eafffb}
+.aqform .ts-dropdown .highlight{background:rgba(94,234,212,.25);color:inherit}
+.aqform .ts-dropdown .create,.aqform .ts-dropdown .no-results{color:#5eead4}
+.aqform .ts-dropdown .dim{color:#61748b;font-size:10.5px}
+.aqform .ts-dropdown .dropdown-input-wrap{padding:6px}
+.aqform .ts-dropdown .dropdown-input{background:#071016;border:1px solid #22303f;
+  border-radius:4px;color:#cfe0f0;padding:5px 8px;font:inherit;width:100%}
+.aqform .ts-dropdown .dropdown-input:focus{outline:none;border-color:#5eead4}
 .aqhead{padding:14px 28px 0;color:#8fa6bf;font-size:12.5px}
 .aqhead b{color:#dbe4ee}
 .aqcap{color:#fbbf24}
@@ -4192,7 +4254,10 @@ ACCURACY_JS = r'''
   }
   var reg = document.querySelector('.aqform select[name=region]'),
       con = document.querySelector('.aqform select[name=connector]');
-  if (reg && con) reg.addEventListener('change', function(){ con.value = ''; });
+  if (reg && con) reg.addEventListener('change', function(){
+    // silent: a region change must not submit the form by itself
+    if (con.tomselect) con.tomselect.clear(true); else con.value = '';
+  });
   sync();
 })();
 
@@ -4539,7 +4604,7 @@ def form_html(r, path, metric=True, region=False, connectors=None):
            _metric_select(r["metric"]) if metric else "",
            _region_select(r["region"]) if region else "",
            (_connector_select(r.get("connector", ""), connectors)
-            if connectors is not None else ""),
+            + CONNECTOR_PICKER if connectors is not None else ""),
            "<button type=submit>run</button>",
            # Outside the inputs, because it acts on the range already run,
            # not on whatever half-edited values sit in the boxes. One button
