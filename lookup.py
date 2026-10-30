@@ -820,7 +820,11 @@ def _member_events(src, out, lo, hi):
     sigs = sorted({r[2] for r in rel[2]})[:200]
     bid = out.get("s_bidders")
     insts = sorted(set().union(*bid.values())) if bid else []
-    only = f" AND instance_id IN ({_lst(insts)})" if insts else ""
+    regs = sorted(_offer_regions(rel))
+    only = (f" AND instance_id IN ({_lst(insts)})" if insts else
+            # no round record: our builders in the regions that offered
+            " AND (" + " OR ".join(f"has(splitByChar('_', instance_id), '{g}')"
+                                   for g in regs) + ")" if regs else "")
     w = f"ts >= '{lo:{F}}' AND ts <= '{hi:{F}}'"
     recv = _rows(src["ch"](
         "SELECT toString(ts), instance_id, entity_kind, entity, "
@@ -840,6 +844,35 @@ def _member_events(src, out, lo, hi):
             f"entity IN ({_lst(ents)}) AND event != 'received' ORDER BY ts "
             "LIMIT 8000"))
     return recv, events
+
+
+def _region(name):
+    """FRA / AMS / JP from a builder name (ours or Titan's), else None."""
+    parts = (name or "").upper().split("_")
+    for tok, reg in (("FRA", "FRA"), ("AMS", "AMS"), ("JP", "JP"), ("TYO", "JP")):
+        if tok in parts:
+            return reg
+    return None
+
+
+def _offer_regions(rel):
+    """The regions whose builders (anyone's) offered the focal orders."""
+    if not isinstance(rel, tuple):
+        return set()
+    return {g for g in (_region(r[0]) for r in rel[0]) if g}
+
+
+def _bidding(data, insts):
+    """Which of `insts` belong on the page: our builders that ran rounds
+    for the focal slots, else (no round record) ours in the regions where
+    the offers were made, else all of them."""
+    bid = data.get("s_bidders")
+    if bid:
+        return set().union(*bid.values())
+    regs = _offer_regions(data.get("s_relay"))
+    if regs:
+        return {i for i in insts if _region(i) in regs}
+    return set(insts)
 
 
 def _bidders(src, focal, out, lo, hi):
@@ -1307,19 +1340,21 @@ def render_summary(ids, data, copy_val, names):
     verd, vcls = _verdicts(data, {sigprefix(s) for s in focal})
     recv_rows, bundles = [], {}
     bid = data.get("s_bidders")
-    bidding = set().union(*bid.values()) if bid else set()
-    if bidding and isinstance(rv, list):
-        # only the builders that bid for this leader; the rest got the same
-        # searcher flow in another region and never had a round for it
-        away = sorted({r[1] for r in rv} - bidding)
+    if isinstance(rv, list):
+        # only the builders bidding where the offers were made; the rest got
+        # the same searcher flow in another region and are not shown at all
+        bidding = _bidding(data, {r[1] for r in rv})
         rv = [r for r in rv if r[1] in bidding]
-        bullets.append(
-            "<b>bidding for it</b>: " + "; ".join(
-                f"slot {s}: {', '.join(e(_bshort(b)) for b in sorted(v))}"
-                for s, v in sorted(bid.items()))
-            + (f' <span class="dim">&middot; also received by '
-               f"{', '.join(e(_bshort(b)) for b in away)}, which ran no round "
-               "for these slots &mdash; left out below</span>" if away else ""))
+        if bid:
+            bullets.append(
+                "<b>bidding for it</b>: " + "; ".join(
+                    f"slot {s}: {', '.join(e(_bshort(b)) for b in sorted(v))}"
+                    for s, v in sorted(bid.items())))
+        elif bidding:
+            bullets.append(
+                "<b>bidding for it</b>: "
+                + ", ".join(e(_bshort(b)) for b in sorted(bidding))
+                + ' <span class="dim">(region of the offers)</span>')
     if isinstance(rv, str):
         bullets.append(f'our builders: <span class="aqcap">{e(rv)}</span>')
     elif rv is not None:
@@ -1394,52 +1429,32 @@ def render_summary(ids, data, copy_val, names):
                 where.setdefault(bid_, set()).add(f"{_bshort(b)} {slot}/{rnd}")
                 k = (bid_, _family(b))
                 if k not in first or at < first[k][0]:
-                    first[k] = (at, f"{_bshort(b)} {slot}/{rnd}")
+                    first[k] = (at, b, slot, rnd)
         ourfirst = data.get("s_first") or {}
 
-        def first_html(bid_):
-            out_ = []
-            o = ourfirst.get(bid_)
-            if o:
-                rr = ""
-                if o[4]:
-                    gap = (_parse_time(o[4]) - _parse_time(o[0])).total_seconds()
-                    rr = (f"; the relay received that offer at "
-                          f"{_tcv(copy_val, o[4], 11, 26)} ({gap * 1000:+,.1f} ms: "
-                          "clock offset + latency)")
-                elif o[4] is None:
-                    rr = "; that offer is not in the relay's record"
-                out_.append(
-                    f"first offered by us {_tcv(copy_val, o[0], 0, 26)} "
-                    f'<span class="dim">{e(_bshort(o[1]))} {e(o[2])}/{e(o[3])} '
-                    f"&middot; our builder's clock (bifrost_miniblocks){rr}</span>")
-            elif (bid_, "us") in first:
-                t, w = first[(bid_, "us")]
-                out_.append(
-                    f"first offered by us {_tcv(copy_val, t, 0, 26)} "
-                    f'<span class="dim">{e(w)} &middot; relay receipt; not in '
-                    "our builders' record (7-day retention)</span>")
-            for fam, lab in (("titan", "Titan"), ("other", "others")):
-                if (bid_, fam) in first:
-                    t, w = first[(bid_, fam)]
-                    out_.append(
-                        f"first offered by {lab} {_tcv(copy_val, t, 0, 26)} "
-                        f'<span class="dim">{e(w)} &middot; relay receipt</span>')
-            return "".join(f"<div>{x}</div>" for x in out_)
-
-        def first_short(bid_, fam):
-            """The first offer of that family, beside the id in the list,
-            so it shows without opening the bundle."""
+        def first_line(bid_, fam):
+            """first offered / received_at / slot of that family's first
+            offer carrying the bundle -- beside the id in the list. Ours
+            from our builder's record (its own clock), with that builder's
+            receipt of the bundle; Titan's from the relay's receipt."""
             o = ourfirst.get(bid_) if fam == "us" else None
             if o:
-                t, w, clock = o[0], f"{_bshort(o[1])} {o[2]}/{o[3]}", "our clock"
+                t, b, sl, rn = o[0], o[1], o[2], o[3]
             elif (bid_, fam) in first:
-                (t, w), clock = first[(bid_, fam)], "relay receipt"
+                t, b, sl, rn = first[(bid_, fam)]
             else:
                 return ""
-            return (f' <span class="dim">first offered</span> '
-                    f"{_tcv(copy_val, t, 11, 26)} "
-                    f'<span class="dim">{e(w)} &middot; {clock}</span>')
+            parts = [f"first offered: {_tcv(copy_val, t, 11, 23)}"]
+            if fam == "us":
+                sm = data.get("s_members")
+                got = sorted((r[1] != b, r[0])
+                             for r in (sm[0] if isinstance(sm, tuple) else [])
+                             if r[2] == "bundle" and r[3] == bid_)
+                if got:
+                    parts.append(f"received_at: {_tcv(copy_val, got[0][1], 11, 23)}")
+            parts.append(f"slot: {e(str(sl))}/{e(str(rn))} {e(_bshort(b))}")
+            return ' <span class="dim">&middot;</span> ' + (
+                ' <span class="dim">&middot;</span> '.join(parts))
 
         def bundle_box(bid_, label):
             """A bundle id that opens to its members on click (and copies
@@ -1454,9 +1469,7 @@ def render_summary(ids, data, copy_val, names):
             return (f'<details class="lkinl"><summary>{label}</summary>'
                     f'<div class="lkbox"><div>{_cv(copy_val, bid_)} '
                     f'<span class="dim">{e(", ".join(sorted(where.get(bid_, ()))))}'
-                    "</span>"
-                    + first_html(bid_)
-                    + f"</div><ol>{inner or '<li class=dim>members not in the relay record</li>'}"
+                    + f"</span></div><ol>{inner or '<li class=dim>members not in the relay record</li>'}"
                     "</ol></div></details>")
         for b, slot, rnd, conn, bid, uuids, _at in offers:
             key = (int(slot), int(rnd))
@@ -1491,7 +1504,7 @@ def render_summary(ids, data, copy_val, names):
                         f'<details class="lkinl"><summary><b>{len(bids)}</b> '
                         "distinct bundle(s)</summary>" + "".join(
                             bundle_box(x, _cv(copy_val, x, 12)
-                                       + first_short(x, fam))
+                                       + first_line(x, fam))
                             for x in sorted(bids)) + "</details>"
                         if bids else "no bundles")
                     + (" + as a plain transaction" if plain else ""))
