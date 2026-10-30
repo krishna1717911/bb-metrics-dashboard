@@ -444,7 +444,16 @@ def summary_jobs(src, focal, lo, hi):
                 f"relay.mini_block_events_v2 WHERE timestamp >= '{lo:{F}}' "
                 f"AND timestamp <= '{hi:{F}}' AND event = 'round_chosen') "
                 "LIMIT 1 BY mini_block_uuid"))
-        return offers, winners
+        bids = {r[4] for r in offers if r[4]}
+        members = []
+        if bids:
+            # every member of those bundles, not only the focal one
+            members = _rows(relay(
+                "SELECT bundle_id, bundle_tx_index, base58Encode(signature) "
+                "FROM relay.mini_block_transactions_v2 WHERE ingested_at >= "
+                f"'{lo:{F}}' AND ingested_at <= '{hi:{F}}' AND bundle_id IN "
+                f"({_lst(bids)}) GROUP BY 1, 2, 3 ORDER BY 1, 2 LIMIT 2000"))
+        return offers, winners, members
     jobs["s_relay"] = _relay
     # every submission of it to our API, with the searcher behind the key
     # and, for a bundle, its size, tip, dropping indices and targets
@@ -754,10 +763,85 @@ def gather(src, kind, ident, lo, hi):
                 out[futs[f]] = f.result()
             except Exception as exc:
                 out[futs[f]] = f"could not be read: {str(exc)[:200]}"
+    out["s_bidders"] = _bidders(src, focal, out, lo, hi)
+    try:
+        out["s_members"] = _member_events(src, out, lo, hi)
+    except Exception as exc:
+        out["s_members"] = f"could not be read: {str(exc)[:200]}"
     return ids, notes, out
 
 
+def _member_events(src, out, lo, hi):
+    """For every member of every bundle the relay saw offered with the
+    focal transactions: each time our bidding builders received it (alone,
+    entity = its SigPrefix, or inside any bundle), and every scheduler event
+    on those entities after. -> (receipts, events) or None."""
+    rel = out.get("s_relay")
+    if not isinstance(rel, tuple) or not rel[2]:
+        return None
+    sigs = sorted({r[2] for r in rel[2]})[:200]
+    bid = out.get("s_bidders")
+    insts = sorted(set().union(*bid.values())) if bid else []
+    only = f" AND instance_id IN ({_lst(insts)})" if insts else ""
+    w = f"ts >= '{lo:{F}}' AND ts <= '{hi:{F}}'"
+    recv = _rows(src["ch"](
+        "SELECT toString(ts), instance_id, entity_kind, entity, "
+        f"arrayFilter(x -> has([{_lst(sigs)}], x), signatures), "
+        "attrs['source'], nums['wait_us'] FROM bifrost_events WHERE "
+        f"{w}{only} AND stage = 'scheduler' AND event = 'received' AND "
+        f"(entity IN ({_lst({sigprefix(x) for x in sigs})}) OR "
+        f"(entity_kind = 'bundle' AND hasAny(signatures, [{_lst(sigs)}]))) "
+        "ORDER BY ts LIMIT 1 BY instance_id, entity LIMIT 4000"))
+    ents = {r[3] for r in recv}
+    events = []
+    if ents:
+        events = _rows(src["ch"](
+            "SELECT instance_id, entity, toString(ts), stage, event, reason, "
+            "toJSONString(mapFilter((k, v) -> k != 'sigs', attrs)), "
+            f"toJSONString(nums) FROM bifrost_events WHERE {w}{only} AND "
+            f"entity IN ({_lst(ents)}) AND event != 'received' ORDER BY ts "
+            "LIMIT 8000"))
+    return recv, events
+
+
+def _bidders(src, focal, out, lo, hi):
+    """slot -> our builders that ran rounds for it, for the slots the
+    focal transactions landed or were offered in. A builder in another
+    region receives the same searcher flow but never bids for that leader;
+    the summary leaves it out. None when there is no slot to go by."""
+    slots = set()
+    chn = out.get("chain")
+    for s, _p, c in (chn if isinstance(chn, list) else []):
+        if s in focal and c and c.get("slot"):
+            slots.add(int(c["slot"]))
+    rel = out.get("s_relay")
+    if isinstance(rel, tuple):
+        slots |= {int(r[1]) for r in rel[0]}
+    if not slots:
+        return None
+    try:
+        got = {}
+        for inst, slot in _rows(src["ch"](
+                "SELECT DISTINCT instance_id, nums['slot'] FROM bifrost_events "
+                f"WHERE ts >= '{lo:{F}}' AND ts <= '{hi:{F}}' AND stage = "
+                "'scheduler' AND event = 'round_started' AND nums['slot'] IN ("
+                + ", ".join(str(x) for x in sorted(slots)) + ")")):
+            got.setdefault(int(slot), set()).add(inst)
+        return got
+    except Exception:
+        return None
+
+
 # ------------------------------------------------------------------ render
+
+def _tcv(copy_val, ts, a=0, b=23):
+    """A timestamp shown as ts[a:b] that copies as the full
+    'YYYY-MM-DD HH:MM:SS.mmm' (to the ms), whatever slice is displayed."""
+    ts = "" if ts is None else str(ts).replace("T", " ").rstrip("Z")
+    if not ts:
+        return ""
+    return copy_val(ts[:23], ts[a:b])
+
 
 def _cv(copy_val, v, short=None):
     v = "" if v is None else str(v)
@@ -817,7 +901,7 @@ def render(kind, ident, lo, hi, how, ids, notes, data, copy_val, names=None):
         f'bundle id(s), {len(ids["uuids"])} API bundle id(s)</span></div>')
     for n in notes:
         out.append(f'<div class="aqcap lknote">{e(n)}</div>')
-    out.append(render_summary(ids, data, copy_val, names))
+    out.append(render_summary(ids, data, copy_val, names) + LK_JS)
     out.append(render_searchers(ids, data, copy_val))
     out.append(render_arbs(ids, data, copy_val, snames))
     out.append('<div class="lkhead">Details &mdash; every store, as read '
@@ -879,7 +963,7 @@ def render(kind, ident, lo, hi, how, ids, notes, data, copy_val, names=None):
     b = data.get("builders")
     if b is not None:
         rows = [] if isinstance(b, str) else [
-            [e(r[0][:23]), e(r[1]), e(r[2]), f"<b>{e(r[3])}</b>", e(r[4] or ""),
+            [_tcv(copy_val, r[0]), e(r[1]), e(r[2]), f"<b>{e(r[3])}</b>", e(r[4] or ""),
              e(r[5]), _cv(copy_val, r[6], 16),
              f'<span class="lkjs" title="{e(r[7])}">{e(r[7][:90])}</span>',
              f'<span class="lkjs" title="{e(r[8])}">{e(r[8][:90])}</span>']
@@ -897,7 +981,7 @@ def render(kind, ident, lo, hi, how, ids, notes, data, copy_val, names=None):
     if o is not None:
         rows = [] if isinstance(o, str) else [
             [_cv(copy_val, r[1]), e(str(r[2])), e(r[0]),
-             f"{int(r[3]):,}", e(r[4][11:23]), e(r[5][11:23]),
+             f"{int(r[3]):,}", _tcv(copy_val, r[4], 11), _tcv(copy_val, r[5], 11),
              _cv(copy_val, r[6], 12), e(str(r[7])),
              ('<b class="land y">won</b> ' + " ".join(
                  _cv(copy_val, u, 8) for u in r[8]) if r[8] else
@@ -919,7 +1003,7 @@ def render(kind, ident, lo, hi, how, ids, notes, data, copy_val, names=None):
              "the Jito block engine it came through; empty = TPU)",
              ["relay sent", "relay", "connector", "source", "type", "bundle id",
               "#", "signature"],
-             lambda r: [e(r[0][:23]), e(r[1]), _conn(copy_val, r[2], names),
+             lambda r: [_tcv(copy_val, r[0]), e(r[1]), _conn(copy_val, r[2], names),
                         e(r[3] or "TPU"), e(r[4]), _cv(copy_val, r[5], 12),
                         e("" if r[6] is None else str(r[6])),
                         _cv(copy_val, r[7], 16)]),
@@ -927,7 +1011,7 @@ def render(kind, ident, lo, hi, how, ids, notes, data, copy_val, names=None):
              "connector_execution_results: what the validator did with it",
              ["received", "relay", "connector", "slot", "mini-block", "type",
               "bundle id", "executed in", "not included because", "signature"],
-             lambda r: [e(r[0][:23]), e(r[1]), _conn(copy_val, r[2], names),
+             lambda r: [_tcv(copy_val, r[0]), e(r[1]), _conn(copy_val, r[2], names),
                         _cv(copy_val, r[3]), _cv(copy_val, r[4], 8), e(r[5]),
                         _cv(copy_val, r[6], 12), e(str(r[7] or "")),
                         (f'<span class="redn">{e(r[8])}</span>' if r[8] else
@@ -951,7 +1035,7 @@ def render(kind, ident, lo, hi, how, ids, notes, data, copy_val, names=None):
               "egress tip sig", "gravity bundle id", "jito", "harmonic",
               "bifrost", "rakurai"],
              lambda r: [_cv(copy_val, r[0], 16), e(r[1]), e(_key8(r[2])),
-                        _cv(copy_val, r[3], 10), e(r[4][:23]), e(r[5]), e(r[6]),
+                        _cv(copy_val, r[3], 10), _tcv(copy_val, r[4]), e(r[5]), e(r[6]),
                         e(r[7]), _conn(copy_val, r[8], names), e(r[9]),
                         e(r[10]), e(r[11]), e(r[12]), _cv(copy_val, r[13], 12),
                         _cv(copy_val, r[14], 12), e(r[15]), e(r[16]), e(r[17]),
@@ -964,7 +1048,7 @@ def render(kind, ident, lo, hi, how, ids, notes, data, copy_val, names=None):
               "est. revenue", "tip wallet", "wallet type", "status",
               "slot landed", "gravity status", "gravity slot",
               "gravity bundle id", "source ip", "signatures"],
-             lambda r: [_cv(copy_val, r[0], 10), e(_key8(r[1])), e(r[2][:23]),
+             lambda r: [_cv(copy_val, r[0], 10), e(_key8(r[1])), _tcv(copy_val, r[2]),
                         e(r[3]), e(str(r[4])), e(r[5]), _cv(copy_val, r[6], 10),
                         e(r[7]), e(r[8]), e(r[9]), _cv(copy_val, r[10], 10),
                         e(r[11]), e(r[12]), e(r[13]), e(r[14]), e(r[15]),
@@ -987,14 +1071,14 @@ def render(kind, ident, lo, hi, how, ids, notes, data, copy_val, names=None):
              "sendTransaction)",
              ["signature", "received", "path", "relayer host", "instance",
               "validator", "approx slot", "from", "sender ts", "source ip"],
-             lambda r: [_cv(copy_val, r[0], 16), e(_ms_str(r[1])), e(r[2]),
+             lambda r: [_cv(copy_val, r[0], 16), _tcv(copy_val, _ms_str(r[1])), e(r[2]),
                         e(r[3]), e(r[4]), _conn(copy_val, r[5], names), e(r[6]),
-                        e(r[7]), e(_ms_str(r[8])), e(r[9])]),
+                        e(r[7]), _tcv(copy_val, _ms_str(r[8])), e(r[9])]),
             ("val_bundles", "our relayer &middot; bundles to validators",
              "relayer.validator_bundle_events",
              ["bundle", "received", "path", "relayer host", "instance",
               "validator", "txs", "approx slot", "signatures"],
-             lambda r: [_cv(copy_val, r[0], 12), e(str(r[1])[:23]), e(r[2]),
+             lambda r: [_cv(copy_val, r[0], 12), _tcv(copy_val, r[1]), e(r[2]),
                         e(r[3]), e(r[4]), _conn(copy_val, r[5], names),
                         e(str(r[6])), e(r[7]),
                         " ".join(_cv(copy_val, s, 10) for s in (r[8] or "").split())]),
@@ -1003,13 +1087,13 @@ def render(kind, ident, lo, hi, how, ids, notes, data, copy_val, names=None):
              "to (token: first 8 characters only)",
              ["searcher", "relayer host", "sent", "relay latency (us)",
               "instance", "signatures in message"],
-             lambda r: [_who(r[0], snames), e(r[1]), e(_ms_str(r[2])), e(r[3]),
+             lambda r: [_who(r[0], snames), e(r[1]), _tcv(copy_val, _ms_str(r[2])), e(r[3]),
                         e(r[4]), e(str(len((r[5] or "").split())))]),
             ("searcher_bundles", "our relayer &middot; bundles streamed to searchers",
              "relayer.searcher_bundle_egress_events (token: first 8 characters only)",
              ["searcher", "relayer host", "sent", "relay latency (us)",
               "instance", "bundles in message"],
-             lambda r: [_who(r[0], snames), e(r[1]), e(str(r[2])[:23]), e(r[3]),
+             lambda r: [_who(r[0], snames), e(r[1]), _tcv(copy_val, r[2]), e(r[3]),
                         e(r[4]), e(str(len((r[5] or "").split())))]),
             ("backruns", "our relayer &middot; searcher backruns",
              "relayer.searcher_backrun_events: backruns searchers sent us on "
@@ -1017,7 +1101,7 @@ def render(kind, ident, lo, hi, how, ids, notes, data, copy_val, names=None):
              ["searcher", "relayer host", "searcher ip", "source", "backrun",
               "at", "instance"],
              lambda r: [_who(r[0], snames), e(r[1]), e(r[2]), _cv(copy_val, r[3], 12),
-                        _cv(copy_val, r[4], 12), e(_ms_str(r[5])), e(r[6])])):
+                        _cv(copy_val, r[4], 12), _tcv(copy_val, _ms_str(r[5])), e(r[6])])):
         v = data.get(key)
         if v is None:
             continue
@@ -1135,7 +1219,9 @@ def _verdicts(data, prefixes):
                             if err and err != what else ""))
         out[key] = " &rarr; ".join(parts)
         # the one-word class, for the summary's tally
-        cls[key] = ("offered" if o and o["rounds"] else
+        cls[key] = (("offered " + ", ".join(f"{s}/{i}" for s, i in
+                                             sorted(o["rounds"])))
+                    if o and o["rounds"] else
                     (" ".join(x for x in (r[5], r[6]) if x) or r[4]) if r else
                     "no event after receipt")
     return out, cls
@@ -1173,7 +1259,7 @@ def render_summary(ids, data, copy_val, names):
         elif "slot" in c:
             bullets.append(
                 f"{lab}landed in slot {_cv(copy_val, c['slot'])} at "
-                f"{e(c['time'])} &mdash; " +
+                f"{_tcv(copy_val, c['time'])} &mdash; " +
                 (f'<span class="redn">failed {e(c["err"])}</span>' if c["err"]
                  else '<span class="land y">ok</span>'))
     land_slots = {int(c["slot"]) for c in landed.values() if c and c.get("slot")}
@@ -1182,6 +1268,20 @@ def render_summary(ids, data, copy_val, names):
     rv = data.get("s_recv")
     verd, vcls = _verdicts(data, {sigprefix(s) for s in focal})
     recv_rows, bundles = [], {}
+    bid = data.get("s_bidders")
+    bidding = set().union(*bid.values()) if bid else set()
+    if bidding and isinstance(rv, list):
+        # only the builders that bid for this leader; the rest got the same
+        # searcher flow in another region and never had a round for it
+        away = sorted({r[1] for r in rv} - bidding)
+        rv = [r for r in rv if r[1] in bidding]
+        bullets.append(
+            "<b>bidding for it</b>: " + "; ".join(
+                f"slot {s}: {', '.join(e(_bshort(b)) for b in sorted(v))}"
+                for s, v in sorted(bid.items()))
+            + (f' <span class="dim">&middot; also received by '
+               f"{', '.join(e(_bshort(b)) for b in away)}, which ran no round "
+               "for these slots &mdash; left out below</span>" if away else ""))
     if isinstance(rv, str):
         bullets.append(f'our builders: <span class="aqcap">{e(rv)}</span>')
     elif rv is not None:
@@ -1215,7 +1315,7 @@ def render_summary(ids, data, copy_val, names):
                 lead = '<span class="dim">no round in the window</span>'
             wait = int(r[6] or 0)
             recv_rows.append([
-                e(ts[11:26]), e(_bshort(inst)),
+                _tcv(copy_val, ts, 11, 26), e(_bshort(inst)),
                 ("standalone tx" if ek != "bundle" else
                  "bundle " + _cv(copy_val, ent, 12)),
                 e(f"{r[4]}/{r[5]}".strip("/")),
@@ -1228,7 +1328,7 @@ def render_summary(ids, data, copy_val, names):
             bullets.append(
                 f"<b>received by our builders</b>: {len(firsts)} "
                 f"({', '.join(e(_bshort(b)) for b in sorted(firsts))}), first "
-                f"{e(_bshort(first[0]))} at {e(first[1][11:23])}; "
+                f"{e(_bshort(first[0]))} at {_tcv(copy_val, first[1], 11)}; "
                 f"in {len(bundles)} distinct bundle(s)"
                 + (f"; standalone from the relay on "
                    f"{', '.join(e(_bshort(b)) for b in sorted(standalone))}"
@@ -1236,17 +1336,6 @@ def render_summary(ids, data, copy_val, names):
         else:
             bullets.append("<b>none of our builders received it</b> in this "
                            "window")
-        if rv:
-            tally = {}
-            for r in rv:
-                c = vcls.get((r[1], r[3]), "no event after receipt")
-                tally[c] = tally.get(c, 0) + 1
-            bullets.append(
-                "<b>our scheduler's verdicts</b> (per builder &times; "
-                "entity): " + " &middot; ".join(
-                    f"{e(c)} <b>{n}</b>" for c, n in
-                    sorted(tally.items(), key=lambda kv: (kv[0] != "offered",
-                                                          -kv[1]))))
 
     # offers, ours and Titan's
     rel = data.get("s_relay")
@@ -1254,8 +1343,31 @@ def render_summary(ids, data, copy_val, names):
     if isinstance(rel, str):
         bullets.append(f'relay offers: <span class="aqcap">{e(rel)}</span>')
     elif rel is not None:
-        offers, winners = rel
+        offers, winners, members = rel
         win = {(int(w[0]), int(w[1])): w for w in winners}
+        mem = {}
+        for bid_, ix, sig in members:
+            mem.setdefault(bid_, {})[int(ix or 0)] = sig
+        where = {}
+        for b, slot, rnd, _c, bid_, _u in offers:
+            if bid_:
+                where.setdefault(bid_, set()).add(f"{_bshort(b)} {slot}/{rnd}")
+
+        def bundle_box(bid_, label):
+            """A bundle id that opens to its members on click (and copies
+            the id, as every id here does)."""
+            ms = mem.get(bid_) or {}
+            inner = "".join(
+                f"<li>#{ix} {_cv(copy_val, sig, 16)} "
+                f"{_cv(copy_val, sigprefix(sig))}"
+                + (' <b class="land y">this one</b>' if sig in fset else "")
+                + _member_log(sig, bid_, data.get("s_members"), copy_val)
+                + "</li>" for ix, sig in sorted(ms.items()))
+            return (f'<details class="lkinl"><summary>{label}</summary>'
+                    f'<div class="lkbox"><div>{_cv(copy_val, bid_)} '
+                    f'<span class="dim">{e(", ".join(sorted(where.get(bid_, ()))))}'
+                    f"</span></div><ol>{inner or '<li class=dim>members not in the relay record</li>'}"
+                    "</ol></div></details>")
         for b, slot, rnd, conn, bid, uuids in offers:
             key = (int(slot), int(rnd))
             d = rounds.setdefault(key, {"conn": conn, "us": {}, "titan": {},
@@ -1285,21 +1397,26 @@ def render_summary(ids, data, copy_val, names):
                         f"slot {s} round {', '.join(r)}"
                         for s, r in sorted(by_slot.items()))
                     + f" ({', '.join(e(_bshort(b)) for b in sorted({b for k in hit for b in rounds[k][fam]}))})"
-                    f" &middot; <b>{len(bids)}</b> distinct bundle(s)"
+                    + f" &middot; " + (
+                        f'<details class="lkinl"><summary><b>{len(bids)}</b> '
+                        "distinct bundle(s)</summary>" + "".join(
+                            bundle_box(x, _cv(copy_val, x, 12))
+                            for x in sorted(bids)) + "</details>"
+                        if bids else "no bundles")
                     + (" + as a plain transaction" if plain else ""))
             else:
-                where = (f" in slot {', '.join(str(s) for s in sorted(land_slots))}"
-                         " (where it landed)" if land_slots else "")
+                at = (f" in slot {', '.join(str(s) for s in sorted(land_slots))}"
+                      " (where it landed)" if land_slots else "")
                 bullets.append(f"<b>offered by {label}</b>: no &mdash; none of "
                                f"{'our' if fam == 'us' else 'its'} offers "
-                               f"carried it{where}")
+                               f"carried it{at}")
         carried = [(k, d["carried"]) for k, d in sorted(rounds.items())
                    if d["carried"]]
         if carried:
             bullets.append("<b>won</b>: " + "; ".join(
                 f"slot {s} round {i} by {e(_bshort(b))}"
-                + (f" (bundle {copy_val(bid, bid[:10] + '…')})" if bid else
-                   " (as a plain transaction)")
+                + (" " + bundle_box(bid, "bundle " + copy_val(bid, bid[:10] + '…'))
+                   if bid else " (as a plain transaction)")
                 for (s, i), (b, bid) in carried))
         elif rounds:
             bullets.append("<b>won</b>: no offer carrying it won a round")
@@ -1348,7 +1465,7 @@ def render_summary(ids, data, copy_val, names):
                   for b in sorted(d["recv"])]
             brows.append([
                 _cv(copy_val, bid, 12),
-                (e(min(d["recv"].values())[11:23]) if d["recv"] else
+                (_tcv(copy_val, min(d["recv"].values()), 11) if d["recv"] else
                  '<span class="dim">never received by us</span>'),
                 "<br>".join(vs) or '<span class="dim">&mdash;</span>',
                 "<br>".join(e(x) for x in sorted(d["us"])) or
@@ -1384,6 +1501,69 @@ def render_summary(ids, data, copy_val, names):
     return head + "".join(out)
 
 
+
+def _member_log(sig, this_bundle, mev, copy_val):
+    """Every receipt of one transaction on our bidding builders -- alone or
+    in any bundle -- with ms after its first receipt, and the scheduler's
+    raw log for each receipt's entity on that builder."""
+    e = html.escape
+    if isinstance(mev, str):
+        return f'<div class="aqcap">{e(mev)}</div>'
+    if not mev:
+        return ""
+    recv, events = mev
+    pfx = sigprefix(sig)
+    mine = [r for r in recv if r[3] == pfx or sig in _arr(r[4])]
+    if not mine:
+        return ('<div class="lkmem dim">no event on our bidding builders: '
+                "never received, alone or in any bundle</div>")
+
+    def t(x):
+        try:
+            return dt.datetime.fromisoformat(x[:26])
+        except ValueError:
+            return None
+    # per builder: each builder's own clock, and they drift apart
+    t0 = {}
+    for r in mine:
+        t0[r[1]] = min(t0.get(r[1], t(r[0])), t(r[0]))
+    logs = {}
+    for r in events:
+        logs.setdefault((r[0], r[1]), []).append(r)
+    rows = []
+    for r in mine:
+        rt = t(r[0])
+        alone = r[3] == pfx
+        log = []
+        for ev in logs.get((r[1], r[3]), []):
+            d = (t(ev[2]) - rt).total_seconds() * 1000 if rt else 0
+            log.append(f'<span class="dim">+{d:,.1f}</span> {e(ev[3])}/'
+                       f"<b>{e(ev[4])}</b> {e(ev[5] or '')} "
+                       f'<span class="lkjs">{e(ev[6])} {e(ev[7])}</span>')
+        wait = int(r[6] or 0)
+        rows.append([
+            e(_bshort(r[1])), _tcv(copy_val, r[0], 11, 26),
+            f"+{(rt - t0[r[1]]).total_seconds() * 1000:,.1f}",
+            ("<b>alone</b>" if alone else
+             ("<b>this bundle</b> " if r[3] == this_bundle else "bundle ")
+             + _cv(copy_val, r[3], 10)),
+            e(r[5] or "") + (f" wait {wait / 1000:,.1f} ms" if wait else ""),
+            "<br>".join(log) or '<span class="dim">nothing after receipt</span>'])
+    builders = sorted({_bshort(r[1]) for r in mine})
+    verdicts = sorted({f"{ev[4]} {ev[5]}".strip()
+                       for r in mine for ev in logs.get((r[1], r[3]), [])})
+    summary = (f"{len(mine)} receipt{'s' if len(mine) != 1 else ''} on "
+               f"{', '.join(e(b) for b in builders)}"
+               + (f" &middot; {e(', '.join(verdicts))}" if verdicts else
+                  ' &middot; <span class="dim">no scheduler event</span>'))
+    # collapsed by default: the table is wide and most members are not the
+    # one being looked at
+    return (f'<details class="lkinl lkmem"><summary>{summary}</summary>'
+            + _table(
+        ["builder", "received", "ms after its first on that builder", "as", "source",
+         "scheduler log (ms after this receipt)"], rows, "") + "</details>")
+
+
 def render_searchers(ids, data, copy_val):
     e = html.escape
     v = data.get("s_api")
@@ -1400,7 +1580,7 @@ def render_searchers(ids, data, copy_val):
         drop, targets = _arr(drop), _arr(targets)
         size = int(nmev or 0) or int(n or 0)
         rows.append([
-            e(at[11:23]),
+            _tcv(copy_val, at, 11),
             (_cv(copy_val, sig, 12) + " " + _cv(copy_val, sigprefix(sig))
              if len(focal) > 1 else ""),
             f"<b>{e(user or kname or '?')}</b> "
@@ -1585,6 +1765,16 @@ def page_body(qs, src, copy_val, names=None):
     return "".join(out)
 
 
+# The page's copy handler cancels the click, which also stops a <details>
+# from opening; a bundle id in a summary line both copies and opens.
+LK_JS = """<script>
+document.addEventListener('click', function(ev){
+  var el = ev.target.closest && ev.target.closest('.lkinl > summary .cpv');
+  if (el) el.closest('details').toggleAttribute('open');
+});
+</script>"""
+
+
 CSS = """
 .lksec{margin:10px 28px;border:1px solid #1e2937;border-radius:8px;
   padding:8px 12px;background:#0b1016}
@@ -1602,4 +1792,14 @@ CSS = """
 .lksum{margin:4px 28px 8px;padding-left:18px;font-size:12.5px;line-height:1.7;
   color:#cbd5e1}
 .lktab td{vertical-align:top}
+.lkinl{display:inline}
+.lkinl>summary{display:inline;cursor:pointer;text-decoration:underline dotted}
+.lkinl[open]>summary{display:inline}
+.lkbox{margin:4px 0 6px 14px;padding:6px 10px;border-left:2px solid #2a3a4d;
+  font-size:12px}
+.lkbox ol{margin:4px 0 0;padding-left:18px}
+.lkinl .lkinl{display:block}
+.lkmem{margin:2px 0 8px}
+.lkmem[open]>.lkwrap{margin-top:4px}
+.lkmem .lktab td{white-space:normal}
 """
