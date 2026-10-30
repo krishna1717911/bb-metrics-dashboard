@@ -1427,6 +1427,20 @@ def render_summary(ids, data, copy_val, names):
                         f'<span class="dim">{e(w)} &middot; relay receipt</span>')
             return "".join(f"<div>{x}</div>" for x in out_)
 
+        def first_short(bid_, fam):
+            """The first offer of that family, beside the id in the list,
+            so it shows without opening the bundle."""
+            o = ourfirst.get(bid_) if fam == "us" else None
+            if o:
+                t, w, clock = o[0], f"{_bshort(o[1])} {o[2]}/{o[3]}", "our clock"
+            elif (bid_, fam) in first:
+                (t, w), clock = first[(bid_, fam)], "relay receipt"
+            else:
+                return ""
+            return (f' <span class="dim">first offered</span> '
+                    f"{_tcv(copy_val, t, 11, 26)} "
+                    f'<span class="dim">{e(w)} &middot; {clock}</span>')
+
         def bundle_box(bid_, label):
             """A bundle id that opens to its members on click (and copies
             the id, as every id here does)."""
@@ -1476,7 +1490,8 @@ def render_summary(ids, data, copy_val, names):
                     + f" &middot; " + (
                         f'<details class="lkinl"><summary><b>{len(bids)}</b> '
                         "distinct bundle(s)</summary>" + "".join(
-                            bundle_box(x, _cv(copy_val, x, 12))
+                            bundle_box(x, _cv(copy_val, x, 12)
+                                       + first_short(x, fam))
                             for x in sorted(bids)) + "</details>"
                         if bids else "no bundles")
                     + (" + as a plain transaction" if plain else ""))
@@ -1536,9 +1551,12 @@ def render_summary(ids, data, copy_val, names):
         for bid, d in sorted(bundles.items(),
                              key=lambda kv: (-len(kv[1]["us"]), -len(kv[1]["titan"]),
                                              min(kv[1]["recv"].values() or ["~"]))):
-            vs = [f"<b>{e(_bshort(b))}</b> " + (verd.get((b, bid)) or
-                  '<span class="dim">no event after receipt</span>')
-                  for b in sorted(d["recv"])]
+            # each builder's own receipt (its own clock), earliest first
+            vs = [f"<b>{e(_bshort(b))}</b> received "
+                  f"{_tcv(copy_val, t, 11, 26)} &middot; "
+                  + (verd.get((b, bid)) or
+                     '<span class="dim">no event after receipt</span>')
+                  for b, t in sorted(d["recv"].items(), key=lambda kv: kv[1])]
             brows.append([
                 _cv(copy_val, bid, 12),
                 (_tcv(copy_val, min(d["recv"].values()), 11) if d["recv"] else
