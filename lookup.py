@@ -242,9 +242,15 @@ def widen(src, ids, lo, hi):
     w = f"ts >= '{lo:{F}}' AND ts <= '{hi:{F}}'"
     notes = []
     why = ids["why"]
+    # bundle id -> {member index: signature}, for the copy menu (LK_BM)
+    members = ids.setdefault("members", {})
 
     def tag(x, reason):
         why.setdefault(x, reason)
+
+    def keep(bid, sigs):
+        for i, m in enumerate(sigs):
+            members.setdefault(bid, {}).setdefault(i, m)
     if ids["sigs"]:
         try:
             for ent, sigs in _rows(ch(
@@ -254,6 +260,7 @@ def widen(src, ids, lo, hi):
                     f"[{_lst(ids['sigs'])}]) GROUP BY entity LIMIT 50")):
                 ids["bundles"].add(ent)
                 tag(ent, "a bundle our builders received carrying it")
+                keep(ent, _arr(sigs))
                 for m in _arr(sigs):
                     ids["sigs"].add(m)
                     tag(m, f"member of bundle {ent[:10]}\u2026")
@@ -265,6 +272,7 @@ def widen(src, ids, lo, hi):
                     "SELECT entity, any(signatures) FROM bifrost_events "
                     f"WHERE {w} AND stage = 'scheduler' AND event = 'received' "
                     f"AND entity IN ({_lst(ids['bundles'])}) GROUP BY entity")):
+                keep(ent, _arr(sigs))
                 for m in _arr(sigs):
                     ids["sigs"].add(m)
                     tag(m, f"member of bundle {ent[:10]}\u2026")
@@ -284,8 +292,9 @@ def widen(src, ids, lo, hi):
                      f"({_lst(ids['prefixes'])})")
     if conds:
         try:
-            for sig, bid in _rows(relay(
-                    "SELECT DISTINCT base58Encode(signature), ifNull(bundle_id, '') "
+            for sig, bid, ix in _rows(relay(
+                    "SELECT DISTINCT base58Encode(signature), ifNull(bundle_id, ''), "
+                    "ifNull(bundle_tx_index, 0) "
                     f"FROM relay.mini_block_transactions_v2 WHERE {rw} AND "
                     f"({' OR '.join(conds)}) LIMIT 400")):
                 ids["sigs"].add(sig)
@@ -294,6 +303,7 @@ def widen(src, ids, lo, hi):
                 if bid:
                     ids["bundles"].add(bid)
                     tag(bid, "a bundle in relay offers carrying it")
+                    members.setdefault(bid, {}).setdefault(int(ix or 0), sig)
         except Exception as exc:
             notes.append(f"relay offers: {str(exc)[:120]}")
     # bundles only the relay named: their members from our builders' log
@@ -304,6 +314,7 @@ def widen(src, ids, lo, hi):
                     "SELECT entity, any(signatures) FROM bifrost_events "
                     f"WHERE {w} AND stage = 'scheduler' AND event = 'received' "
                     f"AND entity IN ({_lst(new)}) GROUP BY entity")):
+                keep(ent, _arr(sigs))
                 for m in _arr(sigs):
                     ids["sigs"].add(m)
                     tag(m, f"member of bundle {ent[:10]}\u2026")
@@ -328,6 +339,9 @@ def widen(src, ids, lo, hi):
                     "LIMIT 50")):
                 ids["uuids"].add(bsid)
                 tag(bsid, "an API bundle carrying one of these transactions")
+                keep(bsid, _arr(sigs))
+                if gb:
+                    keep(gb, _arr(sigs))
                 for m in _arr(sigs):
                     ids["sigs"].add(m)
                     tag(m, f"member of API bundle {bsid[:8]}\u2026")
@@ -931,8 +945,9 @@ def _table(cols, rows, empty):
     head = "".join(f"<th>{html.escape(c)}</th>" for c in cols)
     body = "".join("<tr>" + "".join(f"<td>{c}</td>" for c in r) + "</tr>"
                    for r in rows)
-    return (f'<div class="lkwrap"><table class="otab lktab"><tr>{head}</tr>'
-            f"{body}</table></div>")
+    # thead/tbody: DataTables (LK_DT) needs them to sort and filter
+    return (f'<div class="lkwrap"><table class="otab lktab"><thead><tr>{head}'
+            f"</tr></thead><tbody>{body}</tbody></table></div>")
 
 
 def _sec(title, sub, inner, n=None, cap=None):
@@ -1230,7 +1245,23 @@ def render(kind, ident, lo, hi, how, ids, notes, data, copy_val, names=None):
             "nothing for these ids"), _count(v), CAPS.get(key)))
     # the summary sections stay open; the raw ones start closed
     return "".join(out[:top]) + "".join(out[top:]).replace(
-        '<details class="lksec" open>', '<details class="lksec">')
+        '<details class="lksec" open>', '<details class="lksec">') + _page_maps(
+        ids, data) + LK_DT + LK_BM
+
+
+def _page_maps(ids, data):
+    """signature <-> SigPrefix for the table filters ("our builders" holds
+    only the prefix, the relay tables only the full signature), and every
+    bundle id's members, in order, for the copy menu."""
+    bm = {b: dict(v) for b, v in (ids.get("members") or {}).items()}
+    rel = data.get("s_relay")
+    if isinstance(rel, tuple):
+        for bid, ix, sig in rel[2]:
+            bm.setdefault(bid, {}).setdefault(int(ix or 0), sig)
+    bm = {b: [v[i] for i in sorted(v)] for b, v in bm.items() if b and v}
+    return ("<script>window.LK_SIGS="
+            + json.dumps({s: sigprefix(s) for s in ids["sigs"]})
+            + ";window.LK_BUNDLES=" + json.dumps(bm) + "</script>")
 
 
 # ------------------------------------------------------------------ summary render
@@ -1882,6 +1913,167 @@ document.addEventListener('click', function(ev){
 </script>"""
 
 
+# Every table of two or more rows becomes a DataTables table when it is
+# first shown (most sit in closed sections): a filter box that matches the
+# full value behind every truncated id, and on a table with a timestamp
+# column, oldest/newest-first plus an "after" cutoff. Oldest first by default.
+DATATABLES = "https://cdn.jsdelivr.net/npm/datatables.net@2.1.8"
+LK_DT = (
+    '<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/'
+    'datatables.net-dt@2.1.8/css/dataTables.dataTables.min.css">'
+    '<script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>'
+    f'<script src="{DATATABLES}/js/dataTables.min.js"></script>'
+    r"""<script>(function(){
+  if (!window.DataTable) return;
+  var TS = /^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d/;
+  // a timestamp cell copies the full 'YYYY-MM-DD HH:MM:SS.mmm' (_tcv)
+  // whatever slice it shows; anything else sorts on its text
+  function val(td){
+    var c = td.querySelector('.cpv[data-c]');
+    var v = c ? c.getAttribute('data-c') : '';
+    return TS.test(v) ? v : td.textContent.trim();
+  }
+  var PAIR = {};
+  Object.keys(window.LK_SIGS || {}).forEach(function(s){
+    PAIR[s] = LK_SIGS[s]; PAIR[LK_SIGS[s]] = s;
+  });
+  // search text = what a cell shows plus the full value behind each copy
+  // control, so a whole signature or bundle id matches a truncated one,
+  // and a signature matches its SigPrefix and the other way round.
+  // Returns the first column holding timestamps and otherwise only words
+  // ("never received by us"), not numbers; the words sort after them.
+  function prep(t){
+    var rows = t.tBodies[0].rows, ts = [], num = [];
+    for (var i = 0; i < rows.length; i++){
+      for (var j = 0; j < rows[i].cells.length; j++){
+        var td = rows[i].cells[j], s = [td.textContent];
+        td.querySelectorAll('.cpv[data-c]').forEach(function(c){
+          var v = c.getAttribute('data-c');
+          s.push(v);
+          if (PAIR[v]) s.push(PAIR[v]);
+        });
+        td.setAttribute('data-search', s.join(' '));
+        var v = val(td);
+        if (TS.test(v)) ts[j] = true;
+        else if (/^[+-]?[\d.,]/.test(v)) num[j] = true;
+      }
+    }
+    var col = -1;
+    for (var j = 0; j < ts.length && col < 0; j++) if (ts[j] && !num[j]) col = j;
+    if (col >= 0)
+      for (var i = 0; i < rows.length; i++)
+        if (rows[i].cells[col])
+          rows[i].cells[col].setAttribute('data-order', val(rows[i].cells[col]));
+    return col;
+  }
+  var cuts = new WeakMap();
+  DataTable.ext.search.push(function(s, data, idx){
+    var c = cuts.get(s.nTable);
+    if (!c || !c.v) return true;
+    var td = new DataTable.Api(s).row(idx).node().cells[c.col];
+    var v = td && td.getAttribute('data-order') || '';
+    if (!TS.test(v)) return false;
+    // a bare time compares against the time of day
+    return (/^\d\d:/.test(c.v) ? v.slice(11) : v) >= c.v;
+  });
+  function controls(s, t, col){
+    var api = new DataTable.Api(s), d = document.createElement('div');
+    d.className = 'lkdt';
+    d.innerHTML = '<label>ts <select><option value="asc">oldest first</option>'
+      + '<option value="desc">newest first</option></select></label>'
+      + '<label>at or after <input size="24" '
+      + 'placeholder="16:21:00.950 or 2026-10-25 16:21"></label>';
+    var sel = d.querySelector('select'), inp = d.querySelector('input');
+    sel.addEventListener('change', function(){ api.order([col, sel.value]).draw(); });
+    inp.addEventListener('input', function(){
+      cuts.set(t, {col: col, v: inp.value.trim().replace('T', ' ').replace(/Z$/, '')});
+      api.draw();
+    });
+    // a header click re-sorts too; keep the select honest
+    api.on('order', function(){
+      var o = api.order()[0];
+      if (o && o[0] === col) sel.value = o[1];
+    });
+    return d;
+  }
+  function init(t){
+    if (t.lkdt || !t.tBodies[0] || t.tBodies[0].rows.length < 2) return;
+    t.lkdt = true;
+    var col = prep(t);
+    new DataTable(t, {
+      paging: false, autoWidth: false,
+      order: col >= 0 ? [[col, 'asc']] : [],
+      // no third "unsorted" click
+      columnDefs: [{targets: '_all', orderSequence: ['asc', 'desc']}].concat(
+        col >= 0 ? [{targets: col, type: 'string'}] : []),
+      layout: {topStart: col >= 0 ? function(s){ return controls(s, t, col); } : null,
+               topEnd: 'search', bottomStart: 'info', bottomEnd: null},
+      language: {search: '', searchPlaceholder: 'filter: signature, bundle id, builder…',
+                 info: '_TOTAL_ rows', infoEmpty: '0 rows',
+                 infoFiltered: '(of _MAX_)', zeroRecords: 'no row matches'}
+    });
+  }
+  function scan(root){
+    root.querySelectorAll('table.lktab').forEach(function(t){
+      if (t.offsetParent !== null) init(t);
+    });
+  }
+  scan(document);
+  document.addEventListener('toggle', function(ev){
+    if (ev.target.open) scan(ev.target);
+  }, true);
+})();</script>""")
+
+
+# Clicking a bundle id (anywhere on the page) opens a menu to copy the id,
+# all its member signatures (one per line) or any one member, instead of
+# copying the id straight away. Ids with no known members copy as before.
+# The items are .cpv controls, so the shell's copy handler does the copying.
+LK_BM = (
+    '<script src="https://cdn.jsdelivr.net/npm/@popperjs/core@2.11.8/dist/umd/'
+    'popper.min.js"></script><script src="https://cdn.jsdelivr.net/npm/'
+    'tippy.js@6.3.7/dist/tippy-bundle.umd.min.js"></script>'
+    r"""<script>(function(){
+  if (!window.tippy) return;
+  var B = window.LK_BUNDLES || {}, tip = null;
+  function item(box, label, val, title){
+    var d = document.createElement('div'), s = document.createElement('span');
+    s.className = 'cpv'; s.setAttribute('data-c', val);
+    s.setAttribute('role', 'button'); s.tabIndex = 0;
+    s.title = title || ('click to copy ' + val);
+    s.textContent = label;
+    d.appendChild(s); box.appendChild(d);
+  }
+  function show(el, id, sigs){
+    if (tip) tip.destroy();
+    var box = document.createElement('div');
+    box.className = 'lkbm';
+    item(box, 'copy bundle id', id);
+    item(box, 'copy ' + (sigs.length > 1 ? 'all ' + sigs.length + ' signatures'
+                         : 'its signature') + ' (one per line)',
+         sigs.join('\n'), 'click to copy ' + sigs.length + ' signature(s)');
+    sigs.forEach(function(s, i){ item(box, '#' + i + '  ' + s, s); });
+    tip = tippy(el, {content: box, interactive: true, trigger: 'manual',
+                     placement: 'bottom-start', appendTo: document.body,
+                     maxWidth: 'none', theme: 'lk',
+                     onHidden: function(t){ t.destroy(); if (tip === t) tip = null; }});
+    tip.show();
+  }
+  // capture: runs before the shell's copy handler and LK_JS
+  document.addEventListener('click', function(ev){
+    var el = ev.target.closest && ev.target.closest('.cpv[data-c]');
+    if (!el || el.closest('.tippy-box')) return;
+    var id = el.getAttribute('data-c'), sigs = B[id];
+    if (!sigs) return;
+    ev.preventDefault(); ev.stopPropagation();
+    // a bundle id in a summary line still opens its box
+    var sum = el.closest('.lkinl > summary');
+    if (sum) sum.parentNode.toggleAttribute('open');
+    show(el, id, sigs);
+  }, true);
+})();</script>""")
+
+
 CSS = """
 .lksec{margin:10px 28px;border:1px solid #1e2937;border-radius:8px;
   padding:8px 12px;background:#0b1016}
@@ -1909,4 +2101,27 @@ CSS = """
 .lkmem{margin:2px 0 8px}
 .lkmem[open]>.lkwrap{margin-top:4px}
 .lkmem .lktab td{white-space:normal}
+.lkwrap .dt-container{color:#b9ccdf;font-size:11.5px}
+.lkwrap .dt-layout-row{margin:4px 0}
+.lkwrap .dt-search input,.lkdt input,.lkdt select{background:#0b1016;
+  border:1px solid #2a3a4d;border-radius:4px;color:#dbe4ee;padding:2px 6px;
+  font:11px ui-monospace,Menlo,monospace}
+.lkwrap .dt-search input{width:30em;margin-left:0}
+.lkdt label{margin-right:14px;color:#8fa6bf;font-size:11.5px}
+.lkdt select,.lkdt input{margin-left:5px}
+.lkwrap .dt-info{color:#6b7f96;font-size:11px}
+table.dataTable.lktab>thead>tr>th{padding-top:0;padding-left:0;
+  padding-bottom:5px;border-bottom:1px solid #1e2937}
+table.dataTable.lktab>tbody>tr>td{padding:4px 10px 4px 0}
+table.dataTable.lktab th.dt-type-numeric,table.dataTable.lktab td.dt-type-numeric,
+table.dataTable.lktab th.dt-type-date,table.dataTable.lktab td.dt-type-date{text-align:left}
+table.dataTable.lktab>tbody>tr{background:transparent}
+.tippy-box[data-theme~=lk]{background:#0f1720;border:1px solid #2a3a4d;
+  border-radius:6px;color:#dbe4ee}
+.tippy-box[data-theme~=lk]>.tippy-arrow{color:#2a3a4d}
+.lkbm{font:11px ui-monospace,Menlo,monospace;padding:2px 2px}
+.lkbm>div{padding:2px 0}
+.lkbm>div:nth-child(-n+2){font:12px system-ui,sans-serif}
+.lkbm>div:nth-child(2){padding-bottom:5px;margin-bottom:3px;
+  border-bottom:1px solid #1e2937}
 """
