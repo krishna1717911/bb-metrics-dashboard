@@ -987,6 +987,8 @@ def render(kind, ident, lo, hi, how, ids, notes, data, copy_val, names=None):
         f'bundle id(s), {len(ids["uuids"])} API bundle id(s)</span></div>')
     for n in notes:
         out.append(f'<div class="aqcap lknote">{e(n)}</div>')
+    # filled by LK_DT: one production builder across every table
+    out.append('<div id="lkglobal" class="lkglobal"></div>')
     out.append(render_summary(ids, data, copy_val, names) + LK_JS)
     out.append(render_searchers(ids, data, copy_val))
     out.append(render_arbs(ids, data, copy_val, snames))
@@ -1596,17 +1598,20 @@ def render_summary(ids, data, copy_val, names):
                              key=lambda kv: (-len(kv[1]["us"]), -len(kv[1]["titan"]),
                                              min(kv[1]["recv"].values() or ["~"]))):
             # each builder's own receipt (its own clock), earliest first
-            vs = [f"<b>{e(_bshort(b))}</b> received "
+            vs = [f'<div class="lkbl" data-bld="{e(_bshort(b))}">'
+                  f"<b>{e(_bshort(b))}</b> received "
                   f"{_tcv(copy_val, t, 11, 26)} &middot; "
                   + (verd.get((b, bid)) or
                      '<span class="dim">no event after receipt</span>')
+                  + "</div>"
                   for b, t in sorted(d["recv"].items(), key=lambda kv: kv[1])]
             brows.append([
                 _cv(copy_val, bid, 12),
                 (_tcv(copy_val, min(d["recv"].values()), 11) if d["recv"] else
                  '<span class="dim">never received by us</span>'),
-                "<br>".join(vs) or '<span class="dim">&mdash;</span>',
-                "<br>".join(e(x) for x in sorted(d["us"])) or
+                "".join(vs) or '<span class="dim">&mdash;</span>',
+                "".join(f'<div class="lkbl" data-bld="{e(x.split()[0])}">'
+                        f"{e(x)}</div>" for x in sorted(d["us"])) or
                 '<span class="dim">no</span>',
                 "<br>".join(e(x) for x in sorted(d["titan"])) or
                 '<span class="dim">no</span>',
@@ -1996,11 +2001,69 @@ LK_DT = (
     });
     return d;
   }
+  // the global builder picker: production builders only (no mocks, no
+  // Titan), as short names; a builder column holds either form
+  var PROD = /^(?:ASTRALANE_)?((?:AMS|FRA|JP)_\d+)$/, only = '';
+  function bcol(t){
+    var h = t.tHead ? t.tHead.rows[0].cells : [];
+    for (var j = 0; j < h.length; j++)
+      if (h[j].textContent.trim().toLowerCase() === 'builder') return j;
+    return -1;
+  }
+  function narrow(t){
+    if (t.lkapi && t.lkbcol >= 0)
+      t.lkapi.column(t.lkbcol).search(
+        only ? '^(?:ASTRALANE_)?' + only + '$' : '', true, false).draw();
+  }
+  function lines(){
+    document.querySelectorAll('.lkbl[data-bld]').forEach(function(d){
+      d.style.display = !only || d.getAttribute('data-bld') === only ? '' : 'none';
+    });
+  }
+  function picker(){
+    var box = document.getElementById('lkglobal');
+    if (!box) return;
+    var seen = {};
+    document.querySelectorAll('table.lktab').forEach(function(t){
+      var j = bcol(t);
+      if (j < 0 || !t.tBodies[0]) return;
+      [].forEach.call(t.tBodies[0].rows, function(r){
+        var m = r.cells[j] && PROD.exec(r.cells[j].textContent.trim());
+        if (m) seen[m[1]] = 1;
+      });
+    });
+    var names = Object.keys(seen).sort();
+    if (!names.length) return;
+    var want = new URLSearchParams(location.search).get('builder') || '';
+    only = names.indexOf(want) >= 0 ? want : '';
+    box.innerHTML = '<label>builder <select><option value="">all builders</option>'
+      + names.map(function(n){ return '<option>' + n + '</option>'; }).join('')
+      + '</select></label> <span class="dim">production builders only; '
+      + 'applies to every table with a builder column</span>';
+    var sel = box.querySelector('select');
+    sel.value = only;
+    sel.addEventListener('change', function(){
+      only = sel.value;
+      var u = new URL(location.href);
+      if (only) u.searchParams.set('builder', only); else u.searchParams.delete('builder');
+      history.replaceState(null, '', u);
+      // a new lookup from the form keeps it
+      var f = document.querySelector('.aqform'), h = f && f.querySelector('input[name=builder]');
+      if (f && !h){ h = document.createElement('input'); h.type = 'hidden'; h.name = 'builder'; f.appendChild(h); }
+      if (h) h.value = only;
+      document.querySelectorAll('table.lktab').forEach(narrow);
+      lines();
+    });
+    if (only) sel.dispatchEvent(new Event('change'));
+  }
   function init(t){
-    if (t.lkdt || !t.tBodies[0] || t.tBodies[0].rows.length < 2) return;
+    var bc = bcol(t);
+    // a table with a builder column is narrowed even at one row
+    if (t.lkdt || !t.tBodies[0] || t.tBodies[0].rows.length < (bc >= 0 ? 1 : 2)) return;
     t.lkdt = true;
     var col = prep(t);
-    new DataTable(t, {
+    t.lkbcol = bc;
+    t.lkapi = new DataTable(t, {
       paging: false, autoWidth: false,
       order: col >= 0 ? [[col, 'asc']] : [],
       // no third "unsorted" click
@@ -2012,12 +2075,14 @@ LK_DT = (
                  info: '_TOTAL_ rows', infoEmpty: '0 rows',
                  infoFiltered: '(of _MAX_)', zeroRecords: 'no row matches'}
     });
+    narrow(t);
   }
   function scan(root){
     root.querySelectorAll('table.lktab').forEach(function(t){
       if (t.offsetParent !== null) init(t);
     });
   }
+  picker();
   scan(document);
   document.addEventListener('toggle', function(ev){
     if (ev.target.open) scan(ev.target);
@@ -2116,6 +2181,9 @@ table.dataTable.lktab>tbody>tr>td{padding:4px 10px 4px 0}
 table.dataTable.lktab th.dt-type-numeric,table.dataTable.lktab td.dt-type-numeric,
 table.dataTable.lktab th.dt-type-date,table.dataTable.lktab td.dt-type-date{text-align:left}
 table.dataTable.lktab>tbody>tr{background:transparent}
+.lkglobal{margin:6px 28px 0;font-size:12px;color:#8fa6bf}
+.lkglobal select{margin-left:5px;background:#0b1016;border:1px solid #2a3a4d;
+  border-radius:4px;color:#dbe4ee;padding:2px 6px;font:12px system-ui,sans-serif}
 .tippy-box[data-theme~=lk]{background:#0f1720;border:1px solid #2a3a4d;
   border-radius:6px;color:#dbe4ee}
 .tippy-box[data-theme~=lk]>.tippy-arrow{color:#2a3a4d}
