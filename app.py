@@ -9703,6 +9703,11 @@ def offer_timeline_page(qs):
                               connectors=opts)
     if r["err"]:
         body += accuracy.timeline_table_html(r, [], 0, 0, OURS_RE)
+    elif not r["connector"] and r["mode"] != "slot":
+        # every validator in the region at once is slow and rarely the
+        # question: wait for a validator or a slot
+        body += ('<div class="aqhead">Pick a validator (or enter a slot) to '
+                 "load its offer timelines.</div>")
     else:
         try:
             slots, shown, total = accuracy.timeline_slots(
