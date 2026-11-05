@@ -4261,6 +4261,7 @@ window.__renderOffers = function(){
         var m = marker(g, st.s, colX(i), cy, r, st.c, cls);
         m.addEventListener('mouseenter', function(ev){ show(ev, rd, b, base); });
         m.addEventListener('mouseleave', hide);
+        if(b.x) m.addEventListener('click', function(){ copyOffer(b); });
       });
     }
     draw();
@@ -4283,7 +4284,8 @@ window.__renderOffers = function(){
           ? '<span class="lateT">' + (b.t - rd.deadline)
             + ' ms after the deadline</span>' : '')
       + (best && best.u === b.u ? '<span class="topT">highest reward this round</span>' : '')
-      + (b.v ? '<span class="g">' + esc(b.v) + '</span>' : '');
+      + (b.v ? '<span class="g">' + esc(b.v) + '</span>' : '')
+      + (b.x ? '<span class="g">click to copy every field as JSON</span>' : '');
     document.body.appendChild(tip);
     var r = ev.target.getBoundingClientRect();
     var left = Math.min(r.right + 10, window.innerWidth - tip.offsetWidth - 10);
@@ -4292,6 +4294,18 @@ window.__renderOffers = function(){
       window.innerHeight - tip.offsetHeight - 10)) + 'px';
   }
   function hide(){ if(tip){ tip.remove(); tip = null; } }
+  // Hand the record to the shell's copy handler through a throwaway .cpv:
+  // one copy path (clipboard API, or execCommand on plain http).
+  function copyOffer(b){
+    var s = document.createElement('span');
+    s.className = 'cpv';
+    s.setAttribute('data-c', JSON.stringify(b.x));
+    s.style.cssText = 'position:fixed;left:-9999px;top:0';
+    document.body.appendChild(s);
+    s.click();
+    setTimeout(function(){ s.remove(); }, 1500);
+    if(tip) tip.insertAdjacentHTML('beforeend', '<span class="wonT">copied</span>');
+  }
 
   var cards = D.rounds.map(facet);
   // one control for the lot, because chasing the same button down eight
@@ -6809,6 +6823,7 @@ ol.bsiglist li{margin:2px 0;font-size:10px;word-break:break-all}
   font-size:11px}
 .obuilder{display:flex;align-items:center;gap:6px;
   font-family:ui-monospace,Menlo,monospace}
+#offwrap .om{cursor:pointer}
 .olegend .om{width:9px;height:9px;display:inline-block;border-radius:50%}
 .olegend .om.square{border-radius:1px}
 .olegend .om.diamond{border-radius:1px;transform:rotate(45deg)}

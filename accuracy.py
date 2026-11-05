@@ -3247,7 +3247,8 @@ def slot_timeline(relay_q, slot, window, region="all"):
         "  toString(timestamp) AS t, builder_payment AS pay, "
         "  jito_tips AS jito, protocol_fees AS fees, "
         "  execution_cost AS cost, order_count AS n, reason, "
-        "  toString(mini_block_uuid) AS uuid, is_last, connector_identity "
+        "  toString(mini_block_uuid) AS uuid, is_last, connector_identity, "
+        "  cost_budget, skipped_rounds, instance_id "
         f"FROM relay.mini_block_events_v2 WHERE {tb} AND slot = {int(slot)}"
         f"{_region_sql(region)} ORDER BY idx, t")
     # round_chosen carries no slot, so the winner is the chosen uuid
@@ -3265,7 +3266,7 @@ def slot_timeline(relay_q, slot, window, region="all"):
     rounds_ = {}
     leader, leader_w = "", None
     for (idx, ev, bld, t, pay, jito, fees, cost, n, reason, uuid, is_last,
-         conn) in rows:
+         conn, budget, skipped, inst) in rows:
         i = int(idx)
         if conn and not leader:
             leader = conn
@@ -3275,6 +3276,9 @@ def slot_timeline(relay_q, slot, window, region="all"):
                                    "is_last": False})
         if ev == "round_opened":
             d["opened"] = d["opened"] or t
+            # the round's budget and skips live on its opening row; the
+            # submitted rows carry 0
+            d["budget"], d["skipped"] = int(budget or 0), int(skipped or 0)
             continue
         if ev == "block_sealed":
             d["sealed"] = t
@@ -3294,7 +3298,9 @@ def slot_timeline(relay_q, slot, window, region="all"):
             "bid": score_of(fees or 0, jito or 0, pay or 0, bps),
             "raw": int(pay or 0) + int(jito or 0) + int(fees or 0),
             "cost": int(cost or 0), "n": int(n or 0),
-            "reason": reason or ""})
+            "reason": reason or "", "relay": inst or "",
+            "connector": conn or "",
+            "is_last": str(is_last).lower() in ("1", "true")})
     out = []
     for i in sorted(rounds_):
         d = rounds_[i]
@@ -3412,6 +3418,28 @@ def _epoch_ms(t):
         return 0
 
 
+def offer_record(slot, rnd, o):
+    """Everything the relay's `submitted` row says about one offer, plus
+    what the page derives from it -- what a click on an offer copies."""
+    rec = {"slot": int(slot), "rnd": rnd["idx"],
+           "mini_block_uuid": o["uuid"], "builder_id": o["builder"],
+           "submitted_at": o["at"],
+           "ms_after_open": (None if o.get("t_ms") is None
+                             else round(o["t_ms"], 3)),
+           "round_opened_at": rnd.get("anchor") or "",
+           "relay_score": o["bid"], "raw_reward": o.get("raw", o["bid"]),
+           "protocol_fees": o.get("fees"), "jito_tips": o.get("jito"),
+           "jito_weight_bps": o.get("jito_w"),
+           "builder_payment": o.get("pay"),
+           "execution_cost": o["cost"], "cost_budget": rnd.get("budget"),
+           "order_count": o["n"], "graded": o["reason"],
+           "chosen": bool(o.get("chosen")), "is_last": o.get("is_last"),
+           "skipped_rounds": rnd.get("skipped"),
+           "connector_identity": o.get("connector"),
+           "relay_instance": o.get("relay")}
+    return {k: v for k, v in rec.items() if v is not None}
+
+
 def race_data(tl):
     """slot_timeline output -> the shape OFFERS_JS expects."""
     out = {}
@@ -3423,7 +3451,8 @@ def race_data(tl):
             ms = _epoch_ms(o["at"])
             bids.append({"t": ms, "b": o["builder"], "r": o["bid"],
                          "o": o["n"], "u": o["uuid"],
-                         "v": o["reason"].replace("_", " ")})
+                         "v": o["reason"].replace("_", " "),
+                         "x": offer_record(tl["slot"], rnd, o)})
             if o["chosen"]:
                 chosen = {"b": o["builder"], "r": o["bid"], "o": o["n"],
                           "t": ms, "u": o["uuid"]}
@@ -3581,9 +3610,13 @@ def timeline_html(d, names=None):
             tms = "&mdash;" if o["t_ms"] is None else f"+{o['t_ms']:.0f}"
             star = (' <span class="tlstar">chosen</span>' if o["chosen"]
                     else "")
+            rec = json.dumps(offer_record(d["slot"], rnd, o),
+                             separators=(",", ":"))
             rowsh.append(
                 f'<tr{" class=\"tlwin\"" if o["chosen"] else ""}>'
-                f'<td class="n">{tms}</td>'
+                f'<td class="n"><span class="cpv" data-c="{html.escape(rec, quote=True)}" '
+                'role="button" tabindex="0" title="click to copy this offer '
+                f'(uuid, rewards, slot, round, ...) as JSON">{tms}</span></td>'
                 f'<td class="{"ours" if mine else ""}">'
                 f'{html.escape(o["builder"])}{star}</td>'
                 f'<td class="n" title="{html.escape(why)}">{o["bid"]:,}</td>'
