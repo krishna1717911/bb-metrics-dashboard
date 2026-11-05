@@ -2430,6 +2430,25 @@ def _sel_head(x):
             "winning offer was submitted</span></div>")
 
 
+def _row_copy(i, kind):
+    """One diff row as a single line of JSON, the numbers as the row shows
+    them: recv/win/wait from the same instance _recv_cells picks."""
+    rec = i.get("recv") or {}
+    b = i.get("our_builder")
+    inst = (b if b in rec else min(rec, key=lambda k: rec[k][0])) if rec else ""
+    after, before, wait = (rec[inst][:3] if rec else (None, None, None))
+    rnd = lambda v: None if v is None else round(v, 1)
+    return json.dumps({
+        "type": kind, "signature": i["signature"], "sigprefix": i["sigprefix"],
+        "bundle_id": i["bundle_id"] or "", "landed": i["landed"] or "",
+        "reward": "" if i.get("reward") is None else i["reward"],
+        "recv_open": rnd(after), "win_recv": rnd(before), "wait_us": wait,
+        "recv_on": inst.replace("ASTRALANE_", ""), "verdict": i["verdict"],
+        "scheduler": "; ".join(e + (f" {r}" if r else "")
+                               for e, r in _sched_pairs(i)),
+        "slot": i["slot"], "rn": i["round"]}, separators=(",", ":"))
+
+
 def _sel_table(group):
     out = ['<table class="otab"><tr><th>#</th><th>verdict</th><th>type</th>'
            "<th>signature</th><th>sigprefix</th><th>bundle</th>"
@@ -2490,7 +2509,12 @@ def _sel_table(group):
                   f'data-s="{html.escape(_sched_key(i), quote=True)}"')
         aid = "ap" + rid[2:]
         atag = _api_tag(i, aid)
-        out.append(f'<tr{battr}{extra}><td class="n">{i["order_index"]}</td>'
+        # the row number copies the whole row
+        rowcp = (f'<span class="cpv" data-c="{html.escape(_row_copy(i, kind), quote=True)}" '
+                 'role="button" tabindex="0" title="click to copy this row (type, '
+                 "signature, sigprefix, bundle, landed, reward, recv_open, win_recv, "
+                 f'wait_us, scheduler, slot, rn) as JSON">{i["order_index"]} &#x29C9;</span>')
+        out.append(f'<tr{battr}{extra}><td class="n">{rowcp}</td>'
                    f'<td><span class="vd {vcls}">{i["verdict"]}</span></td>'
                    f'<td class="kd {kind}"'
                    + ('' if i.get("received_by_us") else
