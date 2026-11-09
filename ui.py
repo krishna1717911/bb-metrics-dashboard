@@ -9,6 +9,8 @@ module queries anything.
 """
 
 import html
+
+import theme
 import json
 
 
@@ -97,7 +99,7 @@ CHART_JS = r"""
     figs.forEach(function(s){
       var f = JSON.parse(s.textContent),
           el = s.parentNode.querySelector('.uplot');
-      Plotly.newPlot(el, f.data, f.layout, {displaylogo:false, responsive:true,
+      bbTheme.plot(el, f.data, f.layout, {displaylogo:false, responsive:true,
         modeBarButtonsToRemove:['lasso2d','select2d','autoScale2d']});
     });
   }
@@ -174,35 +176,36 @@ SIDEBAR_JS = r"""
 """
 
 
-CSS = """
+CSS = theme.CSS + """
 /* ---- the shell: sidebar + main, as the BI dashboard lays it out ---- */
 .app{display:grid;grid-template-columns:232px minmax(0,1fr);min-height:100vh}
-.snav{position:sticky;top:0;height:100vh;overflow-y:auto;border-right:1px solid #1e2937;
-  background:#0a0f15;padding:16px 10px 24px;font-size:13px}
+.snav{position:sticky;top:0;height:100vh;overflow-y:auto;border-right:1px solid var(--line);
+  background:var(--bg2);padding:16px 10px 24px;font-size:13px}
 .snav .sbrand{display:block;padding:2px 10px 14px;font-weight:650;font-size:16px;
-  color:#dbe4ee;text-decoration:none}
-.snav .sbrand span{color:#5eead4}
+  color:var(--text);text-decoration:none}
+.snav .sbrand span{color:var(--primary)}
 .snav .sgrp{margin:14px 0 4px;padding:0 10px;font-size:10px;text-transform:uppercase;
-  letter-spacing:.06em;color:#6b7f96;font-weight:650}
+  letter-spacing:.06em;color:var(--text3);font-weight:650}
 .snav .srow{position:relative}
-.snav .slink{display:block;padding:6px 30px 6px 10px;border-radius:7px;color:#b9ccdf;
+.snav .slink{display:block;padding:6px 30px 6px 10px;border-radius:7px;color:var(--text);
   text-decoration:none;line-height:1.35}
-.snav .slink:hover{background:#121c26;color:#e6eef7}
-.snav .slink.on{background:#0f766e33;color:#5eead4;font-weight:600}
+.snav .slink:hover{background:var(--hover);color:var(--text)}
+.snav .slink.on{background:var(--hover);color:var(--text);font-weight:600;
+  box-shadow:inset 3px 0 0 var(--primary)}
 .snav .sstar{position:absolute;right:4px;top:3px;width:24px;height:24px;border:0;
-  background:transparent;color:#4d5c70;cursor:pointer;font-size:14px;line-height:1}
-.snav .sstar.on{color:#fbbf24}
-.snav .sstar:hover{color:#fbbf24}
+  background:transparent;color:var(--text3);cursor:pointer;font-size:14px;line-height:1}
+.snav .sstar.on{color:var(--warn)}
+.snav .sstar:hover{color:var(--warn)}
 .snav .sfav .slink{padding-right:10px}
-.snav .snone{padding:4px 10px;color:#4d5c70;font-size:11.5px}
+.snav .snone{padding:4px 10px;color:var(--text3);font-size:11.5px}
 .smain{min-width:0}
 @media (min-width:901px){.smain>header h1{display:none}}
-.stoggle{display:none;background:#0e151d;border:1px solid #22303f;color:#cfe0f0;
+.stoggle{display:none;background:var(--bg);border:1px solid var(--line2);color:var(--accent);
   border-radius:6px;padding:3px 9px;font-size:13px;cursor:pointer}
 @media (max-width:900px){
   .app{grid-template-columns:minmax(0,1fr)}
   .snav{display:none;position:fixed;z-index:50;width:250px;left:0;top:0;
-    box-shadow:0 0 0 100vmax #0009}
+    box-shadow:0 0 0 100vmax var(--shadow)}
   body.snav-open .snav{display:block}
   .stoggle{display:inline-block}
 }
@@ -210,51 +213,51 @@ CSS = """
 /* ---- st.metric-style KPI tiles ---- */
 .kpirow{display:grid;gap:10px;margin:10px 28px 4px;
   grid-template-columns:repeat(auto-fill,minmax(180px,1fr))}
-.kpi{border:1px solid #1e2937;border-radius:10px;background:#0e151d;padding:11px 14px 10px}
-.kpi .kl{font-size:11.5px;color:#8fa6bf;line-height:1.35}
-.kpi .kv{font-size:22px;font-weight:650;color:#e6eef7;margin-top:3px;
+.kpi{border:1px solid var(--line);border-radius:10px;background:var(--bg);padding:11px 14px 10px}
+.kpi .kl{font-size:11.5px;color:var(--text2);line-height:1.35}
+.kpi .kv{font-size:22px;font-weight:650;color:var(--text);margin-top:3px;
   font-variant-numeric:tabular-nums;letter-spacing:-.01em}
 .kpi .kdl{margin-top:2px;font-size:12px}
-.kpi .ks{margin-top:3px;font-size:11px;color:#6b7f96;line-height:1.4}
+.kpi .ks{margin-top:3px;font-size:11px;color:var(--text3);line-height:1.4}
 .udelta{font-weight:600;font-variant-numeric:tabular-nums}
-.udelta.good{color:#4ade80}
-.udelta.bad{color:#f87171}
-.udelta.flat{color:#8fa6bf}
-.udelta.na{color:#4d5c70;font-weight:400}
+.udelta.good{color:var(--good)}
+.udelta.bad{color:var(--bad)}
+.udelta.flat{color:var(--text2)}
+.udelta.na{color:var(--text3);font-weight:400}
 
 /* ---- st.info / st.warning ---- */
 .ubox{margin:12px 28px;padding:11px 15px;border-radius:9px;font-size:12.5px;line-height:1.6}
-.ubox-info{background:#0c1b2b;border:1px solid #1e3a5f;color:#b9d4ef}
-.ubox-warn{background:#2a1f06;border:1px solid #78350f;color:#fcd9a4}
-.ubox-err{background:#2a0d0d;border:1px solid #7f1d1d;color:#fecaca}
-.ubox b{color:#e6eef7}
+.ubox-info{background:var(--accent-bg);border:1px solid var(--accent-bg);color:var(--accent)}
+.ubox-warn{background:var(--warn-bg);border:1px solid var(--orange-line);color:var(--orange)}
+.ubox-err{background:var(--bad-bg);border:1px solid var(--bad-line);color:var(--bad)}
+.ubox b{color:var(--text)}
 
 /* ---- st.expander ---- */
-.exp{margin:10px 28px;border:1px solid #1e2937;border-radius:9px;background:#0b1016}
-.exp>summary{cursor:pointer;padding:9px 14px;color:#cfe0f0;font-size:13px}
-.exp>summary:hover{color:#5eead4}
+.exp{margin:10px 28px;border:1px solid var(--line);border-radius:9px;background:var(--bg)}
+.exp>summary{cursor:pointer;padding:9px 14px;color:var(--accent);font-size:13px}
+.exp>summary:hover{color:var(--accent)}
 .exp .expb{padding:2px 14px 12px;overflow-x:auto}
 
 /* ---- section headers and the chart grid ---- */
-.usec{margin:26px 28px 2px;font-size:15px;font-weight:650;color:#e6eef7;
+.usec{margin:26px 28px 2px;font-size:15px;font-weight:650;color:var(--text);
   display:flex;gap:10px;align-items:baseline;flex-wrap:wrap}
-.usec .usub{font-size:12px;font-weight:400;color:#6b7f96}
+.usec .usub{font-size:12px;font-weight:400;color:var(--text3)}
 .cgrid{display:grid;gap:12px;margin:10px 28px;
   grid-template-columns:repeat(auto-fill,minmax(440px,1fr))}
 @media (max-width:600px){.cgrid{grid-template-columns:minmax(0,1fr)}}
-.ucard{position:relative;border:1px solid #1e2937;border-radius:10px;background:#0e151d;
+.ucard{position:relative;border:1px solid var(--line);border-radius:10px;background:var(--bg);
   padding:6px 6px 2px}
 .utool{position:absolute;right:10px;bottom:8px;z-index:5}
-.ucsv{background:#0b1016;border:1px solid #22303f;color:#8fa6bf;border-radius:5px;
+.ucsv{background:var(--bg);border:1px solid var(--line2);color:var(--text2);border-radius:5px;
   font-size:10.5px;padding:1px 7px;cursor:pointer}
-.ucsv:hover{color:#5eead4;border-color:#5eead4}
+.ucsv:hover{color:var(--accent);border-color:var(--accent)}
 .uplot{height:250px}
 
 /* ---- a plain data table ---- */
 .utab{border-collapse:collapse;width:100%;font-size:12px}
-.utab th{text-align:left;color:#61748b;font-size:10.5px;text-transform:uppercase;
-  padding:0 12px 6px 0;border-bottom:1px solid #1e2937;font-weight:600}
-.utab td{padding:5px 12px 5px 0;border-bottom:1px solid #121a23;color:#b9ccdf;
+.utab th{text-align:left;color:var(--text3);font-size:10.5px;text-transform:uppercase;
+  padding:0 12px 6px 0;border-bottom:1px solid var(--line);font-weight:600}
+.utab td{padding:5px 12px 5px 0;border-bottom:1px solid var(--line);color:var(--text);
   font-variant-numeric:tabular-nums}
 .utab td.n,.utab th.n{text-align:right}
 .utab td.m{font:11.5px ui-monospace,Menlo,monospace}
@@ -264,9 +267,14 @@ CSS = """
 def sidebar(pages, sections, here, href):
     """The BI dashboard's navigation: favourites first, then one group per
     section, the current page highlighted. `pages` is app.PAGES."""
-    out = ['<nav class="snav" aria-label="pages">',
+    out = [f"<script>{theme.HEAD_JS}</script>",
+           '<nav class="snav" aria-label="pages">',
            f'<a class="sbrand" href="{html.escape(href("/"))}">'
            "sim<span>bench</span></a>",
+           '<button type="button" class="sthemebtn" title="Toggle the theme '
+           'for this browser only"></button>'
+           "<script>bbTheme.label(document.currentScript.previousElementSibling)"
+           "</script>",
            '<div class="sgrp">&#9733; favourites</div><div class="sfav"></div>']
     for sid, label, _ in sections:
         out.append(f'<div class="sgrp">{html.escape(label)}</div>')

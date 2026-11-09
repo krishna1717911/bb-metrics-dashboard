@@ -268,30 +268,30 @@ def cached(relay, our_builders=(), hours=WINDOW_H):
 
 CSS = """
 .wr-tbl{border-collapse:collapse;width:100%;font-size:12px;margin:2px 0 8px}
-.wr-tbl th,.wr-tbl td{padding:4px 8px;border-bottom:1px solid #1b2531;
+.wr-tbl th,.wr-tbl td{padding:4px 8px;border-bottom:1px solid var(--line);
   text-align:right;white-space:nowrap}
-.wr-tbl th{color:#8b9bb0;font-weight:600;text-align:right;
-  border-bottom:1px solid #2a3647}
+.wr-tbl th{color:var(--text2);font-weight:600;text-align:right;
+  border-bottom:1px solid var(--line2)}
 .wr-tbl td.b,.wr-tbl th.b{text-align:left}
-.wr-tbl tr.ours td{background:#101b27}
-.wr-tbl tr.ours td.b{font-weight:600;color:#cfe0f5}
-.wr-tbl td.z{color:#5b6b80}
-.wr-note{color:#8b9bb0;font-size:11px;line-height:1.55;margin:6px 0 0}
-.wr-head{color:#8b9bb0;font-size:11px;margin:0 0 6px}
-.wr-warn{color:#d9a441;font-size:11px;margin:6px 0 0}
-.wr-histbtn{margin:8px 0 4px;background:#0c141b;border:1px solid #2a3647;
-  color:#9fb3c8;border-radius:6px;padding:4px 10px;font-size:11.5px;cursor:pointer}
-.wr-histbtn:hover,.wr-histbtn[aria-expanded=true]{border-color:#14b8a6;color:#5eead4}
+.wr-tbl tr.ours td{background:var(--bg1)}
+.wr-tbl tr.ours td.b{font-weight:600;color:var(--accent)}
+.wr-tbl td.z{color:var(--text3)}
+.wr-note{color:var(--text2);font-size:11px;line-height:1.55;margin:6px 0 0}
+.wr-head{color:var(--text2);font-size:11px;margin:0 0 6px}
+.wr-warn{color:var(--warn);font-size:11px;margin:6px 0 0}
+.wr-histbtn{margin:8px 0 4px;background:var(--bg);border:1px solid var(--line2);
+  color:var(--text);border-radius:6px;padding:4px 10px;font-size:11.5px;cursor:pointer}
+.wr-histbtn:hover,.wr-histbtn[aria-expanded=true]{border-color:var(--accent-main);color:var(--accent)}
 .wr-hist{overflow-x:auto;margin:4px 0 8px}
 .wr-htbl{border-collapse:collapse;font-size:11px}
 .wr-htbl th,.wr-htbl td{padding:3px 5px;text-align:right;white-space:nowrap;
-  border-bottom:1px solid #16202b}
-.wr-htbl th{color:#8b9bb0;font-weight:600;border-bottom:1px solid #2a3647}
-.wr-htbl th.b,.wr-htbl td.b{text-align:left;position:sticky;left:0;background:#0b1016}
-.wr-htbl tr.ours td.b{font-weight:600;color:#cfe0f5}
-.wr-htbl th.now{color:#d9a441}
-.wr-htbl td.z{color:#3e4b5c}
-.wr-htbl td.tot{border-left:1px solid #2a3647;color:#cfe0f5}
+  border-bottom:1px solid var(--line)}
+.wr-htbl th{color:var(--text2);font-weight:600;border-bottom:1px solid var(--line2)}
+.wr-htbl th.b,.wr-htbl td.b{text-align:left;position:sticky;left:0;background:var(--bg)}
+.wr-htbl tr.ours td.b{font-weight:600;color:var(--accent)}
+.wr-htbl th.now{color:var(--warn)}
+.wr-htbl td.z{color:var(--text3)}
+.wr-htbl td.tot{border-left:1px solid var(--line2);color:var(--accent)}
 """
 
 COLS = [("b", "builder"), ("", "offered"), ("", "contested"),

@@ -720,15 +720,15 @@ def fig(title, cur_b, base_b, fn, shift_h, unit="", kind="lines"):
         "connectgaps": False, "line": {"color": col, "width": 2, "dash": dash},
         "marker": {"size": 4}, "hovertemplate": "%{y:,.2f}" + unit + "<extra>" + name + "</extra>"}
     return {"data": [tr(xb, yb, f"baseline ({shift_h:g} h earlier, shifted)",
-                        "dot", "#64748b"),
-                     tr(xc, yc, "this window", "solid", "#2dd4bf")],
-            "layout": {"title": {"text": title, "font": {"size": 13, "color": "#dbe4ee"},
+                        "dot", "var(--text3)"),
+                     tr(xc, yc, "this window", "solid", "var(--c0)")],
+            "layout": {"title": {"text": title, "font": {"size": 13, "color": "var(--text)"},
                                  "x": 0.02},
                        "paper_bgcolor": "rgba(0,0,0,0)", "plot_bgcolor": "rgba(0,0,0,0)",
-                       "font": {"color": "#8fa6bf", "size": 11},
+                       "font": {"color": "var(--text2)", "size": 11},
                        "margin": {"l": 52, "r": 12, "t": 34, "b": 34},
-                       "xaxis": {"gridcolor": "#16212c", "zeroline": False},
-                       "yaxis": {"gridcolor": "#16212c", "zeroline": False,
+                       "xaxis": {"gridcolor": "var(--line)", "zeroline": False},
+                       "yaxis": {"gridcolor": "var(--line)", "zeroline": False,
                                  "ticksuffix": unit, "rangemode": "tozero"},
                        "legend": {"orientation": "h", "y": 1.13, "x": 1, "xanchor": "right",
                                   "font": {"size": 10}},
@@ -865,9 +865,9 @@ def view_builder(p, ch, ixs, panic_src, rq, score, b, live_fn):
                             lambda k: (k["p50"] or 0) / 1e3, sh, " ms"))
             figs[-1]["data"] += [
                 dict(figs[-1]["data"][1], y=_series(bc, lambda k: (k["p99"] or 0) / 1e3)[1],
-                     name="p99 this window", line={"color": "#f59e0b", "width": 1.5}),
+                     name="p99 this window", line={"color": "var(--c6)", "width": 1.5}),
                 dict(figs[-1]["data"][0], y=_series(bbk, lambda k: (k["p99"] or 0) / 1e3)[1],
-                     name="p99 baseline", line={"color": "#7c5a1e", "width": 1.2, "dash": "dot"})]
+                     name="p99 baseline", line={"color": "var(--warn-line)", "width": 1.2, "dash": "dot"})]
             figs.append(fig(f"{name} runs per bucket", bc, bbk, lambda k: k["n"], sh))
         out.append(ui.kpi_row(tiles))
         out.append(ui.chart_grid(figs))
@@ -1283,7 +1283,7 @@ PATH = "/tech/health"
 CSS = """
 .bbform{margin:14px 28px 4px}
 .bbform select{max-width:340px}
-.ks.m{font:11px ui-monospace,Menlo,monospace;color:#8fa6bf;word-break:break-all}
+.ks.m{font:11px ui-monospace,Menlo,monospace;color:var(--text2);word-break:break-all}
 """
 
 

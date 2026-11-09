@@ -102,14 +102,14 @@ def _db_scalars(lo, hi):
 
 BIN = 0.0005          # SOL per histogram bucket
 TRIM_LO, TRIM_HI = 0.01, 0.99
-C_GBX = "#3987e5"
-C_HARM = "#d95926"
-C_FEE = "#199e70"
-C_JITO = "#c98500"
-C_STAKE = "#9085e9"
-C_OTHER = "#d55181"
-C_RATIO = "#c98500"
-C_GAP = "#3987e5"
+C_GBX = "var(--c0)"
+C_HARM = "var(--c6)"
+C_FEE = "var(--c0)"
+C_JITO = "var(--c6)"
+C_STAKE = "var(--c8)"
+C_OTHER = "var(--c2)"
+C_RATIO = "var(--c6)"
+C_GAP = "var(--c0)"
 
 
 def _source_line(G, Hm, n_days):
@@ -293,101 +293,101 @@ def _pool_cu(days, dates, side):
 REWARDS_CSS = """
 .rw-wrap{margin:16px 28px 34px}
 .rw-hero{display:flex;gap:10px;flex-wrap:wrap;margin:0 0 18px}
-.rw-tile{background:#0e151d;border:1px solid #1e2937;border-radius:10px;
+.rw-tile{background:var(--bg);border:1px solid var(--line);border-radius:10px;
   padding:12px 16px;min-width:148px}
-.rw-tile .k{color:#6b7f96;font-size:10px;text-transform:uppercase;
+.rw-tile .k{color:var(--text3);font-size:10px;text-transform:uppercase;
   letter-spacing:.07em}
-.rw-tile .v{color:#dbe4ee;font-size:20px;font-weight:650;margin-top:5px;
+.rw-tile .v{color:var(--text);font-size:20px;font-weight:650;margin-top:5px;
   font-variant-numeric:tabular-nums}
-.rw-tile .d{color:#6b7f96;font-size:11px;margin-top:3px}
-.rw-tile .up{color:#5eead4}
-.rw-tile .dn{color:#fca5a5}
+.rw-tile .d{color:var(--text3);font-size:11px;margin-top:3px}
+.rw-tile .up{color:var(--accent)}
+.rw-tile .dn{color:var(--bad)}
 .rw-grid{display:grid;gap:16px;margin-bottom:16px;
   grid-template-columns:repeat(auto-fit,minmax(440px,1fr))}
 .rw-grid>.rw-box{margin-bottom:0}
-.rw-box{background:#0e151d;border:1px solid #1e2937;border-radius:11px;
+.rw-box{background:var(--bg);border:1px solid var(--line);border-radius:11px;
   padding:13px 15px 9px;overflow-x:auto;margin-bottom:16px}
 .rw-box.wide{grid-column:1/-1}
-.rw-box h2{margin:0 0 6px;font-size:13px;font-weight:650;color:#dbe4ee}
-.rw-box .cs{color:#6b7f96;font-size:10.5px;margin:-3px 0 8px;line-height:1.45}
+.rw-box h2{margin:0 0 6px;font-size:13px;font-weight:650;color:var(--text)}
+.rw-box .cs{color:var(--text3);font-size:10.5px;margin:-3px 0 8px;line-height:1.45}
 details.rw-more{margin:10px 0 0}
-details.rw-more>summary{cursor:pointer;color:#6b7f96;font-size:10.5px;
+details.rw-more>summary{cursor:pointer;color:var(--text3);font-size:10.5px;
   list-style:none;padding:3px 0;user-select:none}
 details.rw-more>summary::-webkit-details-marker{display:none}
-details.rw-more>summary:before{content:"▸ ";color:#5eead4}
+details.rw-more>summary:before{content:"▸ ";color:var(--accent)}
 details.rw-more[open]>summary:before{content:"▾ "}
-details.rw-more>summary:hover{color:#5eead4}
-details.rw-more .body{color:#6b7f96;font-size:11px;line-height:1.6;
-  padding:8px 0 2px;border-top:1px solid #1e2937;margin-top:4px}
-.rw-strip{margin:0 28px 14px;color:#6b7f96;font-size:11px;line-height:1.6}
-.rw-strip b{color:#5eead4;font-weight:600}
+details.rw-more>summary:hover{color:var(--accent)}
+details.rw-more .body{color:var(--text3);font-size:11px;line-height:1.6;
+  padding:8px 0 2px;border-top:1px solid var(--line);margin-top:4px}
+.rw-strip{margin:0 28px 14px;color:var(--text3);font-size:11px;line-height:1.6}
+.rw-strip b{color:var(--accent);font-weight:600}
 .rw-legend{display:flex;gap:16px;flex-wrap:wrap;margin:8px 0 2px;
-  padding-top:11px;border-top:1px solid #1e2937}
-.rw-lg{display:flex;align-items:center;gap:7px;color:#9fb2c8;font-size:11.5px}
+  padding-top:11px;border-top:1px solid var(--line)}
+.rw-lg{display:flex;align-items:center;gap:7px;color:var(--text);font-size:11.5px}
 .rw-sw{width:15px;height:3px;border-radius:2px;flex:none}
 .rw-stats{display:flex;gap:0;flex-wrap:wrap;margin-top:12px;
-  border:1px solid #1e2937;border-radius:9px;overflow:hidden}
+  border:1px solid var(--line);border-radius:9px;overflow:hidden}
 .rw-stats div{flex:1;min-width:170px;padding:12px 15px;
-  border-right:1px solid #1e2937}
+  border-right:1px solid var(--line)}
 .rw-stats div:last-child{border-right:none}
-.rw-stats .sv{color:#dbe4ee;font-size:19px;font-weight:650;
+.rw-stats .sv{color:var(--text);font-size:19px;font-weight:650;
   font-variant-numeric:tabular-nums}
-.rw-stats .sk{color:#8fa6bf;font-size:11px;margin-top:4px}
-.rw-stats .ss{color:#6b7f96;font-size:10px;margin-top:2px}
+.rw-stats .sk{color:var(--text2);font-size:11px;margin-top:4px}
+.rw-stats .ss{color:var(--text3);font-size:10px;margin-top:2px}
 .rw-tbl{width:100%;border-collapse:collapse;margin-top:8px;font-size:12px}
-.rw-tbl th{text-align:right;color:#6b7f96;font-size:10px;font-weight:600;
+.rw-tbl th{text-align:right;color:var(--text3);font-size:10px;font-weight:600;
   text-transform:uppercase;letter-spacing:.06em;padding:7px 9px;
-  border-bottom:1px solid #22303f;white-space:nowrap}
+  border-bottom:1px solid var(--line2);white-space:nowrap}
 .rw-tbl th:first-child{text-align:left}
-.rw-tbl td{text-align:right;padding:6px 9px;border-bottom:1px solid #141c26;
-  font-variant-numeric:tabular-nums;color:#c3d3e6}
-.rw-tbl td:first-child{text-align:left;color:#dbe4ee}
-.rw-tbl tr.win td{background:#0f766e18}
+.rw-tbl td{text-align:right;padding:6px 9px;border-bottom:1px solid var(--line);
+  font-variant-numeric:tabular-nums;color:var(--text)}
+.rw-tbl td:first-child{text-align:left;color:var(--text)}
+.rw-tbl tr.win td{background:var(--accent-bg)}
 .rw-tbl tr.out td{opacity:.42}
 .rw-key{display:grid;grid-template-columns:repeat(auto-fit,minmax(275px,1fr));
-  gap:4px 18px;margin-top:10px;padding-top:10px;border-top:1px solid #1e2937}
-.rw-key div{color:#6b7f96;font-size:11px;line-height:1.55}
-.rw-key b{color:#9fb2c8;font-weight:600}
-.rw-warn{background:#2a2112;border:1px solid #5a4418;color:#e0c07a;
+  gap:4px 18px;margin-top:10px;padding-top:10px;border-top:1px solid var(--line)}
+.rw-key div{color:var(--text3);font-size:11px;line-height:1.55}
+.rw-key b{color:var(--text);font-weight:600}
+.rw-warn{background:var(--orange-bg);border:1px solid var(--warn-line);color:var(--warn);
   border-radius:6px;padding:7px 10px;font-size:11.5px;line-height:1.5;margin:4px 0 6px}
-.rw-note{color:#6b7f96;font-size:11px;margin-top:9px;line-height:1.65}
+.rw-note{color:var(--text3);font-size:11px;margin-top:9px;line-height:1.65}
 .rw-ctl{display:flex;gap:16px;flex-wrap:wrap;align-items:center;margin:-2px 0 8px}
 .rw-ctl .g{display:flex;gap:4px;align-items:center}
-.rw-ctl .lb{color:#6b7f96;font-size:10px;text-transform:uppercase;
+.rw-ctl .lb{color:var(--text3);font-size:10px;text-transform:uppercase;
   letter-spacing:.06em;margin-right:2px}
-.rw-ctl a{color:#8fa6bf;font-size:10.5px;text-decoration:none;padding:3px 9px;
-  border:1px solid #22303f;border-radius:5px}
-.rw-ctl a:hover{border-color:#5eead4;color:#5eead4}
-.rw-ctl a.on{background:#12314d;border-color:#3987e5;color:#7cc0ff;font-weight:650}
-.rw-zoom{display:flex;gap:6px;align-items:center;color:#4d5c70;font-size:10px;
+.rw-ctl a{color:var(--text2);font-size:10.5px;text-decoration:none;padding:3px 9px;
+  border:1px solid var(--line2);border-radius:5px}
+.rw-ctl a:hover{border-color:var(--accent);color:var(--accent)}
+.rw-ctl a.on{background:var(--accent-bg);border-color:var(--accent-main);color:var(--accent);font-weight:650}
+.rw-zoom{display:flex;gap:6px;align-items:center;color:var(--text3);font-size:10px;
   margin:4px 0 0}
-.rw-zoom b{color:#6b7f96;font-weight:600}
-.rw-zoom button{background:#0e151d;border:1px solid #22303f;border-radius:5px;
-  color:#8fa6bf;font:10px ui-monospace,Menlo,monospace;padding:2px 8px;cursor:pointer}
-.rw-zoom button:hover{border-color:#5eead4;color:#5eead4}
-.rw-ok{color:#5eead4}
+.rw-zoom b{color:var(--text3);font-weight:600}
+.rw-zoom button{background:var(--bg);border:1px solid var(--line2);border-radius:5px;
+  color:var(--text2);font:10px ui-monospace,Menlo,monospace;padding:2px 8px;cursor:pointer}
+.rw-zoom button:hover{border-color:var(--accent);color:var(--accent)}
+.rw-ok{color:var(--accent)}
 form.rw-range{display:flex;gap:9px;align-items:flex-end;flex-wrap:wrap;
   margin:0 0 14px}
 form.rw-range label{display:flex;flex-direction:column;gap:4px;
-  color:#6b7f96;font-size:10px;text-transform:uppercase;letter-spacing:.06em}
-form.rw-range select,form.rw-range button{background:#0e151d;
-  border:1px solid #22303f;border-radius:6px;color:#cfe0f0;padding:5px 10px;
+  color:var(--text3);font-size:10px;text-transform:uppercase;letter-spacing:.06em}
+form.rw-range select,form.rw-range button{background:var(--bg);
+  border:1px solid var(--line2);border-radius:6px;color:var(--accent);padding:5px 10px;
   font:12px ui-monospace,Menlo,monospace}
-form.rw-range button{color:#5eead4;border-color:#14b8a655;cursor:pointer}
-form.rw-range button:hover{background:#0f766e22;border-color:#5eead4}
+form.rw-range button{color:var(--accent);border-color:var(--accent-bg);cursor:pointer}
+form.rw-range button:hover{background:var(--accent-bg);border-color:var(--accent)}
 form.rw-range .q{display:flex;gap:5px;align-items:center;margin-left:6px}
-form.rw-range .q a{color:#8fa6bf;font-size:10.5px;text-decoration:none;
-  padding:4px 8px;border:1px solid #22303f;border-radius:5px}
-form.rw-range .q a:hover{border-color:#5eead4;color:#5eead4}
-#rw-tip{position:fixed;display:none;z-index:80;background:#0d151d;
-  border:1px solid #2f4256;border-radius:8px;padding:9px 11px;
-  box-shadow:0 10px 30px #000a;font-size:11.5px;color:#c3d3e6;
+form.rw-range .q a{color:var(--text2);font-size:10.5px;text-decoration:none;
+  padding:4px 8px;border:1px solid var(--line2);border-radius:5px}
+form.rw-range .q a:hover{border-color:var(--accent);color:var(--accent)}
+#rw-tip{position:fixed;display:none;z-index:80;background:var(--bg);
+  border:1px solid var(--line2);border-radius:8px;padding:9px 11px;
+  box-shadow:0 10px 30px var(--shadow);font-size:11.5px;color:var(--text);
   pointer-events:none;min-width:210px}
-#rw-tip .tx{color:#dbe4ee;font-weight:650;margin-bottom:6px;
+#rw-tip .tx{color:var(--text);font-weight:650;margin-bottom:6px;
   font-variant-numeric:tabular-nums}
 #rw-tip .tr{display:flex;align-items:center;gap:7px;margin-top:3px;
   font-variant-numeric:tabular-nums}
-#rw-tip .tr span:last-child{margin-left:auto;color:#dbe4ee}
+#rw-tip .tr span:last-child{margin-left:auto;color:var(--text)}
 """
 
 CU_LABELS = ["0-10k", "10-50k", "50-100k", "100-150k", "150-200k",
@@ -426,16 +426,16 @@ def _viridis(f):
 PLOTLY_CDN = "https://cdn.plot.ly/plotly-3.0.1.min.js"
 
 # dark ground matching the dashboard's panels
-AXIS = dict(gridcolor="#1a2431", zerolinecolor="#243242", linecolor="#243242",
-            tickfont=dict(color="#6b7f96", size=11),
-            titlefont=dict(color="#8fa6bf", size=12))
+AXIS = dict(gridcolor="var(--line)", zerolinecolor="var(--line2)", linecolor="var(--line2)",
+            tickfont=dict(color="var(--text3)", size=11),
+            titlefont=dict(color="var(--text2)", size=12))
 LAYOUT = dict(
-    paper_bgcolor="#0e151d", plot_bgcolor="#0b131c",
-    font=dict(color="#c3d3e6", family="ui-sans-serif,-apple-system,Segoe UI,sans-serif"),
+    paper_bgcolor="var(--bg)", plot_bgcolor="var(--bg)",
+    font=dict(color="var(--text)", family="ui-sans-serif,-apple-system,Segoe UI,sans-serif"),
     margin=dict(l=64, r=24, t=16, b=52),
-    hoverlabel=dict(bgcolor="#0d151d", bordercolor="#2f4256",
-                    font=dict(color="#c3d3e6", size=12)),
-    legend=dict(orientation="h", y=-0.18, x=0, font=dict(color="#9fb2c8", size=11),
+    hoverlabel=dict(bgcolor="var(--bg)", bordercolor="var(--line2)",
+                    font=dict(color="var(--text)", size=12)),
+    legend=dict(orientation="h", y=-0.18, x=0, font=dict(color="var(--text)", size=11),
                 bgcolor="rgba(0,0,0,0)"),
     dragmode="zoom",
 )
@@ -461,7 +461,7 @@ def _fig_ecdf(G, Hm, xmax):
         traces.append(dict(
             type="scatter", mode="markers", showlegend=False,
             x=[_pct(P["hist"], P["slots"], q) for q in qs], y=[q * 100 for q in qs],
-            marker=dict(color=colour, size=10, line=dict(color="#0e151d", width=2)),
+            marker=dict(color=colour, size=10, line=dict(color="var(--bg)", width=2)),
             zorder=3 if colour == C_GBX else 2,
             text=[f"{nm} p{int(q*100)}" for q in qs],
             hovertemplate="%{text}: %{x:.6f} SOL<extra></extra>"))
@@ -482,7 +482,7 @@ def _fig_ratio(qg, qh):
              line=dict(color=C_RATIO, width=2.4),
              hovertemplate="%{y:.6f}×<extra></extra>"),
         dict(type="scatter", mode="lines", name="parity", x=[1, 99], y=[1, 1],
-             line=dict(color="#8fa6bf", width=1.4, dash="solid"), hoverinfo="skip"),
+             line=dict(color="var(--text2)", width=1.4, dash="solid"), hoverinfo="skip"),
     ]
     lay = dict(LAYOUT, height=330,
                xaxis=dict(AXIS, title="percentile", tickprefix="p",
@@ -503,10 +503,10 @@ def _fig_gap(qg, qh):
     ps = list(range(1, 100))
     traces = [
         dict(type="scatter", mode="lines", name="even split", x=[1, 99], y=[0, 100],
-             line=dict(color="#6b7f96", width=1.2, dash="dash"), hoverinfo="skip"),
+             line=dict(color="var(--text3)", width=1.2, dash="dash"), hoverinfo="skip"),
         dict(type="scatter", mode="lines", name="cumulative share", x=ps, y=cum,
              line=dict(color=C_GAP, width=2.4), fill="tozeroy",
-             fillcolor="rgba(57,135,229,0.10)",
+             fillcolor="var(--accent-bg)",
              hovertemplate="p1–p%{x} hold %{y:.2f}% of the gap<extra></extra>"),
     ]
     lay = dict(LAYOUT, height=330,
@@ -538,7 +538,7 @@ def _fig_cu3d(days, dates, side, render, hscale, inspect):
                        marker=dict(size=3.4, color=fc, colorscale="Viridis",
                                    cmin=0, cmax=zmax, opacity=0.88,
                                    colorbar=dict(title="%", thickness=12, len=0.7,
-                                                 tickfont=dict(color="#6b7f96", size=10))),
+                                                 tickfont=dict(color="var(--text3)", size=10))),
                        hovertemplate=hover)]
     elif render == "ribbons":
         traces = []
@@ -555,7 +555,7 @@ def _fig_cu3d(days, dates, side, render, hscale, inspect):
                        customdata=cd, colorscale="Viridis", cmin=0, cmax=zmax,
                        opacity=0.95, hovertemplate=hover,
                        colorbar=dict(title="%", thickness=12, len=0.7,
-                                     tickfont=dict(color="#6b7f96", size=10)),
+                                     tickfont=dict(color="var(--text3)", size=10)),
                        contours=dict(z=dict(show=True, usecolormap=True,
                                             project=dict(z=True))))]
     # the inspected slice, drawn over the scene
@@ -563,12 +563,12 @@ def _fig_cu3d(days, dates, side, render, hscale, inspect):
     traces.append(dict(type="scatter3d", mode="lines+markers",
                        name=f"p{ip+1}", x=xs, y=[ip + 1] * 10,
                        z=[z[ip][b] for b in range(10)], customdata=grid[ip],
-                       line=dict(color="#ffffff", width=6),
-                       marker=dict(color="#ffffff", size=4),
+                       line=dict(color="var(--text)", width=6),
+                       marker=dict(color="var(--text)", size=4),
                        hovertemplate=hover))
-    ax3 = dict(backgroundcolor="#0b131c", gridcolor="#1a2431", zerolinecolor="#243242",
-               showbackground=True, tickfont=dict(color="#6b7f96", size=10),
-               titlefont=dict(color="#8fa6bf", size=11))
+    ax3 = dict(backgroundcolor="var(--bg)", gridcolor="var(--line)", zerolinecolor="var(--line2)",
+               showbackground=True, tickfont=dict(color="var(--text3)", size=10),
+               titlefont=dict(color="var(--text2)", size=11))
     lay = dict(LAYOUT, height=620, margin=dict(l=8, r=8, t=8, b=8),
                scene=dict(
                    xaxis=dict(ax3, title="compute units"),
@@ -589,16 +589,16 @@ def _fig_sankey(P, title, colour):
     tgt = [3, 3, 4, 3, 5, 6]
     val = [F["fee"], F["jn"], F["jito_cut"], F["oth"], F["fee"] + F["keep"] + F["oth"],
            F["stake"]]
-    link_c = ["rgba(25,158,112,0.38)", "rgba(201,133,0,0.38)", "rgba(201,133,0,0.6)",
-              "rgba(213,81,129,0.38)", "rgba(57,135,229,0.30)", "rgba(144,133,233,0.5)"]
+    link_c = ["var(--c4-a)", "var(--c6-a)", "var(--c6-b)",
+              "var(--c2-a)", "var(--c0-a)", "var(--c8-a)"]
     node_c = [C_FEE, C_JITO, C_OTHER, colour, C_JITO, colour, C_STAKE]
     tr = dict(type="sankey", orientation="h", valueformat=".6f", valuesuffix=" SOL",
               node=dict(pad=16, thickness=14, label=lbl, color=node_c,
-                        line=dict(color="#0e151d", width=1)),
+                        line=dict(color="var(--bg)", width=1)),
               link=dict(source=src, target=tgt, value=val, color=link_c))
     lay = dict(LAYOUT, height=300, margin=dict(l=10, r=10, t=28, b=10),
                title=dict(text=f"{title} — SOL per slot, n={P['slots']:,}",
-                          font=dict(color="#8fa6bf", size=12), x=0.01),
+                          font=dict(color="var(--text2)", size=12), x=0.01),
                showlegend=False)
     return dict(data=[tr], layout=lay, config=CONFIG)
 
@@ -899,7 +899,7 @@ var FIGS = {figs_json};
     if (!window.Plotly) {{ return setTimeout(draw, 60); }}
     Object.keys(FIGS).forEach(function(k){{
       var el = document.getElementById('fig-' + k);
-      if (el) Plotly.newPlot(el, FIGS[k].data, FIGS[k].layout, FIGS[k].config);
+      if (el) bbTheme.plot(el, FIGS[k].data, FIGS[k].layout, FIGS[k].config);
     }});
   }}
   draw();

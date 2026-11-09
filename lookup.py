@@ -2140,56 +2140,56 @@ LK_BM = (
 
 
 CSS = """
-.lksec{margin:10px 28px;border:1px solid #1e2937;border-radius:8px;
-  padding:8px 12px;background:#0b1016}
-.lksec>summary{cursor:pointer;color:#dbe4ee;font-size:13px}
+.lksec{margin:10px 28px;border:1px solid var(--line);border-radius:8px;
+  padding:8px 12px;background:var(--bg)}
+.lksec>summary{cursor:pointer;color:var(--text);font-size:13px}
 .lksec>summary .dim{font-size:11.5px;margin-left:6px}
 .lkwrap{overflow-x:auto;margin-top:8px}
 .lktab{font-size:11.5px}
 .lktab td{white-space:nowrap}
-.lkjs{font:10.5px ui-monospace,Menlo,monospace;color:#8fa6bf}
+.lkjs{font:10.5px ui-monospace,Menlo,monospace;color:var(--text2)}
 .lknone{padding:8px 0;font-size:12px}
 .lkerr{margin:8px 0}
 .lknote{padding:4px 28px;font-size:12px}
-.vname{font:12px system-ui,sans-serif;color:#cbd5e1}
-.lkhead{margin:18px 28px 4px;font-size:14px;font-weight:600;color:#dbe4ee}
+.vname{font:12px system-ui,sans-serif;color:var(--text)}
+.lkhead{margin:18px 28px 4px;font-size:14px;font-weight:600;color:var(--text)}
 .lksum{margin:4px 28px 8px;padding-left:18px;font-size:12.5px;line-height:1.7;
-  color:#cbd5e1}
+  color:var(--text)}
 .lktab td{vertical-align:top}
 .lkinl{display:inline}
 .lkinl>summary{display:inline;cursor:pointer;text-decoration:underline dotted}
 .lkinl[open]>summary{display:inline}
-.lkbox{margin:4px 0 6px 14px;padding:6px 10px;border-left:2px solid #2a3a4d;
+.lkbox{margin:4px 0 6px 14px;padding:6px 10px;border-left:2px solid var(--line2);
   font-size:12px}
 .lkbox ol{margin:4px 0 0;padding-left:18px}
 .lkinl .lkinl{display:block}
 .lkmem{margin:2px 0 8px}
 .lkmem[open]>.lkwrap{margin-top:4px}
 .lkmem .lktab td{white-space:normal}
-.lkwrap .dt-container{color:#b9ccdf;font-size:11.5px}
+.lkwrap .dt-container{color:var(--text);font-size:11.5px}
 .lkwrap .dt-layout-row{margin:4px 0}
-.lkwrap .dt-search input,.lkdt input,.lkdt select{background:#0b1016;
-  border:1px solid #2a3a4d;border-radius:4px;color:#dbe4ee;padding:2px 6px;
+.lkwrap .dt-search input,.lkdt input,.lkdt select{background:var(--bg);
+  border:1px solid var(--line2);border-radius:4px;color:var(--text);padding:2px 6px;
   font:11px ui-monospace,Menlo,monospace}
 .lkwrap .dt-search input{width:30em;margin-left:0}
-.lkdt label{margin-right:14px;color:#8fa6bf;font-size:11.5px}
+.lkdt label{margin-right:14px;color:var(--text2);font-size:11.5px}
 .lkdt select,.lkdt input{margin-left:5px}
-.lkwrap .dt-info{color:#6b7f96;font-size:11px}
+.lkwrap .dt-info{color:var(--text3);font-size:11px}
 table.dataTable.lktab>thead>tr>th{padding-top:0;padding-left:0;
-  padding-bottom:5px;border-bottom:1px solid #1e2937}
+  padding-bottom:5px;border-bottom:1px solid var(--line)}
 table.dataTable.lktab>tbody>tr>td{padding:4px 10px 4px 0}
 table.dataTable.lktab th.dt-type-numeric,table.dataTable.lktab td.dt-type-numeric,
 table.dataTable.lktab th.dt-type-date,table.dataTable.lktab td.dt-type-date{text-align:left}
 table.dataTable.lktab>tbody>tr{background:transparent}
-.lkglobal{margin:6px 28px 0;font-size:12px;color:#8fa6bf}
-.lkglobal select{margin-left:5px;background:#0b1016;border:1px solid #2a3a4d;
-  border-radius:4px;color:#dbe4ee;padding:2px 6px;font:12px system-ui,sans-serif}
-.tippy-box[data-theme~=lk]{background:#0f1720;border:1px solid #2a3a4d;
-  border-radius:6px;color:#dbe4ee}
-.tippy-box[data-theme~=lk]>.tippy-arrow{color:#2a3a4d}
+.lkglobal{margin:6px 28px 0;font-size:12px;color:var(--text2)}
+.lkglobal select{margin-left:5px;background:var(--bg);border:1px solid var(--line2);
+  border-radius:4px;color:var(--text);padding:2px 6px;font:12px system-ui,sans-serif}
+.tippy-box[data-theme~=lk]{background:var(--bg);border:1px solid var(--line2);
+  border-radius:6px;color:var(--text)}
+.tippy-box[data-theme~=lk]>.tippy-arrow{color:var(--text3)}
 .lkbm{font:11px ui-monospace,Menlo,monospace;padding:2px 2px}
 .lkbm>div{padding:2px 0}
 .lkbm>div:nth-child(-n+2){font:12px system-ui,sans-serif}
 .lkbm>div:nth-child(2){padding-bottom:5px;margin-bottom:3px;
-  border-bottom:1px solid #1e2937}
+  border-bottom:1px solid var(--line)}
 """

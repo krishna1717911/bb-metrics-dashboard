@@ -840,148 +840,148 @@ CSS = """
 .vcwrap{padding:18px 28px 50px;max-width:1180px}
 .vcform{display:flex;gap:24px;flex-wrap:wrap;align-items:flex-start}
 .vcf{display:flex;flex-direction:column;gap:6px}
-.vcf>label{color:#6b7f96;font-size:11px;text-transform:uppercase;
+.vcf>label{color:var(--text3);font-size:11px;text-transform:uppercase;
   letter-spacing:.04em}
-.vcf select,.vcf input{background:#0e151d;border:1px solid #22303f;
-  border-radius:6px;color:#cfe0f0;padding:6px 11px;
+.vcf select,.vcf input{background:var(--bg);border:1px solid var(--line2);
+  border-radius:6px;color:var(--accent);padding:6px 11px;
   font:12px ui-monospace,Menlo,monospace}
-.vcf select:focus,.vcf input:focus{outline:none;border-color:#5eead4}
+.vcf select:focus,.vcf input:focus{outline:none;border-color:var(--accent)}
 .vcf select{min-width:340px}
 .vcclients{display:flex;flex-wrap:wrap;gap:7px;max-width:420px}
-.vcc{display:flex;align-items:center;gap:5px;border:1px solid #22303f;
-  border-radius:6px;padding:4px 9px;font-size:11.5px;color:#8fa6bf;
+.vcc{display:flex;align-items:center;gap:5px;border:1px solid var(--line2);
+  border-radius:6px;padding:4px 9px;font-size:11.5px;color:var(--text2);
   cursor:pointer}
-.vcc:hover{border-color:#2f4459}
-.vcc input{accent-color:#14b8a6;margin:0}
-.vcc.on{border-color:#14b8a655;color:#cfe0f0;background:#0f766e18}
-.vcu{color:#6b7f96;font-weight:400}
+.vcc:hover{border-color:var(--line2)}
+.vcc input{accent-color:var(--primary);margin:0}
+.vcc.on{border-color:var(--accent-bg);color:var(--accent);background:var(--accent-bg)}
+.vcu{color:var(--text3);font-weight:400}
 /* Two range inputs stacked on one track. Each input is transparent and
    pointer-transparent except for its own thumb, so both handles stay
    grabbable even where they overlap -- a single input cannot express a
    range, and two side by side cannot share a track. */
 .rng{position:relative;width:272px;height:46px;margin-top:2px}
 .rng-mid{position:absolute;top:0;left:0;right:0;text-align:center;
-  color:#cfe0f0;font-size:12px;font-weight:600}
+  color:var(--accent);font-size:12px;font-weight:600}
 .rng-track{position:absolute;top:26px;left:9px;right:9px;height:4px;
-  border-radius:2px;background:#2f4459}
+  border-radius:2px;background:var(--bg3)}
 /* The 0 mark is a position on the track, not a number to work out. */
 .rng-zero{position:absolute;left:50%;top:-4px;width:1px;height:12px;
-  background:#4d5c70}
+  background:var(--line3)}
 .rng-fill{position:absolute;top:0;height:100%;border-radius:2px;
-  background:#5eead4}
+  background:var(--accent-main)}
 .rng input[type=range]{position:absolute;top:18px;left:0;width:100%;
   margin:0;height:20px;background:none;-webkit-appearance:none;
   appearance:none;pointer-events:none}
 .rng input[type=range]:focus{outline:none}
 .rng input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;
   pointer-events:auto;width:18px;height:18px;border-radius:50%;
-  background:#5eead4;border:2px solid #0b1016;cursor:grab}
+  background:var(--accent-main);border:2px solid var(--line);cursor:grab}
 .rng input[type=range]::-moz-range-thumb{pointer-events:auto;width:18px;
-  height:18px;border-radius:50%;background:#5eead4;border:2px solid #0b1016;
+  height:18px;border-radius:50%;background:var(--accent-main);border:2px solid var(--line);
   cursor:grab}
 .rng input[type=range]::-webkit-slider-runnable-track{background:none}
 .rng input[type=range]::-moz-range-track{background:none}
 .rng-ends{position:absolute;top:34px;left:0;right:0;display:flex;
-  justify-content:space-between;color:#6b7f96;
+  justify-content:space-between;color:var(--text3);
   font:11px ui-monospace,Menlo,monospace}
-.rng-ends span:nth-child(2){color:#4d5c70}
-.vcgo{background:#0f766e;border:1px solid #14b8a6;color:#eafffb;
+.rng-ends span:nth-child(2){color:var(--text3)}
+.vcgo{background:var(--primary);border:1px solid var(--primary);color:#fff;
   border-radius:6px;padding:7px 18px;font-size:12.5px;cursor:pointer}
-.vcgo:hover{background:#14b8a6}
+.vcgo:hover{filter:brightness(.92)}
 .vcgo:disabled{opacity:.5;cursor:default}
-.vcstat{margin-top:20px;color:#8fa6bf;font-size:12.5px}
-.vcstat.err{color:#fca5a5}
+.vcstat{margin-top:20px;color:var(--text2);font-size:12.5px}
+.vcstat.err{color:var(--bad)}
 /* Three series, validated against this surface: OKLCH lightness inside the
    dark band, chroma above the grey floor, adjacent CVD separation clear.
    The obvious brighter picks all failed the band check. */
 .vcchart{margin-top:22px}
 .vcchart svg{width:100%;height:280px;display:block;overflow:visible}
-.vcax{stroke:#1e2937;stroke-width:1}
-.vcgl{stroke:#16202b;stroke-width:1}
-.vctick{fill:#6b7f96;font:10.5px ui-monospace,Menlo,monospace}
+.vcax{stroke:var(--line);stroke-width:1}
+.vcgl{stroke:var(--line);stroke-width:1}
+.vctick{fill:var(--text3);font:10.5px ui-monospace,Menlo,monospace}
 /* The series class carries the STROKE only. It used to set fill too, which
    beat .vcln{fill:none} on specificity and rendered every line as a filled
    wedge between its own points. Dots get their fill from a two-class rule
    so they stay solid without reaching the paths. */
 .vcln{fill:none;stroke-width:1.25;stroke-linejoin:round;stroke-linecap:round}
-.vcdot{stroke:#0b1016;stroke-width:1.25}
-.s0{stroke:#2563eb}
-.s1{stroke:#ea580c}
-circle.vcdot.s0{fill:#2563eb}
-circle.vcdot.s1{fill:#ea580c}
+.vcdot{stroke:var(--line);stroke-width:1.25}
+.s0{stroke:var(--accent-main)}
+.s1{stroke:var(--orange-main)}
+circle.vcdot.s0{fill:var(--accent-main)}
+circle.vcdot.s1{fill:var(--orange-main)}
 .vcleg{display:flex;gap:20px;flex-wrap:wrap;margin-top:12px;font-size:12px;
-  color:#8fa6bf}
+  color:var(--text2)}
 .vcleg i{display:inline-block;width:11px;height:11px;border-radius:3px;
   margin-right:6px;vertical-align:-1px}
 .vctab2{margin-top:20px;width:100%;border-collapse:collapse;font-size:12px}
-.vctab2 th{text-align:right;color:#6b7f96;font-size:10.5px;font-weight:600;
+.vctab2 th{text-align:right;color:var(--text3);font-size:10.5px;font-weight:600;
   text-transform:uppercase;letter-spacing:.04em;padding:0 12px 7px 0;
-  border-bottom:1px solid #1e2937}
+  border-bottom:1px solid var(--line)}
 .vctab2 th:first-child{text-align:left}
-.vctab2 td{padding:7px 12px 7px 0;border-bottom:1px solid #16202b;
-  color:#cfe0f0;text-align:right;font:11.5px ui-monospace,Menlo,monospace}
+.vctab2 td{padding:7px 12px 7px 0;border-bottom:1px solid var(--line);
+  color:var(--accent);text-align:right;font:11.5px ui-monospace,Menlo,monospace}
 .vctab2 td:first-child{text-align:left}
-.vcsrc2{margin-top:18px;color:#4d5c70;font-size:11px;line-height:1.6}
+.vcsrc2{margin-top:18px;color:var(--text3);font-size:11px;line-height:1.6}
 .vcrow{cursor:pointer}
-.vcrow:hover td,.vcrow:focus td{background:#101a23;outline:none}
-.vcrow.on td{background:#0f766e18;color:#eafffb}
-.vcdet td{padding:0 0 14px;border-bottom:1px solid #16202b}
-.vcload{color:#6b7f96;font-size:12px;padding:12px 2px}
-.vcload.err{color:#fca5a5}
-.vcdh{color:#8fa6bf;font-size:12.5px;padding:12px 2px 9px}
-.vcdh b{color:#cfe0f0}
+.vcrow:hover td,.vcrow:focus td{background:var(--bg);outline:none}
+.vcrow.on td{background:var(--accent-bg);color:var(--accent)}
+.vcdet td{padding:0 0 14px;border-bottom:1px solid var(--line)}
+.vcload{color:var(--text3);font-size:12px;padding:12px 2px}
+.vcload.err{color:var(--bad)}
+.vcdh{color:var(--text2);font-size:12.5px;padding:12px 2px 9px}
+.vcdh b{color:var(--accent)}
 .vcfee{width:100%;border-collapse:collapse;font-size:12px}
-.vcfee th{text-align:left;color:#6b7f96;font-size:10px;font-weight:600;
+.vcfee th{text-align:left;color:var(--text3);font-size:10px;font-weight:600;
   text-transform:uppercase;letter-spacing:.04em;padding:0 12px 6px 0;
-  border-bottom:1px solid #1e2937}
+  border-bottom:1px solid var(--line)}
 .vcfee th.n,.vcfee td.n{text-align:right}
-.vcfee td{padding:6px 12px 6px 0;border-bottom:1px solid #16202b;
-  color:#cfe0f0}
+.vcfee td{padding:6px 12px 6px 0;border-bottom:1px solid var(--line);
+  color:var(--accent)}
 .vcfee td.m{font:11.5px ui-monospace,Menlo,monospace}
-.vcfail{color:#fca5a5;font-size:10px}
+.vcfail{color:var(--bad);font-size:10px}
 .snapbar{margin-top:22px;display:flex;gap:14px;align-items:center;
   flex-wrap:wrap}
-.snapbar span{color:#8fa6bf;font-size:12.5px}
+.snapbar span{color:var(--text2);font-size:12.5px}
 .snapgrid{display:grid;gap:12px;padding-top:6px;
   grid-template-columns:repeat(auto-fill,minmax(310px,1fr))}
-.snapcard{display:block;padding:15px 17px;border:1px solid #22303f;
-  border-radius:10px;background:#0e151d;text-decoration:none;color:inherit;
+.snapcard{display:block;padding:15px 17px;border:1px solid var(--line2);
+  border-radius:10px;background:var(--bg);text-decoration:none;color:inherit;
   transition:.12s}
-.snapcard:hover{border-color:#5eead4;background:#101a23}
-.snapv{color:#5eead4;font-size:13.5px;font-weight:600}
-.snapv span{color:#4d5c70;font-weight:400;margin:0 4px}
-.snapr{margin-top:6px;color:#cfe0f0;
+.snapcard:hover{border-color:var(--accent);background:var(--bg)}
+.snapv{color:var(--accent);font-size:13.5px;font-weight:600}
+.snapv span{color:var(--text3);font-weight:400;margin:0 4px}
+.snapr{margin-top:6px;color:var(--accent);
   font:12px ui-monospace,Menlo,monospace}
-.snapm{margin-top:5px;color:#6b7f96;font-size:11.5px}
-.snapnone{color:#8fa6bf;font-size:13px;padding:24px 0;max-width:62ch;
+.snapm{margin-top:5px;color:var(--text3);font-size:11.5px}
+.snapnone{color:var(--text2);font-size:13px;padding:24px 0;max-width:62ch;
   line-height:1.6}
-.snaphead{padding:4px 0 18px;border-bottom:1px solid #1e2937;margin-bottom:6px}
-.snaphead h2{margin:10px 0 4px;font-size:15px;color:#cfe0f0}
-.snaphead span{color:#6b7f96;font-size:12px}
-.vclink{color:#5eead4;text-decoration:none;border-bottom:1px solid #14b8a644}
-.vclink:hover,.vclink:focus{border-bottom-color:#5eead4;outline:none}
+.snaphead{padding:4px 0 18px;border-bottom:1px solid var(--line);margin-bottom:6px}
+.snaphead h2{margin:10px 0 4px;font-size:15px;color:var(--accent)}
+.snaphead span{color:var(--text3);font-size:12px}
+.vclink{color:var(--accent);text-decoration:none;border-bottom:1px solid var(--accent-bg)}
+.vclink:hover,.vclink:focus{border-bottom-color:var(--accent);outline:none}
 /* The copy control sits beside a link here, so unlike the bare .cpv value
    it needs its own label -- there is no value text to recolour. */
-.cpsm{margin-left:7px;padding:0 5px;border:1px solid #2b3a4b;border-radius:4px;
-  font-size:9.5px;color:#6b7f96;cursor:pointer;text-transform:uppercase;
+.cpsm{margin-left:7px;padding:0 5px;border:1px solid var(--line2);border-radius:4px;
+  font-size:9.5px;color:var(--text3);cursor:pointer;text-transform:uppercase;
   letter-spacing:.03em}
-.cpsm:hover,.cpsm:focus{color:#5eead4;border-color:#14b8a655;outline:none}
+.cpsm:hover,.cpsm:focus{color:var(--accent);border-color:var(--accent-bg);outline:none}
 /* The egress-by-key bars: one series, so one hue (the page accent), the
    fold-up "N more" bar in the muted grey, and hover brightens. */
 /* Wider than the page column on purpose -- the table it sits in grows
    with it. Readability of the data beats the layout here. */
 .vcegc{width:70vw;min-width:100%}
 .vcegc svg{height:auto;aspect-ratio:760/260}
-.vcegctl{color:#8fa6bf;font-size:12px;padding:0 2px 10px}
-.vcegn{width:64px;background:#0e151d;border:1px solid #22303f;border-radius:6px;
-  color:#cfe0f0;padding:3px 8px;font:12px ui-monospace,Menlo,monospace;margin:0 6px}
-.vcegn:focus{outline:none;border-color:#5eead4}
+.vcegctl{color:var(--text2);font-size:12px;padding:0 2px 10px}
+.vcegn{width:64px;background:var(--bg);border:1px solid var(--line2);border-radius:6px;
+  color:var(--accent);padding:3px 8px;font:12px ui-monospace,Menlo,monospace;margin:0 6px}
+.vcegn:focus{outline:none;border-color:var(--accent)}
 button.cpsm{background:none;font-family:inherit;line-height:1.5}
-.vcbar{fill:#14b8a6}
-.vcbar.oth{fill:#4d5c70}
-.vcbar:hover{fill:#5eead4}
-.vcval{fill:#cfe0f0;font:10px ui-monospace,Menlo,monospace}
-.vcpart{color:#fbbf24}
+.vcbar{fill:var(--accent-main)}
+.vcbar.oth{fill:var(--line3)}
+.vcbar:hover{fill:var(--accent-main)}
+.vcval{fill:var(--accent-main);font:10px ui-monospace,Menlo,monospace}
+.vcpart{color:var(--warn)}
 .vcfeebox{margin-top:22px}
 .vcup{margin-top:16px}
 """
@@ -1165,7 +1165,7 @@ JS = r'''
       });
     });
     var leg = S.map(function(s){
-      var c = s.cls === 's0' ? '#2563eb' : '#ea580c';
+      var c = s.cls === 's0' ? 'var(--c0)' : 'var(--c6)';
       return '<span><i style="background:' + c + '"></i>' + s.label + '</span>'; }).join('');
     function num(n){ return n == null ? '\u2014' : n.toLocaleString(); }
     function sol(n){ return n == null ? '\u2014'

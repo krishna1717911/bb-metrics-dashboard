@@ -810,36 +810,36 @@ def relay_names(rq):
 
 CSS = """
 .hsel{display:flex;gap:10px;align-items:center;padding:14px 28px;
-  border-bottom:1px solid #1e2937;flex-wrap:wrap}
-.hsel label{color:#6b7f96;font-size:11px;text-transform:uppercase;
+  border-bottom:1px solid var(--line);flex-wrap:wrap}
+.hsel label{color:var(--text3);font-size:11px;text-transform:uppercase;
   letter-spacing:.04em}
-.hsel select{background:#0e151d;border:1px solid #22303f;border-radius:6px;
-  color:#cfe0f0;padding:6px 11px;font:12px ui-monospace,Menlo,monospace;
+.hsel select{background:var(--bg);border:1px solid var(--line2);border-radius:6px;
+  color:var(--accent);padding:6px 11px;font:12px ui-monospace,Menlo,monospace;
   min-width:260px}
-.hsel select:focus{outline:none;border-color:#5eead4}
-.hsel button{background:#0f766e;border:1px solid #14b8a6;color:#eafffb;
+.hsel select:focus{outline:none;border-color:var(--accent)}
+.hsel button{background:var(--primary);border:1px solid var(--primary);color:#fff;
   border-radius:6px;padding:6px 14px;font-size:12px;cursor:pointer}
 .bpanel[hidden]{display:none}
-.wrh-btn{margin-top:10px;background:#0c141b;border:1px solid #22303f;
-  color:#9fb3c8;border-radius:6px;padding:4px 10px;font-size:11.5px;cursor:pointer}
-.wrh-btn:hover,.wrh-btn[aria-expanded=true]{border-color:#14b8a6;color:#5eead4}
+.wrh-btn{margin-top:10px;background:var(--bg);border:1px solid var(--line2);
+  color:var(--text);border-radius:6px;padding:4px 10px;font-size:11.5px;cursor:pointer}
+.wrh-btn:hover,.wrh-btn[aria-expanded=true]{border-color:var(--accent-main);color:var(--accent)}
 .wrh[hidden]{display:none}
 .wrh{margin:0 28px 14px}
-.wrh-box{border:1px solid #1e2937;border-radius:8px;padding:12px 14px 8px;
-  background:#0b1016;position:relative}
-.wrh-head{color:#8fa6bf;font-size:12px;margin-bottom:6px;line-height:1.5}
+.wrh-box{border:1px solid var(--line);border-radius:8px;padding:12px 14px 8px;
+  background:var(--bg);position:relative}
+.wrh-head{color:var(--text2);font-size:12px;margin-bottom:6px;line-height:1.5}
 .wrh-plot{min-height:300px}
 .wrh-ctl{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:8px}
-.wrh-mode{background:#0c141b;border:1px solid #22303f;color:#9fb3c8;
+.wrh-mode{background:var(--bg);border:1px solid var(--line2);color:var(--text);
   border-radius:6px;padding:3px 9px;font-size:11.5px;cursor:pointer}
-.wrh-mode:hover{border-color:#14b8a6}
-.wrh-mode.on{border-color:#14b8a6;color:#5eead4;background:#0f766e33}
-.wrh-tab{margin-top:6px;font-size:11px;color:#8fa6bf}
+.wrh-mode:hover{border-color:var(--accent-main)}
+.wrh-mode.on{border-color:var(--accent-main);color:var(--accent);background:var(--accent-bg)}
+.wrh-tab{margin-top:6px;font-size:11px;color:var(--text2)}
 .wrh-tab table{border-collapse:collapse;margin-top:4px}
 .wrh-tab td,.wrh-tab th{padding:2px 10px 2px 0;text-align:right;
-  font:11px ui-monospace,Menlo,monospace;color:#cfe0f0}
-.wrh-tab th{color:#6b7f96;font-weight:600}
-.hsel .lagn{color:#4d5c70;font-size:11px}
+  font:11px ui-monospace,Menlo,monospace;color:var(--accent)}
+.wrh-tab th{color:var(--text3);font-weight:600}
+.hsel .lagn{color:var(--text3);font-size:11px}
 /* Four cards, one row, on any screen wide enough to hold them. The grid was
    capped at 1180px with a 330px minimum, so the fourth card always wrapped
    onto a line of its own and left most of the width empty. auto-fit still
@@ -856,83 +856,83 @@ CSS = """
 @media (max-width:720px){
   .hgrid.g3,.hgrid.g2{grid-template-columns:minmax(0,1fr)}
 }
-.hcard{border:1px solid #22303f;border-radius:10px;background:#0e151d;
+.hcard{border:1px solid var(--line2);border-radius:10px;background:var(--bg);
   padding:16px 18px}
 .hcard h3{margin:0;font-size:11px;text-transform:uppercase;
-  letter-spacing:.05em;color:#6b7f96;font-weight:650}
+  letter-spacing:.05em;color:var(--text3);font-weight:650}
 .hbig{font-size:27px;font-weight:650;margin-top:9px;letter-spacing:-.02em}
-.hbig.good{color:#5eead4}
-.hbig.warn{color:#fbbf24}
-.hbig.dead{color:#fca5a5}
-.hbig.dim{color:#6b7f96}
-.hsub{color:#8fa6bf;font-size:12px;margin-top:7px;line-height:1.55}
+.hbig.good{color:var(--accent)}
+.hbig.warn{color:var(--warn)}
+.hbig.dead{color:var(--bad)}
+.hbig.dim{color:var(--text3)}
+.hsub{color:var(--text2);font-size:12px;margin-top:7px;line-height:1.55}
 .hrow{display:flex;justify-content:space-between;gap:12px;margin-top:6px;
-  font-size:12px;border-top:1px solid #16202b;padding-top:6px}
-.hrow span:first-child{color:#6b7f96}
-.hrow span:last-child{color:#cfe0f0;font:11.5px ui-monospace,Menlo,monospace}
-.hnote{margin-top:11px;color:#6b7f96;font-size:11px;line-height:1.55;
+  font-size:12px;border-top:1px solid var(--line);padding-top:6px}
+.hrow span:first-child{color:var(--text3)}
+.hrow span:last-child{color:var(--accent);font:11.5px ui-monospace,Menlo,monospace}
+.hnote{margin-top:11px;color:var(--text3);font-size:11px;line-height:1.55;
   font-style:italic}
-.herr{margin-top:9px;color:#fca5a5;font-size:12px;line-height:1.55}
-.hth{color:#4d5c70;font-size:10.5px;margin-top:9px;
+.herr{margin-top:9px;color:var(--bad);font-size:12px;line-height:1.55}
+.hth{color:var(--text3);font-size:10.5px;margin-top:9px;
   font:10.5px ui-monospace,Menlo,monospace}
 .hsec{margin:26px 28px 0;font-size:11px;text-transform:uppercase;
-  letter-spacing:.06em;color:#8fa6bf;font-weight:650;
-  border-bottom:1px solid #1e2937;padding-bottom:9px}
+  letter-spacing:.06em;color:var(--text2);font-weight:650;
+  border-bottom:1px solid var(--line);padding-bottom:9px}
 .rtab{margin:14px 28px 4px;border-collapse:collapse;max-width:1180px;
   width:calc(100% - 56px);font-size:12.5px}
-.rtab th{text-align:left;color:#6b7f96;font-size:10.5px;font-weight:600;
+.rtab th{text-align:left;color:var(--text3);font-size:10.5px;font-weight:600;
   text-transform:uppercase;letter-spacing:.04em;padding:0 14px 7px 0;
-  border-bottom:1px solid #1e2937;vertical-align:bottom}
+  border-bottom:1px solid var(--line);vertical-align:bottom}
 .rtab th.n,.rtab td.n{text-align:right}
-.rtab td{padding:9px 14px 9px 0;border-bottom:1px solid #16202b;
-  color:#cfe0f0}
+.rtab td{padding:9px 14px 9px 0;border-bottom:1px solid var(--line);
+  color:var(--accent)}
 .rtab td.m{font:11.5px ui-monospace,Menlo,monospace}
-.rtab .dim{color:#6b7f96}
+.rtab .dim{color:var(--text3)}
 /* The deployment table carries prose in its last column, so it drops the
    monospace and gets room to wrap -- a branch description squeezed into a
    code-width cell is unreadable. */
 .dtab{max-width:1180px}
-.dtab td.dnote{font:12px/1.55 inherit;color:#8fa6bf;min-width:240px;
+.dtab td.dnote{font:12px/1.55 inherit;color:var(--text2);min-width:240px;
   padding-right:0}
-.dtab tr.now td{color:#cfe0f0}
+.dtab tr.now td{color:var(--accent)}
 .dtab tr.now td:first-child::after{content:"current";margin-left:8px;
   font:9.5px ui-sans-serif,sans-serif;text-transform:uppercase;
-  letter-spacing:.04em;color:#5eead4;border:1px solid #14b8a655;
+  letter-spacing:.04em;color:var(--accent);border:1px solid var(--accent-bg);
   border-radius:4px;padding:1px 5px}
-.dbuild{margin:12px 28px;border:1px solid #22303f;border-radius:10px;
-  background:#0e151d;max-width:1180px}
+.dbuild{margin:12px 28px;border:1px solid var(--line2);border-radius:10px;
+  background:var(--bg);max-width:1180px}
 .dbuild>summary{cursor:pointer;padding:13px 17px;display:flex;gap:12px;
   align-items:baseline;flex-wrap:wrap;list-style:none}
 .dbuild>summary::-webkit-details-marker{display:none}
-.dbuild>summary::before{content:"\25b8";color:#4d5c70;font-size:11px}
+.dbuild>summary::before{content:"\25b8";color:var(--text3);font-size:11px}
 .dbuild[open]>summary::before{content:"\25be"}
-.dbuild>summary b{color:#5eead4;font:12.5px ui-monospace,Menlo,monospace}
+.dbuild>summary b{color:var(--accent);font:12.5px ui-monospace,Menlo,monospace}
 .dbuild>summary:hover b{text-decoration:underline}
-.dsum{color:#8fa6bf;font-size:12px}
-.dcount{margin-left:auto;color:#4d5c70;font-size:11px}
+.dsum{color:var(--text2);font-size:12px}
+.dcount{margin-left:auto;color:var(--text3);font-size:11px}
 /* Branch links had no rule at all, so they fell back to the browser's
    default link blue -- the one colour on the page that belongs to no part
    of this palette. Teal is the accent everything else uses, with a faint
    rule under it so it still reads as a link rather than as emphasis. */
-.dtab a,.dsum a{color:#5eead4;text-decoration:none;
-  border-bottom:1px solid #14b8a644}
+.dtab a,.dsum a{color:var(--accent);text-decoration:none;
+  border-bottom:1px solid var(--accent-bg)}
 .dtab a:hover,.dsum a:hover,.dtab a:focus,.dsum a:focus{
-  border-bottom-color:#5eead4;outline:none}
+  border-bottom-color:var(--accent);outline:none}
 .dbuild .rtab{margin:0 17px 14px;width:calc(100% - 34px)}
-.dapi{margin:16px 28px;border:1px solid #22303f;border-radius:10px;
-  background:#0e151d;max-width:1180px}
-.dapi>summary{cursor:pointer;padding:12px 17px;color:#5eead4;font-size:12px}
-.dapib{padding:0 17px 14px;color:#8fa6bf;font-size:12.5px;line-height:1.6}
-.dapib pre{background:#0b1016;border:1px solid #1e2937;border-radius:7px;
-  padding:11px 13px;overflow:auto;color:#cfe0f0;
+.dapi{margin:16px 28px;border:1px solid var(--line2);border-radius:10px;
+  background:var(--bg);max-width:1180px}
+.dapi>summary{cursor:pointer;padding:12px 17px;color:var(--accent);font-size:12px}
+.dapib{padding:0 17px 14px;color:var(--text2);font-size:12.5px;line-height:1.6}
+.dapib pre{background:var(--bg);border:1px solid var(--line);border-radius:7px;
+  padding:11px 13px;overflow:auto;color:var(--accent);
   font:11.5px/1.65 ui-monospace,Menlo,monospace}
-.dapib code{color:#5eead4;font:11.5px ui-monospace,Menlo,monospace}
-.dwarn{border-left:2px solid #78350f;padding-left:11px;color:#fcd9a4}
+.dapib code{color:var(--accent);font:11.5px ui-monospace,Menlo,monospace}
+.dwarn{border-left:2px solid var(--orange-line);padding-left:11px;color:var(--orange)}
 .rv{font-weight:650;font-size:11px;text-transform:uppercase;
   letter-spacing:.04em}
-.rv.good{color:#5eead4}
-.rv.warn{color:#fbbf24}
-.rv.dead{color:#fca5a5}
+.rv.good{color:var(--accent)}
+.rv.warn{color:var(--warn)}
+.rv.dead{color:var(--bad)}
 
 /* ---- panic histogram ---- */
 .pchart{margin:16px 28px 10px;max-width:760px}
@@ -940,35 +940,35 @@ CSS = """
 /* One series, so one hue. #fca5a5 is the dashboard's existing "bad" step
    and clears 3:1 against this surface; panics are never good news, so a
    magnitude ramp in a neutral hue would understate what is being read. */
-.pbar{fill:#fca5a5;fill-opacity:.62;transition:fill-opacity .12s}
+.pbar{fill:var(--bad-main);fill-opacity:.62;transition:fill-opacity .12s}
 .pbar.has{cursor:pointer}
 .pbar.has:hover{fill-opacity:.92}
-.pbar.on{fill-opacity:1;stroke:#0e151d;stroke-width:.5}
-.pbar.zero{fill:#22303f;fill-opacity:1}
-.pnum{fill:#cfe0f0;font:4.4px ui-monospace,Menlo,monospace;
+.pbar.on{fill-opacity:1;stroke:var(--line);stroke-width:.5}
+.pbar.zero{fill:var(--bg3);fill-opacity:1}
+.pnum{fill:var(--accent-main);font:4.4px ui-monospace,Menlo,monospace;
   text-anchor:middle}
 .paxis{display:flex;margin-top:5px}
 .pax{flex:1;text-align:center;display:flex;flex-direction:column;gap:1px}
-.pax b{color:#8fa6bf;font:11px ui-monospace,Menlo,monospace;font-weight:500}
-.pax span{color:#4d5c70;font-size:10px}
-.pday{margin-top:14px;border-top:1px solid #1e2937;padding-top:12px}
-.pdayh{font-size:12px;color:#cfe0f0;font-weight:650;margin-bottom:9px}
-.pev{border:1px solid #22303f;border-radius:8px;background:#0b1016;
+.pax b{color:var(--text2);font:11px ui-monospace,Menlo,monospace;font-weight:500}
+.pax span{color:var(--text3);font-size:10px}
+.pday{margin-top:14px;border-top:1px solid var(--line);padding-top:12px}
+.pdayh{font-size:12px;color:var(--accent);font-weight:650;margin-bottom:9px}
+.pev{border:1px solid var(--line2);border-radius:8px;background:var(--bg);
   padding:11px 13px;margin-bottom:9px}
 .pevh{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;
   margin-bottom:8px}
-.pevh b{color:#fca5a5;font:11.5px ui-monospace,Menlo,monospace}
-.pevh span{color:#6b7f96;font-size:11px}
+.pevh b{color:var(--bad);font:11.5px ui-monospace,Menlo,monospace}
+.pevh span{color:var(--text3);font-size:11px}
 .plist{margin-top:7px}
 .plh{font-size:10.5px;text-transform:uppercase;letter-spacing:.04em;
-  color:#6b7f96;display:flex;gap:8px;align-items:center;margin-bottom:3px}
-.plist code{display:block;color:#8fa6bf;font:10.5px ui-monospace,Menlo,monospace;
-  background:#0e151d;border:1px solid #1e2937;border-radius:6px;
+  color:var(--text3);display:flex;gap:8px;align-items:center;margin-bottom:3px}
+.plist code{display:block;color:var(--text2);font:10.5px ui-monospace,Menlo,monospace;
+  background:var(--bg);border:1px solid var(--line);border-radius:6px;
   padding:7px 9px;max-height:76px;overflow:auto;word-break:break-all;
   line-height:1.5}
-.pcopy{background:#0f766e22;border:1px solid #14b8a655;color:#5eead4;
+.pcopy{background:var(--accent-bg);border:1px solid var(--accent-bg);color:var(--accent);
   border-radius:5px;padding:1px 8px;font-size:10px;cursor:pointer}
-.pcopy:hover{background:#0f766e44}
+.pcopy:hover{background:var(--accent-bg)}
 """
 
 
@@ -1012,7 +1012,7 @@ HEALTH_JS = r'''
             el = box.querySelector('.wrh-plot');
         if (!spec || !el) return;
         var f = JSON.parse(spec.textContent);
-        Plotly.newPlot(el, f.data, f.layout, f.config);
+        bbTheme.plot(el, f.data, f.layout, f.config);
       })
       .catch(function(e){
         box.setAttribute('data-loaded', '0');
@@ -1226,7 +1226,7 @@ def winrate_card(me, peers):
 #
 # Behind the win-rate card's toggle: this builder's win% over time, one
 # line, hourly for 24 h or daily for 7 d. Teal as for "ours" elsewhere.
-WRH_OURS = "#0d9488"
+WRH_OURS = "var(--c0)"
 
 
 WRH_DAYS = 7
@@ -1258,20 +1258,20 @@ def _wrh_figure(series, hrs, day):
             "x": hrs, "y": ys, "customdata": cd, "connectgaps": False,
             "line": {"color": col, "width": 2},
             "marker": {"color": col, "size": 8,
-                       "line": {"color": "#0b1016", "width": 2}},
+                       "line": {"color": "var(--bg)", "width": 2}},
             "hovertemplate": "%{y:.1f}%  (%{customdata[0]:,} of "
                              "%{customdata[1]:,})<extra>" + r["builder"]
                              + "</extra>"})
-    axis = {"gridcolor": "#1a2431", "zerolinecolor": "#243242",
-            "linecolor": "#243242", "tickfont": {"color": "#6b7f96", "size": 11}}
+    axis = {"gridcolor": "var(--line)", "zerolinecolor": "var(--line2)",
+            "linecolor": "var(--line2)", "tickfont": {"color": "var(--text3)", "size": 11}}
     layout = {
-        "paper_bgcolor": "#0b1016", "plot_bgcolor": "#0b1016", "height": 300,
-        "font": {"color": "#c3d3e6",
+        "paper_bgcolor": "var(--bg)", "plot_bgcolor": "var(--bg)", "height": 300,
+        "font": {"color": "var(--text)",
                  "family": "ui-sans-serif,-apple-system,Segoe UI,sans-serif"},
         "margin": {"l": 52, "r": 16, "t": 8, "b": 40},
         "hovermode": "x unified",
-        "hoverlabel": {"bgcolor": "#0d151d", "bordercolor": "#2f4256",
-                       "font": {"color": "#c3d3e6", "size": 12}},
+        "hoverlabel": {"bgcolor": "var(--bg)", "bordercolor": "var(--line2)",
+                       "font": {"color": "var(--text)", "size": 12}},
         "showlegend": False,          # one series: the heading names it
         "xaxis": dict(axis, type="date",
                       tickformat="%d/%m" if day else "%H:%M",
@@ -1279,7 +1279,7 @@ def _wrh_figure(series, hrs, day):
                       else "%Y-%m-%d %H:%M UTC"),
         "yaxis": dict(axis, ticksuffix="%", rangemode="tozero",
                       title={"text": "win% contested",
-                             "font": {"color": "#8fa6bf", "size": 12}}),
+                             "font": {"color": "var(--text2)", "size": 12}}),
     }
     config = {"displaylogo": False, "responsive": True,
               "modeBarButtonsToRemove": ["lasso2d", "select2d"],
