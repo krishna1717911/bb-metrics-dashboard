@@ -37,6 +37,9 @@ import health
 import valcomp
 import accuracy
 import lookup
+import ui
+import bbhealth
+import system
 
 # ------------------------------------------------------------------- clients
 
@@ -3156,6 +3159,7 @@ REWARDS_PATH = "/econ/rewards"
 # page, which is the same invisible-state problem the explicit parameter
 # exists to solve, just pointing the other way.
 DEP_FREE_PATHS = {HEALTH_PATH, ACCURACY_PATH, ACCURACY_PATH + '/slot',
+                  system.FRESH_PATH, system.ABOUT_PATH,
                   lookup.LOOKUP_PATH,
                   HEALTH_PATH + '/winrate-history',
                   HOME_PATH, DEPLOYHIST_PATH, VALCOMP_PATH,
@@ -9214,14 +9218,19 @@ SECTIONS = [
     ("econ", "Economics",
      "What the builder is worth — against other clients, against a "
      "named validator, and in absolute reward terms."),
+    ("system", "System",
+     "The dashboard itself — is every store it reads current, and what "
+     "does it read for what."),
 ]
 
 PAGES = [
     dict(id="health", section="tech", path=HEALTH_PATH,
-         title="connector & relay health",
-         blurb="Is the builder connected, and is the relay grading it? The "
-               "live probe, extend and commit timings, win rate across every "
-               "builder the relay sees, and per-connector eligibility.",
+         title="bb health",
+         blurb="One builder, connector or relay at a time, and whether it is "
+               "getting better or worse: win rate and reward per round, "
+               "replay, commit, extend and probe timings, restarts and "
+               "disconnects, skipped slots and fallback blocks, each against "
+               "a baseline window.",
          ready=True),
     dict(id="offertl", section="tech", path="/tech/offer-timelines",
          title="offer timelines",
@@ -9288,6 +9297,17 @@ PAGES = [
                "actually sit across the last 30 days, with the compute-unit "
                "field and the per-day scalars.",
          ready=True),
+
+    dict(id="freshness", section="system", path=system.FRESH_PATH,
+         title="freshness",
+         blurb="How old the newest row is in every store the dashboard reads, "
+               "per writer, and how long each read took.",
+         ready=True),
+    dict(id="about", section="system", path=system.ABOUT_PATH,
+         title="about",
+         blurb="This build, the stores each page reads, and the caveats that "
+               "change how the numbers should be read.",
+         ready=True),
 ]
 
 PAGE_BY_ID = {p["id"]: p for p in PAGES}
@@ -9346,8 +9366,12 @@ def shell(body, *, title="", subtitle="", here=None, sel_path=None,
     return f"""<!doctype html><html><head><meta charset="utf-8">
 <title>{html.escape(doc_title)}</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<style>{CSS}{winrate.CSS}{extra_css}</style></head><body>
+<style>{CSS}{ui.CSS}{winrate.CSS}{extra_css}</style></head><body>
+<div class="app">
+{ui.sidebar(PAGES, SECTIONS, here, nav_href)}
+<main class="smain">
 <header>
+  <button type="button" class="stoggle" aria-label="pages">&#9776;</button>
   <h1><a href="{html.escape(nav_href(HOME_PATH))}">sim<span>bench</span></a></h1>
   <div class="sub">{subtitle}</div>
   {jump_form}
@@ -9355,9 +9379,23 @@ def shell(body, *, title="", subtitle="", here=None, sel_path=None,
 </header>
 {crumb}
 {body}
+</main>
+</div>
 {scripts}
 <script>{COPY_JS}</script>
+<script>{ui.SIDEBAR_JS}</script>
 </body></html>"""
+
+
+def with_sidebar(here, doc):
+    """The sidebar for a page that renders its own document instead of
+    going through shell() (the rewards page)."""
+    doc = doc.replace("</style>", ui.CSS + "</style>", 1)
+    doc = doc.replace("<body>", '<body><div class="app">'
+                      + ui.sidebar(PAGES, SECTIONS, here, nav_href)
+                      + '<main class="smain">', 1)
+    return doc.replace("</body>", "</main></div><script>" + ui.SIDEBAR_JS
+                       + "</script></body>", 1)
 
 
 def nav_href(path):
@@ -9438,8 +9476,11 @@ def otel_or_explain(sql):
         raise
 
 
-def health_page():
-    """Connector & relay health.
+def health_page(qs=None):
+    """BB health (was "connector & relay health"): see bbhealth.py. The old
+    page's live cards are the top of the builder view.
+
+    Connector & relay health, as it was:
 
     The one page that is NOT about a deployment. It is keyed by instance_id
     straight from ClickHouse, so every builder writing rows is reachable --
@@ -9455,11 +9496,15 @@ def health_page():
     # relay_fast: every relay query here reads relay.mini_block_events_v2,
     # which the direct login serves without Grafana's proxy -- whose TLS
     # handshake times out now and then and blanked the win-rate card.
-    body = health.body(clickhouse_main, influx_series, otel_or_explain,
-                       relay_fast, SOLANA_RPC, HEALTH_PATH)
-    return shell(body, here="health",
-                 subtitle="connector &amp; relay health",
-                 extra_css=health.CSS)
+    panic_src = bbhealth.panic_source(
+        otel_main, os.environ.get("SLACK_BOT_TOKEN", ""),
+        os.environ.get("BB_ALERTS_CHANNEL", "C0BVA8EDHMX"),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "panics.json"))
+    body = bbhealth.page(qs or {}, clickhouse_main, influx_series,
+                         panic_src, relay_fast, relay, SOLANA_RPC,
+                         _validator_names())
+    return shell(body, here="health", subtitle="bb health",
+                 extra_css=health.CSS + accuracy.CSS + bbhealth.CSS)
 
 
 ACCURACY_PATH_SLOT = ACCURACY_PATH + "/slot"
@@ -10049,10 +10094,19 @@ class Handler(BaseHTTPRequestHandler):
     def _page_home(self, q):
         return home_page()
 
+    def _page_freshness(self, q):
+        return shell(system.freshness_page(
+            clickhouse_main, influx_series, relay_fast, relay, valcomp.fd_report,
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "panics.json")),
+            here="freshness", subtitle="data freshness")
+
+    def _page_about(self, q):
+        return shell(system.about_page(PAGES, SECTIONS), here="about",
+                     subtitle="about this dashboard")
+
     def _page_health(self, q):
-        # Takes no query parameter: which builder is on screen is page
-        # state, not an address.
-        return health_page()
+        # kind / id / window / baseline are in the address now (bb health)
+        return health_page(q)
 
     def _page_accuracy(self, q):
         return accuracy_page(q)
@@ -10078,11 +10132,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def _page_rewards(self, q):
         one = lambda k: (q.get(k, [""])[0] or None)
-        return rewards.rewards_page(
+        return with_sidebar("rewards", rewards.rewards_page(
             CSS, purl, one("from"), one("to"),
             {k: one(k) for k in ("cu", "render", "hscale", "cam", "insp")},
             paths={"home": HOME_PATH, "self": REWARDS_PATH,
-                   "reference": REF_PATH, "crumb": crumb_html("rewards")})
+                   "reference": REF_PATH, "crumb": crumb_html("rewards")}))
 
     def _page_range(self, q):
         one = lambda k, d: (q.get(k, [d])[0] or d)
@@ -10154,6 +10208,8 @@ class Handler(BaseHTTPRequestHandler):
         return {
             HOME_PATH: (self._page_home, False),
             HEALTH_PATH: (self._page_health, False),
+            system.FRESH_PATH: (self._page_freshness, False),
+            system.ABOUT_PATH: (self._page_about, False),
             ACCURACY_PATH: (self._page_accuracy, False),
             ACCURACY_PATH_SLOT: (self._frag_accuracy_slot, True),
             OFFERTL_PATH: (self._page_offertl, False),

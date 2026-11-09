@@ -1,0 +1,808 @@
+{
+ "source": "#bb-alerts (C0BVA8EDHMX), every line matching 'ERROR panic'",
+ "covers_from": "2026-10-07 07:17:27",
+ "covers_to": "2026-11-09 09:15:00",
+ "note": "pulled 2026-11-09; earlier panics exist but predate bifrost_events retention",
+ "panics": [
+  {
+   "at": "2026-10-07 07:17:27",
+   "instance": "ASTRALANE_FRA_1",
+   "build": "cfa28ed94",
+   "thread": "SchedulerTile<OrderMaxRewardPrio",
+   "location": "bifrost-builder/src/scheduler/commit.rs:683:17",
+   "message": "winner order bytes invariant failed: slot=454153358 index=2"
+  },
+  {
+   "at": "2026-10-07 08:41:31",
+   "instance": "ASTRALANE_FRA_1",
+   "build": "cfa28ed94",
+   "thread": "SchedulerTile<OrderMaxRewardPrio",
+   "location": "bifrost-builder/src/scheduler/commit.rs:683:17",
+   "message": "winner order bytes invariant failed: slot=454172191 index=3"
+  },
+  {
+   "at": "2026-10-07 17:04:23",
+   "instance": "ASTRALANE_FRA_1",
+   "build": "cfa28ed94",
+   "thread": "SchedulerTile<OrderMaxRewardPrio",
+   "location": "bifrost-builder/src/scheduler/commit.rs:683:17",
+   "message": "winner order bytes invariant failed: slot=454284573 index=0"
+  },
+  {
+   "at": "2026-10-07 18:36:14",
+   "instance": "ASTRALANE_AMS_MOCK",
+   "build": "cfa28ed94",
+   "thread": "SchedulerTile<OrderMaxRewardPrio",
+   "location": "bifrost-builder/src/scheduler/commit.rs:683:17",
+   "message": "winner order bytes invariant failed: slot=454304987 index=2"
+  },
+  {
+   "at": "2026-10-07 18:36:14",
+   "instance": "ASTRALANE_AMS_1",
+   "build": "cfa28ed94",
+   "thread": "SchedulerTile<OrderMaxRewardPrio",
+   "location": "bifrost-builder/src/scheduler/commit.rs:683:17",
+   "message": "winner order bytes invariant failed: slot=454304987 index=2"
+  },
+  {
+   "at": "2026-10-07 18:36:14",
+   "instance": "ASTRALANE_AMS_2",
+   "build": "cfa28ed94",
+   "thread": "SchedulerTile<OrderMaxRewardPrio",
+   "location": "bifrost-builder/src/scheduler/commit.rs:683:17",
+   "message": "winner order bytes invariant failed: slot=454304987 index=2"
+  },
+  {
+   "at": "2026-10-07 19:45:03",
+   "instance": "ASTRALANE_FRA_1",
+   "build": "cfa28ed94",
+   "thread": "SchedulerTile<OrderMaxRewardPrio",
+   "location": "bifrost-builder/src/scheduler/commit.rs:683:17",
+   "message": "winner order bytes invariant failed: slot=454320249 index=2"
+  },
+  {
+   "at": "2026-10-07 19:53:57",
+   "instance": "ASTRALANE_FRA_1",
+   "build": "cfa28ed94",
+   "thread": "SchedulerTile<OrderMaxRewardPrio",
+   "location": "bifrost-builder/src/scheduler/commit.rs:683:17",
+   "message": "winner order bytes invariant failed: slot=454322224 index=0"
+  },
+  {
+   "at": "2026-10-07 19:58:25",
+   "instance": "ASTRALANE_FRA_1",
+   "build": "cfa28ed94",
+   "thread": "SchedulerTile<OrderMaxRewardPrio",
+   "location": "bifrost-builder/src/scheduler/commit.rs:683:17",
+   "message": "winner order bytes invariant failed: slot=454323216 index=1"
+  },
+  {
+   "at": "2026-10-07 20:44:32",
+   "instance": "ASTRALANE_FRA_1",
+   "build": "cfa28ed94",
+   "thread": "SchedulerTile<OrderMaxRewardPrio",
+   "location": "bifrost-builder/src/scheduler/commit.rs:683:17",
+   "message": "winner order bytes invariant failed: slot=454333455 index=3"
+  },
+  {
+   "at": "2026-10-07 20:58:38",
+   "instance": "ASTRALANE_FRA_1",
+   "build": "cfa28ed94",
+   "thread": "SchedulerTile<OrderMaxRewardPrio",
+   "location": "bifrost-builder/src/scheduler/commit.rs:683:17",
+   "message": "winner order bytes invariant failed: slot=454336585 index=2"
+  },
+  {
+   "at": "2026-10-07 21:10:52",
+   "instance": "ASTRALANE_FRA_1",
+   "build": "cfa28ed94",
+   "thread": "SchedulerTile<OrderMaxRewardPrio",
+   "location": "bifrost-builder/src/scheduler/commit.rs:683:17",
+   "message": "winner order bytes invariant failed: slot=454339294 index=0"
+  },
+  {
+   "at": "2026-10-07 21:47:38",
+   "instance": "ASTRALANE_FRA_1",
+   "build": "cfa28ed94",
+   "thread": "SchedulerTile<OrderMaxRewardPrio",
+   "location": "bifrost-builder/src/scheduler/commit.rs:683:17",
+   "message": "winner order bytes invariant failed: slot=454347458 index=0"
+  },
+  {
+   "at": "2026-10-07 22:15:53",
+   "instance": "ASTRALANE_FRA_1",
+   "build": "cfa28ed94",
+   "thread": "SchedulerTile<OrderMaxRewardPrio",
+   "location": "bifrost-builder/src/scheduler/commit.rs:683:17",
+   "message": "winner order bytes invariant failed: slot=454353773 index=0"
+  },
+  {
+   "at": "2026-10-08 03:21:33",
+   "instance": "ASTRALANE_FRA_1",
+   "build": "cfa28ed94",
+   "thread": "SchedulerTile<OrderMaxRewardPrio",
+   "location": "bifrost-builder/src/scheduler/commit.rs:683:17",
+   "message": "winner order bytes invariant failed: slot=454422151 index=2"
+  },
+  {
+   "at": "2026-10-08 11:52:03",
+   "instance": "ASTRALANE_FRA_1",
+   "build": "cfa28ed94",
+   "thread": "SchedulerTile<OrderMaxRewardPrio",
+   "location": "bifrost-builder/src/scheduler/commit.rs:683:17",
+   "message": "winner order bytes invariant failed: slot=454536685 index=1"
+  },
+  {
+   "at": "2026-10-08 12:21:33",
+   "instance": "ASTRALANE_FRA_1",
+   "build": "cfa28ed94",
+   "thread": "SchedulerTile<OrderMaxRewardPrio",
+   "location": "bifrost-builder/src/scheduler/commit.rs:683:17",
+   "message": "winner order bytes invariant failed: slot=454543275 index=3"
+  },
+  {
+   "at": "2026-10-08 14:03:01",
+   "instance": "ASTRALANE_AMS_MOCK",
+   "build": "cfa28ed94",
+   "thread": "SchedulerTile<OrderMaxRewardPrio",
+   "location": "bifrost-builder/src/scheduler/commit.rs:683:17",
+   "message": "winner order bytes invariant failed: slot=454565932 index=0"
+  },
+  {
+   "at": "2026-10-08 14:03:01",
+   "instance": "ASTRALANE_AMS_1",
+   "build": "cfa28ed94",
+   "thread": "SchedulerTile<OrderMaxRewardPrio",
+   "location": "bifrost-builder/src/scheduler/commit.rs:683:17",
+   "message": "winner order bytes invariant failed: slot=454565932 index=0"
+  },
+  {
+   "at": "2026-10-08 14:03:01",
+   "instance": "ASTRALANE_AMS_2",
+   "build": "cfa28ed94",
+   "thread": "SchedulerTile<OrderMaxRewardPrio",
+   "location": "bifrost-builder/src/scheduler/commit.rs:683:17",
+   "message": "winner order bytes invariant failed: slot=454565932 index=0"
+  },
+  {
+   "at": "2026-10-08 14:03:05",
+   "instance": "ASTRALANE_FRA_1",
+   "build": "cfa28ed94",
+   "thread": "SchedulerTile<OrderMaxRewardPrio",
+   "location": "bifrost-builder/src/scheduler/commit.rs:683:17",
+   "message": "winner order bytes invariant failed: slot=454565948 index=0"
+  },
+  {
+   "at": "2026-10-08 15:39:40",
+   "instance": "ASTRALANE_FRA_1",
+   "build": "cfa28ed94",
+   "thread": "SchedulerTile<OrderMaxRewardPrio",
+   "location": "bifrost-builder/src/scheduler/commit.rs:683:17",
+   "message": "winner order bytes invariant failed: slot=454587466 index=0"
+  },
+  {
+   "at": "2026-10-08 16:06:51",
+   "instance": "ASTRALANE_FRA_1",
+   "build": "cfa28ed94",
+   "thread": "SchedulerTile<OrderMaxRewardPrio",
+   "location": "bifrost-builder/src/scheduler/commit.rs:683:17",
+   "message": "winner order bytes invariant failed: slot=454593496 index=0"
+  },
+  {
+   "at": "2026-10-08 16:42:42",
+   "instance": "ASTRALANE_FRA_1",
+   "build": "cfa28ed94",
+   "thread": "SchedulerTile<OrderMaxRewardPrio",
+   "location": "bifrost-builder/src/scheduler/commit.rs:683:17",
+   "message": "winner order bytes invariant failed: slot=454601444 index=0"
+  },
+  {
+   "at": "2026-10-08 16:59:12",
+   "instance": "ASTRALANE_FRA_1",
+   "build": "cfa28ed94",
+   "thread": "SchedulerTile<OrderMaxRewardPrio",
+   "location": "bifrost-builder/src/scheduler/commit.rs:683:17",
+   "message": "winner order bytes invariant failed: slot=454605117 index=2"
+  },
+  {
+   "at": "2026-10-08 18:06:51",
+   "instance": "ASTRALANE_FRA_1",
+   "build": "cfa28ed94",
+   "thread": "SchedulerTile<OrderMaxRewardPrio",
+   "location": "bifrost-builder/src/scheduler/commit.rs:683:17",
+   "message": "winner order bytes invariant failed: slot=454620128 index=0"
+  },
+  {
+   "at": "2026-10-08 18:45:48",
+   "instance": "ASTRALANE_FRA_1",
+   "build": "cfa28ed94",
+   "thread": "SchedulerTile<OrderMaxRewardPrio",
+   "location": "bifrost-builder/src/scheduler/commit.rs:683:17",
+   "message": "winner order bytes invariant failed: slot=454628713 index=1"
+  },
+  {
+   "at": "2026-10-08 18:57:20",
+   "instance": "ASTRALANE_FRA_1",
+   "build": "cfa28ed94",
+   "thread": "SchedulerTile<OrderMaxRewardPrio",
+   "location": "bifrost-builder/src/scheduler/commit.rs:683:17",
+   "message": "winner order bytes invariant failed: slot=454631258 index=0"
+  },
+  {
+   "at": "2026-10-08 19:02:35",
+   "instance": "ASTRALANE_FRA_1",
+   "build": "cfa28ed94",
+   "thread": "SchedulerTile<OrderMaxRewardPrio",
+   "location": "bifrost-builder/src/scheduler/commit.rs:683:17",
+   "message": "winner order bytes invariant failed: slot=454632400 index=0"
+  },
+  {
+   "at": "2026-10-08 19:13:37",
+   "instance": "ASTRALANE_FRA_1",
+   "build": "cfa28ed94",
+   "thread": "SchedulerTile<OrderMaxRewardPrio",
+   "location": "bifrost-builder/src/scheduler/commit.rs:683:17",
+   "message": "winner order bytes invariant failed: slot=454634844 index=0"
+  },
+  {
+   "at": "2026-10-08 19:56:28",
+   "instance": "ASTRALANE_FRA_1",
+   "build": "cfa28ed94",
+   "thread": "SchedulerTile<OrderMaxRewardPrio",
+   "location": "bifrost-builder/src/scheduler/commit.rs:683:17",
+   "message": "winner order bytes invariant failed: slot=454644467 index=0"
+  },
+  {
+   "at": "2026-10-08 20:39:31",
+   "instance": "ASTRALANE_FRA_1",
+   "build": "cfa28ed94",
+   "thread": "SchedulerTile<OrderMaxRewardPrio",
+   "location": "bifrost-builder/src/scheduler/commit.rs:683:17",
+   "message": "winner order bytes invariant failed: slot=454654008 index=0"
+  },
+  {
+   "at": "2026-10-08 20:44:22",
+   "instance": "ASTRALANE_FRA_1",
+   "build": "cfa28ed94",
+   "thread": "SchedulerTile<OrderMaxRewardPrio",
+   "location": "bifrost-builder/src/scheduler/commit.rs:683:17",
+   "message": "winner order bytes invariant failed: slot=454655112 index=0"
+  },
+  {
+   "at": "2026-10-08 20:51:36",
+   "instance": "ASTRALANE_JP_1",
+   "build": "cfa28ed94",
+   "thread": "SchedulerTile<OrderMaxRewardPrio",
+   "location": "bifrost-builder/src/scheduler/commit.rs:683:17",
+   "message": "winner order bytes invariant failed: slot=454656711 index=0"
+  },
+  {
+   "at": "2026-10-08 21:44:28",
+   "instance": "ASTRALANE_FRA_1",
+   "build": "cfa28ed94",
+   "thread": "SchedulerTile<OrderMaxRewardPrio",
+   "location": "bifrost-builder/src/scheduler/commit.rs:683:17",
+   "message": "winner order bytes invariant failed: slot=454668472 index=1"
+  },
+  {
+   "at": "2026-10-08 22:53:07",
+   "instance": "ASTRALANE_FRA_1",
+   "build": "cfa28ed94",
+   "thread": "SchedulerTile<OrderMaxRewardPrio",
+   "location": "bifrost-builder/src/scheduler/commit.rs:683:17",
+   "message": "winner order bytes invariant failed: slot=454683842 index=2"
+  },
+  {
+   "at": "2026-10-08 23:42:03",
+   "instance": "ASTRALANE_FRA_1",
+   "build": "cfa28ed94",
+   "thread": "SchedulerTile<OrderMaxRewardPrio",
+   "location": "bifrost-builder/src/scheduler/commit.rs:683:17",
+   "message": "winner order bytes invariant failed: slot=454694742 index=1"
+  },
+  {
+   "at": "2026-10-08 23:50:49",
+   "instance": "ASTRALANE_FRA_1",
+   "build": "cfa28ed94",
+   "thread": "SchedulerTile<OrderMaxRewardPrio",
+   "location": "bifrost-builder/src/scheduler/commit.rs:683:17",
+   "message": "winner order bytes invariant failed: slot=454696707 index=0"
+  },
+  {
+   "at": "2026-10-09 00:03:26",
+   "instance": "ASTRALANE_FRA_1",
+   "build": "cfa28ed94",
+   "thread": "SchedulerTile<OrderMaxRewardPrio",
+   "location": "bifrost-builder/src/scheduler/commit.rs:683:17",
+   "message": "winner order bytes invariant failed: slot=454699512 index=0"
+  },
+  {
+   "at": "2026-10-09 01:58:25",
+   "instance": "ASTRALANE_FRA_1",
+   "build": "cfa28ed94",
+   "thread": "SchedulerTile<OrderMaxRewardPrio",
+   "location": "bifrost-builder/src/scheduler/commit.rs:683:17",
+   "message": "winner order bytes invariant failed: slot=454725236 index=0"
+  },
+  {
+   "at": "2026-10-09 02:01:54",
+   "instance": "ASTRALANE_FRA_1",
+   "build": "cfa28ed94",
+   "thread": "SchedulerTile<OrderMaxRewardPrio",
+   "location": "bifrost-builder/src/scheduler/commit.rs:683:17",
+   "message": "winner order bytes invariant failed: slot=454726020 index=0"
+  },
+  {
+   "at": "2026-10-09 02:46:49",
+   "instance": "ASTRALANE_FRA_1",
+   "build": "cfa28ed94",
+   "thread": "SchedulerTile<OrderMaxRewardPrio",
+   "location": "bifrost-builder/src/scheduler/commit.rs:683:17",
+   "message": "winner order bytes invariant failed: slot=454736020 index=0"
+  },
+  {
+   "at": "2026-10-09 04:34:47",
+   "instance": "ASTRALANE_FRA_1",
+   "build": "cfa28ed94",
+   "thread": "SchedulerTile<OrderMaxRewardPrio",
+   "location": "bifrost-builder/src/scheduler/commit.rs:683:17",
+   "message": "winner order bytes invariant failed: slot=454760227 index=3"
+  },
+  {
+   "at": "2026-10-09 05:51:51",
+   "instance": "ASTRALANE_FRA_1",
+   "build": "cfa28ed94",
+   "thread": "SchedulerTile<OrderMaxRewardPrio",
+   "location": "bifrost-builder/src/scheduler/commit.rs:683:17",
+   "message": "winner order bytes invariant failed: slot=454777500 index=0"
+  },
+  {
+   "at": "2026-10-09 13:24:20",
+   "instance": "ASTRALANE_FRA_1",
+   "build": "cfa28ed94",
+   "thread": "SchedulerTile<OrderMaxRewardPrio",
+   "location": "bifrost-builder/src/scheduler/commit.rs:683:17",
+   "message": "winner order bytes invariant failed: slot=454878904 index=1"
+  },
+  {
+   "at": "2026-10-09 13:37:28",
+   "instance": "ASTRALANE_FRA_1",
+   "build": "cfa28ed94",
+   "thread": "SchedulerTile<OrderMaxRewardPrio",
+   "location": "bifrost-builder/src/scheduler/commit.rs:683:17",
+   "message": "winner order bytes invariant failed: slot=454881826 index=1"
+  },
+  {
+   "at": "2026-10-20 11:36:22",
+   "instance": "ASTRALANE_AMS_MOCK",
+   "build": "abafe169e",
+   "thread": "NetworkTile",
+   "location": "bifrost-builder/src/relay.rs:74:9",
+   "message": "latest relay frame rejected: unsupported outer tag: 0 len=82"
+  },
+  {
+   "at": "2026-10-20 11:36:22",
+   "instance": "ASTRALANE_AMS_1",
+   "build": "e68b5c8a5",
+   "thread": "NetworkTile",
+   "location": "bifrost-builder/src/relay.rs:74:9",
+   "message": "latest relay frame rejected: unsupported outer tag: 0 len=82"
+  },
+  {
+   "at": "2026-10-20 11:42:15",
+   "instance": "ASTRALANE_AMS_1",
+   "build": "e68b5c8a5",
+   "thread": "NetworkTile",
+   "location": "bifrost-builder/src/relay.rs:74:9",
+   "message": "latest relay frame rejected: unsupported outer tag: 0 len=82"
+  },
+  {
+   "at": "2026-10-20 11:44:30",
+   "instance": "ASTRALANE_AMS_MOCK",
+   "build": "abafe169e",
+   "thread": "NetworkTile",
+   "location": "bifrost-builder/src/relay.rs:74:9",
+   "message": "latest relay frame rejected: unsupported outer tag: 0 len=82"
+  },
+  {
+   "at": "2026-10-20 11:56:30",
+   "instance": "ASTRALANE_AMS_MOCK",
+   "build": "abafe169e",
+   "thread": "NetworkTile",
+   "location": "bifrost-builder/src/relay.rs:74:9",
+   "message": "latest relay frame rejected: unsupported outer tag: 0 len=82"
+  },
+  {
+   "at": "2026-10-20 11:56:30",
+   "instance": "ASTRALANE_AMS_1",
+   "build": "e68b5c8a5",
+   "thread": "NetworkTile",
+   "location": "bifrost-builder/src/relay.rs:74:9",
+   "message": "latest relay frame rejected: unsupported outer tag: 0 len=82"
+  },
+  {
+   "at": "2026-10-20 12:01:15",
+   "instance": "ASTRALANE_AMS_MOCK",
+   "build": "abafe169e",
+   "thread": "NetworkTile",
+   "location": "bifrost-builder/src/relay.rs:74:9",
+   "message": "latest relay frame rejected: unsupported outer tag: 0 len=82"
+  },
+  {
+   "at": "2026-10-20 12:02:03",
+   "instance": "ASTRALANE_AMS_1",
+   "build": "e68b5c8a5",
+   "thread": "NetworkTile",
+   "location": "bifrost-builder/src/relay.rs:74:9",
+   "message": "latest relay frame rejected: unsupported outer tag: 0 len=82"
+  },
+  {
+   "at": "2026-10-20 12:08:06",
+   "instance": "ASTRALANE_AMS_1",
+   "build": "e68b5c8a5",
+   "thread": "NetworkTile",
+   "location": "bifrost-builder/src/relay.rs:74:9",
+   "message": "latest relay frame rejected: unsupported outer tag: 0 len=82"
+  },
+  {
+   "at": "2026-10-20 12:08:17",
+   "instance": "ASTRALANE_AMS_MOCK",
+   "build": "abafe169e",
+   "thread": "NetworkTile",
+   "location": "bifrost-builder/src/relay.rs:74:9",
+   "message": "latest relay frame rejected: unsupported outer tag: 0 len=82"
+  },
+  {
+   "at": "2026-10-20 12:13:28",
+   "instance": "ASTRALANE_AMS_1",
+   "build": "e68b5c8a5",
+   "thread": "NetworkTile",
+   "location": "bifrost-builder/src/relay.rs:74:9",
+   "message": "latest relay frame rejected: unsupported outer tag: 0 len=82"
+  },
+  {
+   "at": "2026-10-20 12:13:43",
+   "instance": "ASTRALANE_AMS_MOCK",
+   "build": "abafe169e",
+   "thread": "NetworkTile",
+   "location": "bifrost-builder/src/relay.rs:74:9",
+   "message": "latest relay frame rejected: unsupported outer tag: 0 len=82"
+  },
+  {
+   "at": "2026-10-20 12:19:01",
+   "instance": "ASTRALANE_AMS_1",
+   "build": "e68b5c8a5",
+   "thread": "NetworkTile",
+   "location": "bifrost-builder/src/relay.rs:74:9",
+   "message": "latest relay frame rejected: unsupported outer tag: 0 len=82"
+  },
+  {
+   "at": "2026-10-20 12:19:53",
+   "instance": "ASTRALANE_AMS_MOCK",
+   "build": "abafe169e",
+   "thread": "NetworkTile",
+   "location": "bifrost-builder/src/relay.rs:74:9",
+   "message": "latest relay frame rejected: unsupported outer tag: 0 len=82"
+  },
+  {
+   "at": "2026-10-20 12:24:59",
+   "instance": "ASTRALANE_AMS_1",
+   "build": "e68b5c8a5",
+   "thread": "NetworkTile",
+   "location": "bifrost-builder/src/relay.rs:74:9",
+   "message": "latest relay frame rejected: unsupported outer tag: 0 len=82"
+  },
+  {
+   "at": "2026-10-20 12:25:39",
+   "instance": "ASTRALANE_AMS_MOCK",
+   "build": "abafe169e",
+   "thread": "NetworkTile",
+   "location": "bifrost-builder/src/relay.rs:74:9",
+   "message": "latest relay frame rejected: unsupported outer tag: 0 len=82"
+  },
+  {
+   "at": "2026-10-20 12:29:56",
+   "instance": "ASTRALANE_AMS_1",
+   "build": "e68b5c8a5",
+   "thread": "NetworkTile",
+   "location": "bifrost-builder/src/relay.rs:74:9",
+   "message": "latest relay frame rejected: unsupported outer tag: 0 len=82"
+  },
+  {
+   "at": "2026-10-20 12:31:35",
+   "instance": "ASTRALANE_AMS_MOCK",
+   "build": "abafe169e",
+   "thread": "NetworkTile",
+   "location": "bifrost-builder/src/relay.rs:74:9",
+   "message": "latest relay frame rejected: unsupported outer tag: 0 len=82"
+  },
+  {
+   "at": "2026-10-20 12:35:39",
+   "instance": "ASTRALANE_AMS_1",
+   "build": "e68b5c8a5",
+   "thread": "NetworkTile",
+   "location": "bifrost-builder/src/relay.rs:74:9",
+   "message": "latest relay frame rejected: unsupported outer tag: 0 len=82"
+  },
+  {
+   "at": "2026-10-20 12:36:50",
+   "instance": "ASTRALANE_AMS_MOCK",
+   "build": "abafe169e",
+   "thread": "NetworkTile",
+   "location": "bifrost-builder/src/relay.rs:74:9",
+   "message": "latest relay frame rejected: unsupported outer tag: 0 len=82"
+  },
+  {
+   "at": "2026-10-20 12:40:20",
+   "instance": "ASTRALANE_AMS_1",
+   "build": "e68b5c8a5",
+   "thread": "SchedulerTile<OrderMaxRewardPrio",
+   "location": "bifrost-builder/src/scheduler/commit.rs:540:13",
+   "message": "winner order bytes invariant failed: slot=459233450 index=2"
+  },
+  {
+   "at": "2026-10-20 12:42:26",
+   "instance": "ASTRALANE_AMS_MOCK",
+   "build": "abafe169e",
+   "thread": "NetworkTile",
+   "location": "bifrost-builder/src/relay.rs:74:9",
+   "message": "latest relay frame rejected: unsupported outer tag: 0 len=82"
+  },
+  {
+   "at": "2026-10-20 12:45:39",
+   "instance": "ASTRALANE_AMS_1",
+   "build": "e68b5c8a5",
+   "thread": "NetworkTile",
+   "location": "bifrost-builder/src/relay.rs:74:9",
+   "message": "latest relay frame rejected: unsupported outer tag: 0 len=82"
+  },
+  {
+   "at": "2026-10-20 12:48:24",
+   "instance": "ASTRALANE_AMS_MOCK",
+   "build": "abafe169e",
+   "thread": "NetworkTile",
+   "location": "bifrost-builder/src/relay.rs:74:9",
+   "message": "latest relay frame rejected: unsupported outer tag: 0 len=82"
+  },
+  {
+   "at": "2026-10-20 12:52:57",
+   "instance": "ASTRALANE_AMS_1",
+   "build": "e68b5c8a5",
+   "thread": "NetworkTile",
+   "location": "bifrost-builder/src/relay.rs:74:9",
+   "message": "latest relay frame rejected: unsupported outer tag: 0 len=82"
+  },
+  {
+   "at": "2026-10-20 12:53:25",
+   "instance": "ASTRALANE_AMS_MOCK",
+   "build": "abafe169e",
+   "thread": "NetworkTile",
+   "location": "bifrost-builder/src/relay.rs:74:9",
+   "message": "latest relay frame rejected: unsupported outer tag: 0 len=82"
+  },
+  {
+   "at": "2026-10-20 12:58:40",
+   "instance": "ASTRALANE_AMS_MOCK",
+   "build": "abafe169e",
+   "thread": "NetworkTile",
+   "location": "bifrost-builder/src/relay.rs:74:9",
+   "message": "latest relay frame rejected: unsupported outer tag: 0 len=82"
+  },
+  {
+   "at": "2026-10-20 12:58:47",
+   "instance": "ASTRALANE_AMS_1",
+   "build": "e68b5c8a5",
+   "thread": "NetworkTile",
+   "location": "bifrost-builder/src/relay.rs:74:9",
+   "message": "latest relay frame rejected: unsupported outer tag: 0 len=82"
+  },
+  {
+   "at": "2026-10-20 13:03:25",
+   "instance": "ASTRALANE_AMS_MOCK",
+   "build": "abafe169e",
+   "thread": "NetworkTile",
+   "location": "bifrost-builder/src/relay.rs:74:9",
+   "message": "latest relay frame rejected: unsupported outer tag: 0 len=82"
+  },
+  {
+   "at": "2026-10-20 13:04:35",
+   "instance": "ASTRALANE_AMS_1",
+   "build": "e68b5c8a5",
+   "thread": "NetworkTile",
+   "location": "bifrost-builder/src/relay.rs:74:9",
+   "message": "latest relay frame rejected: unsupported outer tag: 0 len=82"
+  },
+  {
+   "at": "2026-10-20 13:09:00",
+   "instance": "ASTRALANE_AMS_MOCK",
+   "build": "abafe169e",
+   "thread": "NetworkTile",
+   "location": "bifrost-builder/src/relay.rs:74:9",
+   "message": "latest relay frame rejected: unsupported outer tag: 0 len=82"
+  },
+  {
+   "at": "2026-10-20 13:11:28",
+   "instance": "ASTRALANE_AMS_1",
+   "build": "e68b5c8a5",
+   "thread": "NetworkTile",
+   "location": "bifrost-builder/src/relay.rs:74:9",
+   "message": "latest relay frame rejected: unsupported outer tag: 0 len=82"
+  },
+  {
+   "at": "2026-10-20 13:16:10",
+   "instance": "ASTRALANE_AMS_1",
+   "build": "e68b5c8a5",
+   "thread": "NetworkTile",
+   "location": "bifrost-builder/src/relay.rs:74:9",
+   "message": "latest relay frame rejected: unsupported outer tag: 0 len=82"
+  },
+  {
+   "at": "2026-10-20 13:16:54",
+   "instance": "ASTRALANE_AMS_MOCK",
+   "build": "abafe169e",
+   "thread": "NetworkTile",
+   "location": "bifrost-builder/src/relay.rs:74:9",
+   "message": "latest relay frame rejected: unsupported outer tag: 0 len=82"
+  },
+  {
+   "at": "2026-10-20 13:21:48",
+   "instance": "ASTRALANE_AMS_MOCK",
+   "build": "abafe169e",
+   "thread": "NetworkTile",
+   "location": "bifrost-builder/src/relay.rs:74:9",
+   "message": "latest relay frame rejected: unsupported outer tag: 0 len=82"
+  },
+  {
+   "at": "2026-10-20 13:23:36",
+   "instance": "ASTRALANE_AMS_1",
+   "build": "e68b5c8a5",
+   "thread": "NetworkTile",
+   "location": "bifrost-builder/src/relay.rs:74:9",
+   "message": "latest relay frame rejected: unsupported outer tag: 0 len=82"
+  },
+  {
+   "at": "2026-10-20 13:31:04",
+   "instance": "ASTRALANE_AMS_1",
+   "build": "e68b5c8a5",
+   "thread": "NetworkTile",
+   "location": "bifrost-builder/src/relay.rs:74:9",
+   "message": "latest relay frame rejected: unsupported outer tag: 0 len=82"
+  },
+  {
+   "at": "2026-10-20 13:31:49",
+   "instance": "ASTRALANE_AMS_MOCK",
+   "build": "abafe169e",
+   "thread": "NetworkTile",
+   "location": "bifrost-builder/src/relay.rs:74:9",
+   "message": "latest relay frame rejected: unsupported outer tag: 0 len=82"
+  },
+  {
+   "at": "2026-10-20 13:36:21",
+   "instance": "ASTRALANE_AMS_1",
+   "build": "e68b5c8a5",
+   "thread": "NetworkTile",
+   "location": "bifrost-builder/src/relay.rs:74:9",
+   "message": "latest relay frame rejected: unsupported outer tag: 0 len=82"
+  },
+  {
+   "at": "2026-10-20 13:37:48",
+   "instance": "ASTRALANE_AMS_MOCK",
+   "build": "abafe169e",
+   "thread": "NetworkTile",
+   "location": "bifrost-builder/src/relay.rs:74:9",
+   "message": "latest relay frame rejected: unsupported outer tag: 0 len=82"
+  },
+  {
+   "at": "2026-10-20 13:41:51",
+   "instance": "ASTRALANE_AMS_1",
+   "build": "e68b5c8a5",
+   "thread": "NetworkTile",
+   "location": "bifrost-builder/src/relay.rs:74:9",
+   "message": "latest relay frame rejected: unsupported outer tag: 0 len=82"
+  },
+  {
+   "at": "2026-10-20 13:45:05",
+   "instance": "ASTRALANE_AMS_MOCK",
+   "build": "abafe169e",
+   "thread": "NetworkTile",
+   "location": "bifrost-builder/src/relay.rs:74:9",
+   "message": "latest relay frame rejected: unsupported outer tag: 0 len=82"
+  },
+  {
+   "at": "2026-10-20 13:46:51",
+   "instance": "ASTRALANE_AMS_1",
+   "build": "e68b5c8a5",
+   "thread": "NetworkTile",
+   "location": "bifrost-builder/src/relay.rs:74:9",
+   "message": "latest relay frame rejected: unsupported outer tag: 0 len=82"
+  },
+  {
+   "at": "2026-10-20 13:51:11",
+   "instance": "ASTRALANE_AMS_MOCK",
+   "build": "abafe169e",
+   "thread": "NetworkTile",
+   "location": "bifrost-builder/src/relay.rs:74:9",
+   "message": "latest relay frame rejected: unsupported outer tag: 0 len=82"
+  },
+  {
+   "at": "2026-10-20 13:51:49",
+   "instance": "ASTRALANE_AMS_1",
+   "build": "e68b5c8a5",
+   "thread": "NetworkTile",
+   "location": "bifrost-builder/src/relay.rs:74:9",
+   "message": "latest relay frame rejected: unsupported outer tag: 0 len=82"
+  },
+  {
+   "at": "2026-10-20 13:57:19",
+   "instance": "ASTRALANE_AMS_MOCK",
+   "build": "abafe169e",
+   "thread": "NetworkTile",
+   "location": "bifrost-builder/src/relay.rs:74:9",
+   "message": "latest relay frame rejected: unsupported outer tag: 0 len=82"
+  },
+  {
+   "at": "2026-10-20 13:57:34",
+   "instance": "ASTRALANE_AMS_1",
+   "build": "e68b5c8a5",
+   "thread": "NetworkTile",
+   "location": "bifrost-builder/src/relay.rs:74:9",
+   "message": "latest relay frame rejected: unsupported outer tag: 0 len=82"
+  },
+  {
+   "at": "2026-10-20 14:02:21",
+   "instance": "ASTRALANE_AMS_1",
+   "build": "e68b5c8a5",
+   "thread": "NetworkTile",
+   "location": "bifrost-builder/src/relay.rs:74:9",
+   "message": "latest relay frame rejected: unsupported outer tag: 0 len=82"
+  },
+  {
+   "at": "2026-10-20 14:02:52",
+   "instance": "ASTRALANE_AMS_MOCK",
+   "build": "abafe169e",
+   "thread": "NetworkTile",
+   "location": "bifrost-builder/src/relay.rs:74:9",
+   "message": "latest relay frame rejected: unsupported outer tag: 0 len=82"
+  },
+  {
+   "at": "2026-10-20 14:09:05",
+   "instance": "ASTRALANE_AMS_MOCK",
+   "build": "abafe169e",
+   "thread": "NetworkTile",
+   "location": "bifrost-builder/src/relay.rs:74:9",
+   "message": "latest relay frame rejected: unsupported outer tag: 6 len=747"
+  },
+  {
+   "at": "2026-10-21 14:35:29",
+   "instance": "ASTRALANE_AMS_MOCK",
+   "build": "abafe169e",
+   "thread": "NetworkTile",
+   "location": "bifrost-builder/src/relay.rs:74:9",
+   "message": "latest relay frame rejected: unsupported outer tag: 0 len=82"
+  },
+  {
+   "at": "2026-10-21 14:35:29",
+   "instance": "ASTRALANE_AMS_1",
+   "build": "e68b5c8a5",
+   "thread": "NetworkTile",
+   "location": "bifrost-builder/src/relay.rs:74:9",
+   "message": "latest relay frame rejected: unsupported outer tag: 0 len=82"
+  },
+  {
+   "at": "2026-10-22 21:50:39",
+   "instance": "ASTRALANE_FRA_MOCK_1",
+   "build": "4354acbf0",
+   "thread": "SchedulerTile<OrderMaxRewardPrio",
+   "location": "bifrost-builder/src/scheduler/commit.rs:540:13",
+   "message": "winner order bytes invariant failed: slot=460194216 index=0"
+  },
+  {
+   "at": "2026-10-26 22:34:02",
+   "instance": "ASTRALANE_FRA_MOCK_1",
+   "build": "4354acbf0",
+   "thread": "SchedulerTile<OrderMaxRewardPrio",
+   "location": "bifrost-builder/src/scheduler/commit.rs:540:13",
+   "message": "winner order bytes invariant failed: slot=461835072 index=0"
+  }
+ ]
+}

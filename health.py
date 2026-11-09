@@ -1,4 +1,6 @@
-"""Connector & relay health -- three questions, one builder at a time.
+"""The live cards of the bb health page's builder view (bbhealth.py) --
+three questions, one builder at a time. Was the "connector & relay health"
+page.
 
 Keyed by `instance_id` read live from ClickHouse rather than by the
 deployment config. That is the point of the rewrite: the old page could only
@@ -981,21 +983,6 @@ def _dur(sec):
     return f"{sec // 3600}h {(sec % 3600) // 60}m"
 
 
-def picker(insts, cur):
-    opts = []
-    for i in insts:
-        sel = " selected" if i["id"] == cur else ""
-        opts.append(f'<option value="{html.escape(i["id"])}"{sel}>'
-                    f'{html.escape(i["id"])}</option>')
-    # A bare select, not a form. Every builder's cards are already in the
-    # page, so choosing one is page state rather than a new address -- there
-    # is nothing to put in a URL and nothing to go and fetch.
-    return ('<div class="hsel"><label for=i>builder</label>'
-            '<select id=i>' + "".join(opts) + "</select>"
-            f'<span class="lagn">{len(insts)} builders &middot; all loaded'
-            "</span></div>")
-
-
 HEALTH_JS = r'''
 (function(){
   // The win-rate card's "hourly history": the chart lives in a full-width
@@ -1058,17 +1045,6 @@ HEALTH_JS = r'''
 })();
 
 (function(){
-  // Every builder's cards are already in the DOM -- one fleet-wide query
-  // per store built them all. Switching is show/hide: no request, and
-  // nothing that can wait on a store.
-  var sel = document.getElementById('i');
-  if (!sel) return;
-  sel.addEventListener('change', function(){
-    var panels = document.querySelectorAll('.bpanel');
-    for (var k = 0; k < panels.length; k++)
-      panels[k].hidden = panels[k].getAttribute('data-inst') !== sel.value;
-  });
-
   // One delegated listener on the document: the panels for every builder
   // are already in the DOM, so binding per bar would wire up six charts'
   // worth of handlers for the one chart on screen.
@@ -1606,76 +1582,82 @@ def relay_section(rq):
         "clock.</div>")
 
 
-def body(ch, ix, ot, relay, rpc_url, path):
-    try:
-        insts = instances(ch)
-    except Exception as exc:
-        return ('<div class="herr" style="margin:28px">the instance list '
-                "could not be read from ClickHouse: "
-                f"{html.escape(str(exc)[:200])}</div>")
-    if not insts:
-        return ('<div class="herr" style="margin:28px">The instance list came '
-                "back empty twice. bifrost_events returned no rows for the "
-                "last 24h, which is almost always the store blinking "
-                "rather than every builder being silent &mdash; "
-                f'<a href="{html.escape(path)}">try again</a>.</div>')
-    ids = [i["id"] for i in insts]
-    inst = DEFAULT_INSTANCE if DEFAULT_INSTANCE in ids else ids[0]
-
-    # Three fleet-wide fetches, whatever is on screen. Each store is asked
-    # once per page rather than once per builder per click.
+def _fleet(ch, ix, relay, rpc_url, ids):
+    """The fleet-wide fetches every panel reads: each store asked once per
+    page rather than once per builder per click."""
     def safe(fn):
         try:
             return fn(), None
         except Exception as exc:
             return {}, str(exc)[:200]
-    build, e1 = safe(lambda: building_all(ch, rpc_url, ids))
-    bank, e2 = safe(lambda: bank_feed_all(ix, ids))
-    rep, e6 = safe(lambda: shred_repairs_all(ix, ids))
-    pan, e3 = safe(lambda: restarts_all(ch, ids))
-    wr, e5 = safe(lambda: win_rates(relay))
-    hist, e4 = safe(lambda: restart_history(ch, ids))
+    jobs = {("build", "e1"): lambda: building_all(ch, rpc_url, ids),
+            ("bank", "e2"): lambda: bank_feed_all(ix, ids),
+            ("rep", "e6"): lambda: shred_repairs_all(ix, ids),
+            ("pan", "e3"): lambda: restarts_all(ch, ids),
+            ("wr", "e5"): lambda: win_rates(relay),
+            ("hist", "e4"): lambda: restart_history(ch, ids)}
+    f = {}
+    # in parallel: the six stores answer independently, and one after
+    # another they took ~19 s cold
+    with cf.ThreadPoolExecutor(max_workers=len(jobs)) as ex:
+        futs = {ex.submit(safe, fn): k for k, fn in jobs.items()}
+        for fut in cf.as_completed(futs):
+            (val, err), (vk, ek) = fut.result(), futs[fut]
+            f[vk], f[ek] = val, err
+    return f
 
+
+def _panel(i, f, hidden=False):
     def fail(name, err):
         return _card(name, "&mdash;", "dead", "", err=html.escape(err))
+    build, pan, wr, bank, rep, hist = (f["build"], f["pan"], f["wr"],
+                                       f["bank"], f["rep"], f["hist"])
+    # Two rows, fixed columns rather than auto-fit: is-it-working on
+    # top, the slot-timing pair underneath. auto-fit would reflow them
+    # into one ragged line the moment the window was wide enough.
+    row1 = [
+        build.get(i) and building_card(build[i]) or
+        fail("building", f["e1"] or "no data for this builder"),
+        pan.get(i) and restart_card(pan[i]) or
+        fail("restarts today", f["e3"] or "no data for this builder"),
+        (winrate_card(dict(wr[i], builder=i) if wr.get(i) else None,
+                      {b: dict(v, builder=b) for b, v in wr.items()})
+         if wr or not f["e5"] else
+         fail(f"win rate &mdash; last {WINRATE_HOURS}h", f["e5"])),
+    ]
+    row2 = [
+        bank.get(i) and bank_card(bank[i]) or
+        fail("replay", f["e2"] or "no data for this builder"),
+        rep.get(i) and repair_card(rep[i]) or
+        fail(f"shreds &mdash; repaired per slot, {SHRED_REPAIR_DAYS}d",
+             f["e6"] or "no data for this builder"),
+    ]
+    return (
+        f'<div class="bpanel" data-inst="{html.escape(i)}"'
+        + (" hidden" if hidden else "") + ">"
+        + '<h2 class="hsec">builder health</h2>'
+        + f'<div class="hgrid g3">{"".join(row1)}</div>'
+        + f'<div class="wrh" data-b="{html.escape(i)}" data-loaded="0" '
+        'hidden></div>'
+        + f'<div class="hgrid g2">{"".join(row2)}</div>'
+        + '<h2 class="hsec">restarts, last '
+        + f"{PANIC_DAYS} days</h2>"
+        + (restart_chart(i, hist[i]) if hist.get(i) else
+           f'<div class="herr" style="padding:0 28px">{html.escape(f["e4"] or "")}'
+           "</div>")
+        + "</div>")
 
-    panels = []
-    for i in ids:
-        # Two rows, fixed columns rather than auto-fit: is-it-working on
-        # top, the slot-timing pair underneath. auto-fit would reflow them
-        # into one ragged line the moment the window was wide enough.
-        row1 = [
-            build.get(i) and building_card(build[i]) or
-            fail("building", e1 or "no data for this builder"),
-            pan.get(i) and restart_card(pan[i]) or
-            fail("restarts today", e3 or "no data for this builder"),
-            (winrate_card(dict(wr[i], builder=i) if wr.get(i) else None,
-                          {b: dict(v, builder=b) for b, v in wr.items()})
-             if wr or not e5 else
-             fail(f"win rate &mdash; last {WINRATE_HOURS}h", e5)),
-        ]
-        row2 = [
-            bank.get(i) and bank_card(bank[i]) or
-            fail("replay", e2 or "no data for this builder"),
-            rep.get(i) and repair_card(rep[i]) or
-            fail(f"shreds &mdash; repaired per slot, {SHRED_REPAIR_DAYS}d",
-                 e6 or "no data for this builder"),
-        ]
-        panels.append(
-            f'<div class="bpanel" data-inst="{html.escape(i)}"'
-            + ("" if i == inst else " hidden") + ">"
-            + '<h2 class="hsec">builder health</h2>'
-            + f'<div class="hgrid g3">{"".join(row1)}</div>'
-            + f'<div class="wrh" data-b="{html.escape(i)}" data-loaded="0" '
-            'hidden></div>'
-            + f'<div class="hgrid g2">{"".join(row2)}</div>'
-            + '<h2 class="hsec">restarts, last '
-            + f"{PANIC_DAYS} days</h2>"
-            + (restart_chart(i, hist[i]) if hist.get(i) else
-               f'<div class="herr" style="padding:0 28px">{html.escape(e4 or "")}'
-               "</div>")
-            + "</div>")
-    return (picker(insts, inst) + "".join(panels)
-            + '<h2 class="hsec">relay health</h2>' + relay_section(relay)
+
+def builder_live(ch, ix, relay, rpc_url, inst):
+    """The live cards for one builder, as the old page showed them: is it
+    building, restarts today, win rate, replay (bank feed), shreds, and the
+    restart history. Used by the bb health page's builder view."""
+    try:
+        ids = [i["id"] for i in instances(ch)]
+    except Exception:
+        ids = []
+    if inst not in ids:
+        ids.append(inst)
+    return (_panel(inst, _fleet(ch, ix, relay, rpc_url, ids))
             + "<script>" + HEALTH_JS.replace("__PLOTLY_CDN__", PLOTLY_CDN)
             + "</script>")

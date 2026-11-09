@@ -722,6 +722,63 @@ rounds, extends, the simulator's DAG, the shred path, our logs — because for
 this builder none of it was ever written. Those tabs say exactly that instead of
 rendering an empty frame that reads as a fault.
 
+## BB health — `/tech/health`
+
+Was "connector & relay health". One builder, connector or relay at a time
+(`?kind=builder|connector|relay&id=…`), every number computed for a window
+(`win` = today, 1 h, 6 h, 24 h, 3 d, 7 d; `end` optional, UTC) and for a
+baseline of the same length (`vs` = `prev`, `day` or `week`). Each KPI tile
+shows the change and colours it green (better) or red (worse); each chart
+draws the baseline dashed on the window's clock. Code in `bbhealth.py`.
+
+- **builder**: the old page's live cards (building, restarts, win rate,
+  replay/bank feed, shreds, restart history), then from the relay's round
+  log win rate, reward per round offered, gap to the winner in lost rounds,
+  rejections and time to first offer; simulator replay / commit / extend /
+  probe `body_us` p50, p99 and mean from Influx; restarts, relay
+  disconnects, extend refusals, probe failures and flow from
+  `bifrost_events`. Panics are read from the first source that answers:
+  `otel_logs` (needs `OTEL_URL` / `OTEL_USER` / `OTEL_PASS`). The panic
+  hook's own `panic: …` line never ships (the process aborts a second later),
+  so a panic is the panic site's ERROR line followed within 10 s by a
+  `starting bifrost builder` line; that matched `#bb-alerts` on all 54 panics
+  10-17 → 11-09, and a start with no ERROR line before it is shown as a
+  restart with no error (deploy or kill). Fallback: `#bb-alerts`, where every builder panic
+  is posted as `[INSTANCE build] ERROR panic: thread=… location=… message=…`
+  (the otel store that used to hold them has had no working login since
+  2026-10-17). Set `SLACK_BOT_TOKEN` (a bot with `channels:history`, invited
+  to the channel) and optionally `BB_ALERTS_CHANNEL` (default `C0BVA8EDHMX`)
+  to read it live. Without the token the page reads `panics.json`, a snapshot
+  of every panic line in the channel (10-07 → 11-09 09:15Z, 100 panics), and
+  counts any restart after the snapshot as an "exit not yet classified".
+- **connector**: heartbeat gaps over 15 s in `solana.slot_info` (when it
+  disconnected and for how long), relay handshakes, leader slots from
+  `getLeaderSchedule` against `solana.block_summary` (skipped slots), fallback
+  blocks (produced in a slot none of our builders offered on, split into
+  "no round opened" and "rounds, we did not bid"), the relay's rounds for it,
+  and the Firedancer report's daily avg reward / fee / tips / skip rate.
+- **relay**: liveness of every relay, then rounds, connectors, our and
+  Titan's win rates, reward per round, our rejections by reason, handshakes.
+
+Every view opens with a **data freshness** row (newest row in each store it
+reads), the bucket can be forced (`bucket` = 5, 15, 30, 60, 120 or 360 min;
+auto otherwise), and every chart has a **⬇ CSV** button with its points.
+
+The page shell (sidebar with favourites, KPI tiles, info boxes, expanders,
+the Plotly chart grid) lives in `ui.py` and follows the BI dashboard in
+`astralane-quant/python/bi_dashboard`. Favourites are per browser
+(localStorage).
+
+## System — `/system/freshness`, `/system/about`
+
+From the BI dashboard's System section. **Freshness**: the newest row in
+every store the dashboard reads (bifrost_events and bifrost_miniblocks per
+builder, the relay's tables per relay, block_summary, slot_info, Influx per
+simulator host, the Firedancer report, the panic snapshot), its age, a
+fresh / behind / stale verdict against that store's cadence, and how long
+the read took. **About**: the build, the stores each page reads, and the
+known caveats. Code in `system.py`.
+
 ## Validator comparison — `/econ/validator-comparison`
 
 One of our GBX validators against one other validator of similar stake, per
