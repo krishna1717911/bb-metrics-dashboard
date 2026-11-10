@@ -3774,6 +3774,17 @@ def _stale_mark(lag):
     return lag.strftime("%Y-%m-%d %H:%M UTC") if old else ""
 
 
+def _export_tag(r):
+    """File-name part: the range, plus the validator when the page is
+    filtered to one (the export covers exactly what the page shows)."""
+    tag = re.sub(r"[^0-9a-zA-Z]+", "-", r["label"]).strip("-")
+    if r.get("connector"):
+        tag += "_" + r["connector"][:8]
+    elif r.get("region", "all") not in ("", "all"):
+        tag += "_" + r["region"]
+    return tag
+
+
 def scan_misses(relay_q, ch, rpc_url, r, on_step=lambda _m: None):
     """Every unlanded winner order across the whole range -> a CSV file.
 
@@ -3785,7 +3796,8 @@ def scan_misses(relay_q, ch, rpc_url, r, on_step=lambda _m: None):
     """
     on_step("reading the chosen rounds")
     rounds_, _shown, total = rounds(relay_q, r, cap=EXPORT_MAX_SLOTS,
-                                    region=r.get("region", "all"))
+                                    region=r.get("region", "all"),
+                                    connector=r.get("connector", ""))
     if not rounds_:
         raise RuntimeError("the relay recorded no chosen round in this range")
     lag = relay_tx_lag(relay_q)
@@ -3861,7 +3873,7 @@ def scan_misses(relay_q, ch, rpc_url, r, on_step=lambda _m: None):
     miss.sort(key=lambda x: (x["slot"], x["round"], x["order_index"]))
     os.makedirs(EXPORT_DIR, exist_ok=True)
     name = ("misses_%s_%s.csv"
-            % (re.sub(r"[^0-9a-zA-Z]+", "-", r["label"]).strip("-"),
+            % (_export_tag(r),
                dt.datetime.now(dt.UTC).strftime("%Y%m%d-%H%M%S")))
     path = os.path.join(EXPORT_DIR, name)
     with open(path, "w", newline="") as fh:
@@ -3897,7 +3909,8 @@ def scan_selection(relay_q, ch, rpc_url, r, on_step=lambda _m: None):
     hold, and the ingested_at bound is what keeps each relay read fast."""
     on_step("reading the chosen rounds")
     rounds_, _shown, total = rounds(relay_q, r, cap=EXPORT_MAX_SLOTS,
-                                    region=r.get("region", "all"))
+                                    region=r.get("region", "all"),
+                                    connector=r.get("connector", ""))
     if not rounds_:
         raise RuntimeError("the relay recorded no chosen round in this range")
     lag = relay_tx_lag(relay_q)
@@ -3923,7 +3936,7 @@ def scan_selection(relay_q, ch, rpc_url, r, on_step=lambda _m: None):
                             x["verdict"], str(x["order_index"])))
     os.makedirs(EXPORT_DIR, exist_ok=True)
     name = ("selection_%s_%s.csv"
-            % (re.sub(r"[^0-9a-zA-Z]+", "-", r["label"]).strip("-"),
+            % (_export_tag(r),
                dt.datetime.now(dt.UTC).strftime("%Y%m%d-%H%M%S")))
     path = os.path.join(EXPORT_DIR, name)
     with open(path, "w", newline="") as fh:
