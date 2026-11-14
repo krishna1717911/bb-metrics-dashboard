@@ -1046,7 +1046,8 @@ ACCEPTED = "('best', 'not_best', 'tail')"
 
 SEL_COLS = ["kind", "received_by_us",
             "fee", "tip", "reward", "jito_raw", "jito_weight_bps",
-            "wait_us",
+            "wait_us", "titan_off_ms", "titan_off_err_ms", "titan_off_on",
+            "titan_first_by",
             "slot", "round", "connector", "won_by", "we_won",
             "our_builder", "titan_builder", "builder_id", "verdict",
             "type", "signature", "sigprefix", "bundle_id",
@@ -1181,8 +1182,12 @@ SCHED_EVENTS = ("dropped", "check_dropped", "winner_order_refused",
                 "bundle_selection")
 
 
-def scheduler_notes(ch, entities, lo=None, hi=None):
+def scheduler_notes(ch, entities, lo=None, hi=None, kind=None):
     """Why the scheduler turned an order away -> {entity: [note, ...]}.
+
+    `kind` narrows to one entity_kind ('tx' / 'bundle'): a member's
+    SigPrefix as a tx entity is the plain copy of that transaction, the
+    one that arrived on its own, not the bundle it is also inside.
 
     `entity` is the 22-char SigPrefix for a transaction and the bare hex
     bundle id for a bundle, so both sides of an expanded bundle row can be
@@ -1204,21 +1209,24 @@ def scheduler_notes(ch, entities, lo=None, hi=None):
     tb = (f"ts >= '{lo:{f}}' AND ts <= '{hi:{f}}' AND " if lo and hi
           else "ts > now() - INTERVAL 2 HOUR AND ")
     evs = ", ".join("'%s'" % e for e in SCHED_EVENTS)
+    kf = f"  AND entity_kind = '{_q(kind)}' " if kind else ""
     for i in range(0, len(ents), ENTITY_BATCH):
         lst = ", ".join("'%s'" % _q(e) for e in ents[i:i + ENTITY_BATCH])
         try:
             _, rows = ch(
                 "SELECT entity, toString(ts) AS at, instance_id, event, "
-                "  reason, toJSONString(attrs) AS a, toJSONString(nums) AS n "
+                "  reason, toJSONString(attrs) AS a, toJSONString(nums) AS n, "
+                "  entity_kind "
                 f"FROM bifrost_events WHERE {tb}stage = 'scheduler' "
-                f"  AND event IN ({evs}) AND entity IN ({lst}) "
+                f"  AND event IN ({evs}) AND entity IN ({lst}) {kf}"
                 "ORDER BY entity, ts")
         except Exception:
             continue
-        for ent, at, inst, ev, rsn, a, n in rows:
+        for ent, at, inst, ev, rsn, a, n, ek in rows:
             out.setdefault(ent, []).append({
                 "at": at or "", "instance": inst or "", "event": ev or "",
-                "reason": rsn or "", "attrs": a or "{}", "nums": n or "{}"})
+                "reason": rsn or "", "attrs": a or "{}", "nums": n or "{}",
+                "kind": ek or ""})
     return out
 
 
@@ -1357,12 +1365,19 @@ def attach_member_recv(ch, rows, marks, lo=None, hi=None):
     member's SigPrefix as an entity, i.e. the transaction arriving on its
     own (the relay's feed, mostly), not inside this bundle. `recv_alone`
     is [(instance, ms after that instance's round_started or None,
-    event)], one per instance that logged it; empty = never alone."""
+    event)], one per instance that logged it; empty = never alone.
+
+    `sched_alone` is the same copy's later life: every SCHED_EVENTS row
+    the scheduler wrote with the member's SigPrefix as a tx entity
+    (entity_kind = 'tx' -- the bundle's own rows carry the bundle id and
+    sit on the parent row), as [(instance, ms after that instance's
+    round_started or None, note)] in time order; empty = nothing logged."""
     pfx = {m["prefix"] for x in rows for m in (x.get("members") or [])
            if m.get("prefix")}
     if not pfx:
         return rows
     got = received_events(ch, pfx, lo, hi)
+    notes = scheduler_notes(ch, pfx, lo, hi, kind="tx")
     for x in rows:
         for m in x.get("members") or []:
             out = []
@@ -1371,6 +1386,13 @@ def attach_member_recv(ch, rows, marks, lo=None, hi=None):
                 after = _ms(mk["open"], ev["at"]) if "open" in mk else None
                 out.append((inst, after, ev))
             m["recv_alone"] = out
+            sched = []
+            for n in notes.get(m.get("prefix")) or []:
+                mk = marks.get((n["instance"], int(x["round"]))) or {}
+                after = _ms(mk["open"], n["at"]) if "open" in mk else None
+                sched.append((n["instance"], after, n))
+            sched.sort(key=lambda z: z[2]["at"])
+            m["sched_alone"] = sched
     return rows
 
 
@@ -1401,6 +1423,9 @@ def attach_recv(ch, rows, slot, lo=None, hi=None, round_of=lambda x: x["round"],
                     got[inst] = (t, w, src, kind)
         # any builder instance at all, round marks or not: "did we get it"
         x["received_by_us"] = bool(got)
+        # the raw admission stamp per instance, on that instance's clock --
+        # titan_off puts it on the relay's clock
+        x["recv_at"] = {inst: v[0] for inst, v in got.items()}
         rec = {}
         for inst, (t, w, src, kind) in got.items():
             m = marks.get((inst, int(round_of(x))))
@@ -1452,6 +1477,222 @@ def _recv_cells(x, prefer=None):
     return (cell(after, " neg" if after < 0 else " pos")
             + cell(before, " neg" if before is not None and before < 0 else "")
             + wcell)
+
+
+# ------------------------------------------------------------- titan_off
+#
+# How long after we admitted an order Titan first offered it:
+#
+#   titan_off = Titan's first offer carrying the signature (relay clock)
+#               - our scheduler/received for it (builder clock -> relay clock)
+#
+# Titan's side is mini_block_transactions_v2.ingested_at, which is the
+# relay's `submitted` stamp for that offer to the microsecond (checked
+# 2026-11-14 on every uuid of a 5-min sample). "First" = earliest TITAN_*
+# offer on the round's connector in this slot or the three before it (one
+# leader window): an order Titan put up in an earlier round counts from
+# then, not from the round it finally won.
+#
+# Our side is on the admitting builder's own clock, which is NOT the
+# relay's: FRA_1 ran 13-18 s behind it in early November and drifted 20 ppm
+# until builder #139; it is within 0.3 ms today. So every value is
+# corrected by the relay - builder offset measured AROUND THAT ADMISSION,
+# two-sided, per 20 s bucket:
+#   upper = min(relay `submitted` - our `selected` row)  over our offers
+#           (offset + uplink latency  >= offset)
+#   lower = max(relay `round_chosen` - our `winner` row) over the rounds
+#           (offset - downlink latency <= offset)
+# midpoint = offset, half the gap = the error bar shown on hover. A bucket
+# missing a bound widens to the neighbours (up to +-40 s); a pair that
+# crosses means the clock moved inside the span, and no value is better
+# than a wrong one.
+
+TITAN_LOOKBACK_SLOTS = 3
+SKEW_BUCKET_US = 20_000_000
+SKEW_WIDEN = 2                  # buckets each side, at most
+_EPOCH = dt.datetime(1970, 1, 1)
+
+
+def _us(t):
+    """ClickHouse timestamp string (UTC) -> epoch microseconds."""
+    try:
+        d = dt.datetime.fromisoformat(str(t)[:26])
+    except (ValueError, TypeError):
+        return None
+    return (d.replace(tzinfo=None) - _EPOCH) // dt.timedelta(microseconds=1)
+
+
+def _ts(us):
+    return (_EPOCH + dt.timedelta(microseconds=us)).strftime(
+        "%Y-%m-%d %H:%M:%S")
+
+
+def _pfx_hex(p):
+    try:
+        raw = b58decode(p)
+    except Exception:
+        return ""
+    return raw.hex().upper() if len(raw) == 16 else ""
+
+
+def titan_first_offers(relay_q, rows, window=None):
+    """{(connector, prefix hex): [(slot, relay us, builder, round)]} --
+    per slot, the earliest TITAN_* offer carrying the transaction."""
+    want = {}
+    for x in rows:
+        h = _pfx_hex(x.get("sigprefix") or "")
+        if h and x.get("connector"):
+            w = want.setdefault(x["connector"], [set(), [], []])
+            w[0].add(h)
+            w[1].append(int(x["slot"]))
+    out = {}
+    tb = ""
+    if window and window[0] and window[1]:
+        f = "%Y-%m-%d %H:%M:%S"
+        tb = (f"ingested_at >= '{window[0]:{f}}' "
+              f"AND ingested_at <= '{window[1]:{f}}' AND ")
+    for conn, (hs, slots, _) in want.items():
+        if not PUBKEY_RE.match(conn):
+            continue
+        hs = sorted(hs)
+        lo, hi = min(slots) - TITAN_LOOKBACK_SLOTS, max(slots)
+        for i in range(0, len(hs), ENTITY_BATCH):
+            lst = ", ".join(f"unhex('{h}')" for h in hs[i:i + ENTITY_BATCH])
+            _, got = relay_q(
+                "SELECT hex(substring(signature, 1, 16)) AS h, slot, "
+                "  toUnixTimestamp64Micro(min(ingested_at)) AS t_first, "
+                "  argMin(builder_id, ingested_at) AS b_first, "
+                "  argMin(index_in_slot, ingested_at) AS r_first "
+                "FROM relay.mini_block_transactions_v2 "
+                f"WHERE {tb}connector_identity = '{conn}' "
+                f"  AND slot BETWEEN {lo} AND {hi} "
+                "  AND startsWith(builder_id, 'TITAN') "
+                f"  AND substring(signature, 1, 16) IN ({lst}) "
+                "GROUP BY h, slot")
+            for h, sl, t, b, r in got:
+                out.setdefault((conn, str(h).upper()), []).append(
+                    (int(sl), int(t), b or "", int(r or 0)))
+    return out
+
+
+def relay_offsets(relay_q, ch, insts, lo_us, hi_us):
+    """-> offset(inst, at_us) -> (relay - builder us, error us) or None.
+    See the block comment above for the two bounds."""
+    insts = sorted({i for i in insts if i and re.match(r"^[A-Z0-9_]+$", i)})
+    if not insts:
+        return lambda _i, _t: None
+    il = ", ".join(f"'{i}'" for i in insts)
+    _, ours = ch(
+        "SELECT instance_id, kind, toString(uuid), "
+        "  toUnixTimestamp64Micro(min(ts)) "
+        f"FROM bifrost_miniblocks WHERE ts >= '{_ts(lo_us)}' "
+        f"  AND ts <= '{_ts(hi_us)}' AND instance_id IN ({il}) "
+        "  AND kind IN ('selected', 'winner') "
+        "GROUP BY instance_id, kind, uuid")
+    # the relay side is padded: its clock is the one we are measuring
+    # against, and our stamps were as much as ~20 s off in the past
+    _, rel = relay_q(
+        "SELECT toString(mini_block_uuid) AS u, event, "
+        "  toUnixTimestamp64Micro(min(timestamp)) AS t_first "
+        "FROM relay.mini_block_events_v2 "
+        f"WHERE timestamp >= '{_ts(lo_us - 60_000_000)}' "
+        f"  AND timestamp <= '{_ts(hi_us + 60_000_000)}' "
+        f"  AND (event = 'round_chosen' OR (event = 'submitted' "
+        f"       AND builder_id IN ({il}))) GROUP BY u, event")
+    sub = {u: int(t) for u, e, t in rel if e == "submitted"}
+    cho = {u: int(t) for u, e, t in rel if e == "round_chosen"}
+    up, lw = {}, {}
+    for inst, kind, u, t in ours:
+        t = int(t)
+        k = (inst, t // SKEW_BUCKET_US)
+        if kind == "selected" and u in sub:
+            up[k] = min(up.get(k, sub[u] - t), sub[u] - t)
+        elif kind == "winner" and u in cho:
+            lw[k] = max(lw.get(k, cho[u] - t), cho[u] - t)
+
+    def offset(inst, at_us):
+        b = at_us // SKEW_BUCKET_US
+        for w in range(SKEW_WIDEN + 1):
+            us = [up[(inst, b + d)] for d in range(-w, w + 1)
+                  if (inst, b + d) in up]
+            ls = [lw[(inst, b + d)] for d in range(-w, w + 1)
+                  if (inst, b + d) in lw]
+            if not us or not ls:
+                continue
+            u, l = min(us), max(ls)
+            if l > u:
+                return None
+            return ((u + l) / 2.0, (u - l) / 2.0)
+        return None
+    return offset
+
+
+def attach_titan_off(relay_q, ch, rows, window=None):
+    """x["titan_off"] = {ms, err, inst, by, slot, round, off} or None,
+    with x["titan_off_why"] saying why it is blank."""
+    for x in rows:
+        x["titan_off"], x["titan_off_why"] = None, ""
+    rows = [x for x in rows if x.get("sigprefix")]
+    if not rows:
+        return
+    firsts = titan_first_offers(relay_q, rows, window)
+    ats = [(inst, _us(t)) for x in rows
+           for inst, t in (x.get("recv_at") or {}).items()]
+    ats = [(i, t) for i, t in ats if t is not None]
+    offset = (relay_offsets(relay_q, ch, {i for i, _ in ats},
+                            min(t for _, t in ats) - 60_000_000,
+                            max(t for _, t in ats) + 60_000_000)
+              if ats else (lambda _i, _t: None))
+    for x in rows:
+        sl = int(x["slot"])
+        cand = [e for e in firsts.get((x.get("connector"),
+                                       _pfx_hex(x["sigprefix"])), [])
+                if sl - TITAN_LOOKBACK_SLOTS <= e[0] <= sl]
+        if not cand:
+            x["titan_off_why"] = (f"no Titan offer carried it in slots "
+                                  f"{sl - TITAN_LOOKBACK_SLOTS}-{sl}")
+            continue
+        tslot, tus, tby, tround = min(cand, key=lambda e: e[1])
+        rec = {i: _us(t) for i, t in (x.get("recv_at") or {}).items()}
+        rec = {i: t for i, t in rec.items() if t is not None}
+        if not rec:
+            x["titan_off_why"] = ("Titan offered it, but no builder of "
+                                  "ours logged scheduler/received for it")
+            continue
+        # the row's own builder first, then by admission time
+        b = x.get("our_builder")
+        order = ([b] if b in rec else []) + sorted(
+            (i for i in rec if i != b), key=lambda i: rec[i])
+        for inst in order:
+            off = offset(inst, rec[inst])
+            if off is None:
+                continue
+            x["titan_off"] = {
+                "ms": (tus - off[0] - rec[inst]) / 1000.0,
+                "err": off[1] / 1000.0, "off": off[0] / 1000.0,
+                "inst": inst, "by": tby, "slot": tslot, "round": tround}
+            break
+        else:
+            x["titan_off_why"] = ("no clock bound for "
+                                  + ", ".join(order) + " around its "
+                                  "admission (no matched offer/winner pair)")
+
+
+def _toff_cell(x):
+    t = x.get("titan_off")
+    if not t:
+        why = html.escape(x.get("titan_off_why") or "", quote=True)
+        return f'<td class="n dim" title="{why}">&mdash;</td>'
+    title = html.escape(
+        f"{t['by']} first offered it in {t['slot']}/{t['round']}, "
+        f"{t['ms']:+.1f} ms after {t['inst']} admitted it "
+        f"(relay - {t['inst']} clock {t['off']:+.2f} +- {t['err']:.2f} ms, "
+        "already applied). Negative = Titan offered it before we had it.",
+        quote=True)
+    pm = (f'<span class="dim"> &plusmn;{t["err"]:.0f}</span>'
+          if t["err"] >= 1 else "")
+    return (f'<td class="n m {"neg" if t["ms"] < 0 else "pos"}" '
+            f'title="{title}">{t["ms"]:+.1f}{pm}</td>')
 
 
 # ------------------------------------------- our own API's view of an order
@@ -1634,7 +1875,7 @@ def _sched_label(k):
 def _kind_mix(group, verdict="titan_inc_not_us"):
     """One line: what share of this verdict's rows were bundle / txn,
     and how many of them any builder of ours received."""
-    rows = [i for i in group if i["verdict"] == verdict]
+    rows = _units([i for i in group if i["verdict"] == verdict])
     if not rows:
         return ""
     n = len(rows)
@@ -1644,7 +1885,8 @@ def _kind_mix(group, verdict="titan_inc_not_us"):
         f'<span class="kd {k}">{k}</span> {c[k]:,} ({100 * c[k] / n:.0f}%)'
         for k in ("txn", "bundle") if c[k])
     return (f'<div class="selcnt"><span class="vd ti">{verdict}</span> '
-            f"by type: {mix} &middot; received by us "
+            f"by type: {mix} <span class=\"dim\">(a bundle counts once)</span>"
+            " &middot; received by us "
             f'<b>{got:,}</b> of {n:,} ({100 * got / n:.0f}%) '
             '<span class="dim">(a scheduler/received on any builder of '
             "ours, for the tx or its bundle)</span></div>")
@@ -1654,8 +1896,9 @@ def _sel_filters(rows):
     """Per-slot filters over every diff row: verdict, kind, and what the
     scheduler said -- each option with its count. Applied in the browser
     (ACCURACY_JS); while one is set the 40-row cap is lifted."""
-    real = [i for i in rows
-            if i["verdict"] in ("titan_inc_not_us", "us_inc_not_titan")]
+    real = _units([i for i in rows
+                   if i["verdict"] in ("titan_inc_not_us",
+                                       "us_inc_not_titan")])
     if not real:
         return ""
     vc = collections.Counter(i["verdict"] for i in real)
@@ -2021,6 +2264,12 @@ def selection_diff(relay_q, ch, rounds_, window, blocks=None,
         marks = round_marks(ch, sl, lo, hi)
         attach_recv(ch, part, sl, lo, hi, marks=marks)
         attach_member_recv(ch, part, marks, lo, hi)
+    try:
+        attach_titan_off(relay_q, ch, flat_rows, window)
+    except Exception as exc:
+        for x in flat_rows:
+            x["titan_off"] = None
+            x["titan_off_why"] = f"could not be read: {str(exc)[:120]}"
     for x in flat_rows:
         x["kind"] = ("bundle" if x.get("bundle_id") or x.get("type") == "bundle"
                      else "txn")
@@ -2028,7 +2277,15 @@ def selection_diff(relay_q, ch, rounds_, window, blocks=None,
 
 
 def _sel_flat(x, col):
-    """The three scheduler columns and wait_us are derived, not stored."""
+    """The three scheduler columns, wait_us and titan_off are derived,
+    not stored."""
+    if col.startswith("titan_off") or col == "titan_first_by":
+        t = x.get("titan_off")
+        if not t:
+            return ""
+        return {"titan_off_ms": round(t["ms"], 3),
+                "titan_off_err_ms": round(t["err"], 3),
+                "titan_off_on": t["inst"], "titan_first_by": t["by"]}[col]
     if col == "wait_us":
         rec = x.get("recv") or {}
         if not rec:
@@ -2440,13 +2697,83 @@ def _row_copy(i, kind):
     rnd = lambda v: None if v is None else round(v, 1)
     return json.dumps({
         "type": kind, "signature": i["signature"], "sigprefix": i["sigprefix"],
+        "signatures": [r["signature"] for r in i.get("_rows") or [i]],
         "bundle_id": i["bundle_id"] or "", "landed": i["landed"] or "",
         "reward": "" if i.get("reward") is None else i["reward"],
         "recv_open": rnd(after), "win_recv": rnd(before), "wait_us": wait,
         "recv_on": inst.replace("ASTRALANE_", ""), "verdict": i["verdict"],
+        "titan_off_ms": (round(i["titan_off"]["ms"], 1)
+                         if i.get("titan_off") else None),
+        "titan_first_by": (i["titan_off"]["by"] if i.get("titan_off")
+                           else None),
         "scheduler": "; ".join(e + (f" {r}" if r else "")
                                for e, r in _sched_pairs(i)),
         "slot": i["slot"], "rn": i["round"]}, separators=(",", ":"))
+
+
+def _units(rows):
+    """Diff rows -> display rows: a bundle is ONE row, not one per member.
+
+    The diff is per signature (see _sel_rows) and the CSV stays that way;
+    on screen, every member row of the same bundle on the same side
+    collapses into one, which shows the bundle's FIRST transaction and
+    opens the rest. Sums and unions are over the members that are in the
+    diff; the panel lists every member, in-diff or not."""
+    out, at = [], {}
+    for i in rows:
+        b = i.get("bundle_id")
+        if not b or i["verdict"] not in ("titan_inc_not_us",
+                                         "us_inc_not_titan"):
+            out.append(i)
+            continue
+        k = (i["verdict"], i.get("our_builder"), b)
+        if k in at:
+            at[k]["_rows"].append(i)
+            continue
+        at[k] = dict(i, _rows=[i])
+        out.append(at[k])
+    for u in at.values():
+        rs = sorted(u["_rows"], key=lambda r: (r["bundle_tx_index"] is None,
+                                               r["bundle_tx_index"] or 0))
+        u["_rows"] = rs
+        first = (u.get("members") or [None])[0] or {
+            "sig": rs[0]["signature"], "prefix": rs[0]["sigprefix"]}
+        u["signature"], u["sigprefix"] = first["sig"], first["prefix"]
+        u["order_index"] = min(r["order_index"] for r in rs)
+        marks = {r["landed"] for r in rs}
+        u["landed"] = (marks.pop() if len(marks) == 1 else
+                       ("partial" if "yes" in marks else ""))
+        priced = [r for r in rs if r.get("reward") not in ("", None)]
+        if priced:
+            u["fee"] = sum(int(r["fee"] or 0) for r in priced)
+            u["tip"] = sum(int(r["tip"] or 0) for r in priced)
+            u["jito_raw"] = sum(int(r.get("jito_raw") or 0) for r in priced)
+            u["reward"] = sum(int(r["reward"] or 0) for r in priced)
+            u["priced"] = ("bytes" if all(r.get("priced") == "bytes"
+                                          for r in priced) else "")
+            u["tip_lower_bound"] = any(r.get("tip_lower_bound")
+                                       for r in priced)
+        else:
+            u["reward"] = ""
+        seen, sched = set(), []
+        for r in rs:
+            for n in r.get("sched") or []:
+                key = (n["instance"], n["event"], n["reason"], n["at"])
+                if key not in seen:
+                    seen.add(key)
+                    sched.append(n)
+        u["sched"] = sched
+        u["received_by_us"] = any(r.get("received_by_us") for r in rs)
+        # the earliest Titan offer of any member: Titan offers a bundle
+        # whole, so this is normally every member's value anyway
+        offs = [r for r in rs if r.get("titan_off")]
+        if offs:
+            u["titan_off"] = min((r["titan_off"] for r in offs),
+                                 key=lambda t: t["ms"])
+        else:
+            u["titan_off_why"] = next((r.get("titan_off_why") for r in rs
+                                       if r.get("titan_off_why")), "")
+    return out
 
 
 def _sel_table(group):
@@ -2458,9 +2785,11 @@ def _sel_table(group):
            '<th class="n" title="ms from this round&#39;s round_started to the builder admitting the order (scheduler/received), same clock; negative = it arrived before the round opened">recv +open</th>'
            '<th class="n" title="ms from the builder admitting the order to that builder&#39;s own winner row (bifrost_miniblocks kind = winner) for this slot and round, same clock">win &minus;recv</th>'
            '<th class="n" title="the relay&#39;s hold on the order (scheduler/received nums wait_us), ms: the builder may not extend it before admission + wait. 0 = no hold (votes, non-nonce bundles, searcher flow); blank = not logged">wait</th>'
+           '<th class="n" title="titan_off: ms from our builder admitting the order (scheduler/received) to Titan&#39;s FIRST offer carrying it on this connector, this slot or the 3 before (relay submitted stamp). Our stamp is moved onto the relay clock with the relay - builder offset measured around that moment (two-sided bound, error on hover). Negative = Titan offered it before we had it">titan off</th>'
            "<th>scheduler said</th></tr>"]
-    real = [i for i in group
-            if i["verdict"] not in ("no_accepted_offer", "no_content")]
+    real = _units([i for i in group
+                   if i["verdict"] not in ("no_accepted_offer",
+                                           "no_content")])
     shown = _sel_show(group)
     front = {id(i) for i in shown}
     # the capped order first, then everything else -- hidden, not dropped
@@ -2471,15 +2800,22 @@ def _sel_table(group):
         bid = (copy_val(i["bundle_id"], i["bundle_id"][:12] + "\u2026")
                if i["bundle_id"] else '<span class="dim">&mdash;</span>')
         bx = ""
+        sigcell = copy_val(i["signature"])
         if i["bundle_id"] and i.get("members"):
             n = len(i["members"])
-            pos = next((k + 1 for k, m in enumerate(i["members"])
-                        if m["sig"] == i["signature"]), None)
-            bxid = f'bx{abs(hash((i["slot"], i["round"], i["order_index"], i["signature"], i["verdict"], i.get("our_builder"), i.get("builder_id")))):x}'
-            bid += (f' <span class="scopen bxo" data-sx="{bxid}" role="button" '
-                    f'tabindex="0" title="every member of this bundle">'
-                    f'#{pos or "?"} of {n}</span>')
-            bx = (f'<tr class="sxrow" id="{bxid}" hidden><td colspan=12>'
+            k = len(i.get("_rows") or [i])
+            bxid = f'bx{abs(hash((i["slot"], i["round"], i["bundle_id"], i["verdict"], i.get("our_builder"), i.get("builder_id")))):x}'
+            # the signature list IS the opener: the bundle's first
+            # transaction, and a click shows every one of them
+            short = (i["signature"] or "")[:24] + "\u2026" if i["signature"] else "&mdash;"
+            sigcell = (f'<span class="scopen sigl" data-sx="{bxid}" '
+                       'role="button" tabindex="0" title="the bundle&#39;s '
+                       'first transaction; click for every transaction in '
+                       f'the bundle">{short} <span class="dim">'
+                       f'{n} txn{"" if n == 1 else "s"}</span></span>')
+            bid += (f' <span class="dim bxo" title="members of this bundle '
+                    f'that are in the diff">{k} of {n} in diff</span>')
+            bx = (f'<tr class="sxrow" id="{bxid}" hidden><td colspan=13>'
                   + _bundle_panel(i) + "</td></tr>")
         vcls = "us" if i["verdict"] == "us_inc_not_titan" else "ti"
         pairs = _sched_pairs(i)
@@ -2487,7 +2823,7 @@ def _sel_table(group):
         # our-builder group (AMS_1 vs Titan, AMS_2 vs Titan), so the
         # builder has to be in the key or the ids collide and a click in
         # the second group opens the first group's panel.
-        rid = f'sx{abs(hash((i["slot"], i["round"], i["order_index"], i["signature"], i["verdict"], i.get("our_builder"), i.get("builder_id")))):x}'
+        rid = f'sx{abs(hash((i["slot"], i["round"], i["order_index"], i["signature"], i["bundle_id"], i["verdict"], i.get("our_builder"), i.get("builder_id")))):x}'
         if pairs:
             lab = " ".join(
                 f'<span class="sc">{html.escape(e)}'
@@ -2521,21 +2857,22 @@ def _sel_table(group):
                       ' title="no scheduler/received on any of our builders"')
                    + f'>{kind}{"" if i.get("received_by_us") else " <i>unseen</i>"}'
                    + atag + '</td>'
-                   f'<td>{copy_val(i["signature"])}</td>'
+                   f'<td>{sigcell}</td>'
                    f'<td>{copy_val(i["sigprefix"])}</td>'
                    f"<td>{bid}</td>"
                    f'<td class="land {"y" if i["landed"] == "yes" else "n"}">'
                    f'{i["landed"] or "?"}</td>'
                    f'<td class="n">{_rw_cell(i)}</td>'
                    f'{_recv_cells(i, i.get("our_builder"))}'
+                   f'{_toff_cell(i)}'
                    f"<td>{cell}</td></tr>")
         if bx:
             out.append(bx)
         if pairs:
-            out.append(f'<tr class="sxrow" id="{rid}" hidden><td colspan=12>'
+            out.append(f'<tr class="sxrow" id="{rid}" hidden><td colspan=13>'
                        + _sched_panel(i) + "</td></tr>")
         if i.get("api_bundles") or i.get("api_txs"):
-            out.append(f'<tr class="sxrow" id="{aid}" hidden><td colspan=12>'
+            out.append(f'<tr class="sxrow" id="{aid}" hidden><td colspan=13>'
                        + _api_panel(i) + "</td></tr>")
     out.append("</table>")
     if len(real) > len(shown):
@@ -2544,6 +2881,7 @@ def _sel_table(group):
         tm = sum(1 for i in real if i["verdict"] == "us_inc_not_titan")
         out.append(f'<div class="more">showing {st} of {len(real) - tm:,} '
                    f"titan_inc_not_us and {sm} of {tm:,} us_inc_not_titan "
+                   "rows (a bundle is one row) "
                    f'<button type="button" class="cpsm selmore">show all '
                    f"{len(real):,}</button></div>")
     return "".join(out)
@@ -2556,6 +2894,7 @@ def _bundle_panel(i):
     without it was carried by BOTH sides and so is not a difference -- but
     it is still part of the bundle, and usually the one paying the tip."""
     rows = []
+    mine = {r.get("sigprefix"): r for r in (i.get("_rows") or [i])}
     for m in i["members"]:
         tag = ('<span class="vd us">in diff</span>' if m["in_diff"]
                else ('<span class="vd na">both sides</span>' if m["shared"]
@@ -2567,7 +2906,10 @@ def _bundle_panel(i):
             f'<td class="land {"y" if m["landed"] == "yes" else "n"}">'
             f'{m["landed"] or "?"}</td>'
             f'<td class="n">{_rw_cell(m)}</td><td>{tag}</td>'
-            f"<td>{_alone_cell(m)}</td></tr>")
+            + (_toff_cell(mine[m["prefix"]]) if m.get("prefix") in mine
+               else '<td class="n dim">&mdash;</td>')
+            + f"<td>{_alone_cell(m)}</td>"
+            + f"<td>{_alone_sched_cell(m)}</td></tr>")
     return ('<div class="sxbox"><div class="sxh">bundle '
             + copy_val(i["bundle_id"], i["bundle_id"][:16] + "\u2026")
             + f' &middot; {len(i["members"])} member'
@@ -2575,11 +2917,21 @@ def _bundle_panel(i):
             '<table class="otab"><tr><th>#</th><th>signature</th>'
             "<th>sigprefix</th><th>landed</th>"
             '<th class="n">reward</th><th></th>'
+            '<th class="n" title="ms from our admission to Titan&#39;s first '
+            'offer carrying this member, relay clock (members in the diff '
+            'only)">titan off</th>'
             '<th title="scheduler/received for the member\'s own SigPrefix: '
             "the transaction arriving on its own, outside this bundle -- "
             "per instance, ms after that instance's round_started, "
             "source/route and the relay's hold. Hover a line for the raw "
-            'attrs and nums">received on its own</th></tr>'
+            'attrs and nums">received on its own</th>'
+            '<th title="what the scheduler then did with that plain copy: '
+            "every dropped / pin_skipped / check_dropped / ... row whose "
+            "entity is the member\'s own SigPrefix with entity_kind = tx, "
+            "per instance, ms after that instance\'s round_started. The "
+            "bundle\'s own verdicts are on the row above, under its bundle "
+            'id. Hover a line for the raw attrs and nums">'
+            "scheduler events as a tx</th></tr>"
             + "".join(rows) + "</table></div>")
 
 
@@ -2604,6 +2956,27 @@ def _alone_cell(m):
                    f'{html.escape(ev["route"] or "?")} &middot; '
                    f'<span class="{"held" if ev["wait"] else "dim"}">{hold}</span>'
                    "</div>")
+    return "".join(out)
+
+
+def _alone_sched_cell(m):
+    got = m.get("sched_alone")
+    if got is None:
+        return '<span class="dim">&mdash;</span>'
+    if not got:
+        return '<span class="dim">nothing logged</span>'
+    out = []
+    for inst, after, n in got:
+        raw = html.escape(f"{n['at']}\nattrs {n['attrs']}\nnums  {n['nums']}",
+                          quote=True)
+        when = (f"{after:+.1f} ms" if after is not None
+                else html.escape(n["at"][11:23]))
+        out.append(f'<div class="alone" title="{raw}">'
+                   f'{html.escape(inst.replace("ASTRALANE_", ""))} '
+                   f'<span class="m">{when}</span> &middot; '
+                   f'<b>{html.escape(n["event"])}</b>'
+                   + (f'/{html.escape(n["reason"])}' if n["reason"] else "")
+                   + "</div>")
     return "".join(out)
 
 
