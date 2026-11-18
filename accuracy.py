@@ -1057,7 +1057,8 @@ SEL_COLS = ["kind", "received_by_us",
             "our_reason", "titan_reason", "is_last",
             "sched_event", "sched_reason", "sched_detail",
             "our_uuid", "trace_on", "trace_at_our_offer", "trace_then",
-            "trace_window_closed", "trace_path"]
+            "trace_window_closed", "trace_path",
+            "similar_bundles", "similar_at_our_offer", "overlap_bundles"]
 
 
 def _is_ours(b):
@@ -1243,18 +1244,29 @@ def _sched_keys(rows):
     return out
 
 
-def attach_notes(ch, rows, lo=None, hi=None):
+def _own_keys(x, by_kind):
+    """The entities a row's own events are logged under. With `by_kind`
+    a bundle row is its bundle id ONLY: a member's SigPrefix as a tx entity
+    is that transaction arriving on its own, a different order, and hanging
+    its events on the bundle row reads as if the bundle had them. Those
+    live in the bundle's member panel instead."""
+    if by_kind and x.get("bundle_id"):
+        return (x["bundle_id"],)
+    return tuple(k for k in (x.get("sigprefix"), x.get("bundle_id")) if k)
+
+
+def attach_notes(ch, rows, lo=None, hi=None, by_kind=False):
     """Hang the scheduler's verdicts on each diff row, in place."""
-    notes = scheduler_notes(ch, _sched_keys(rows), lo, hi)
+    notes = scheduler_notes(ch, {k for x in rows
+                                 for k in _own_keys(x, by_kind)}, lo, hi)
     if not notes:
         for x in rows:
             x.setdefault("sched", [])
         return rows
     for x in rows:
         got = []
-        for k in (x.get("sigprefix"), x.get("bundle_id")):
-            if k:
-                got += notes.get(k, [])
+        for k in _own_keys(x, by_kind):
+            got += notes.get(k, [])
         got.sort(key=lambda z: z["at"])
         x["sched"] = got
     return rows
@@ -1400,7 +1412,8 @@ def attach_member_recv(ch, rows, marks, lo=None, hi=None):
 
 def attach_recv(ch, rows, slot, lo=None, hi=None, round_of=lambda x: x["round"],
                 prefix_of=lambda x: x.get("sigprefix"),
-                bundle_of=lambda x: x.get("bundle_id"), marks=None):
+                bundle_of=lambda x: x.get("bundle_id"), marks=None,
+                by_kind=False):
     """Hang, on each row, when the builder admitted the order relative to
     its round: {instance: (ms after round_started, ms before that
     instance's `winner` row in bifrost_miniblocks -- see round_marks)}.
@@ -1410,16 +1423,25 @@ def attach_recv(ch, rows, slot, lo=None, hi=None, round_of=lambda x: x["round"],
     earlier of the two is the admission. Both stamps are the same
     instance's clock, so no correction applies. Negative "after open"
     means it arrived before that round opened -- normal for a round that
-    is not the slot's first."""
+    is not the slot's first.
+
+    `by_kind`: a bundle row is looked up by its bundle id alone -- the
+    member arriving as a plain tx is not the bundle being received (that
+    copy is in the member panel, attach_member_recv)."""
     if marks is None:
         marks = round_marks(ch, slot, lo, hi)
+
+    def keys(x):
+        if by_kind and bundle_of(x):
+            return ((bundle_of(x), "bundle"),)
+        return ((prefix_of(x), "tx"), (bundle_of(x), "bundle"))
     ents = set()
     for x in rows:
-        ents.update(k for k in (prefix_of(x), bundle_of(x)) if k)
+        ents.update(k for k, _kind in keys(x) if k)
     recv = received_at(ch, ents, lo, hi)
     for x in rows:
         got = {}
-        for key, kind in ((prefix_of(x), "tx"), (bundle_of(x), "bundle")):
+        for key, kind in keys(x):
             for inst, (t, w, src) in (recv.get(key) or {}).items():
                 if inst not in got or t < got[inst][0]:
                     got[inst] = (t, w, src, kind)
@@ -1759,7 +1781,10 @@ def _trace_one(tr, keys, inst, off, traced, marks, closes=()):
 def attach_traces(ch, rows, lo=None, hi=None, marks_by_slot=None):
     """On every diff row, `trace`: the order's builder_order_traces history
     on the row's own builder, and its state when the offer compared here
-    went out. Bundle members get `trace` too: the member as a plain tx."""
+    went out. A bundle row is traced as the bundle (entity_kind = bundle)
+    and nothing else; its members get `trace` of their own, the member as
+    a plain tx, shown in the member panel. Every similar bundle
+    (attach_similar) gets its own `trace` as well."""
     want = [x for x in rows if x.get("verdict") in DIFF_VERDICTS]
     if not want:
         return rows
@@ -1774,6 +1799,8 @@ def attach_traces(ch, rows, lo=None, hi=None, marks_by_slot=None):
         for m in x.get("members") or []:
             if m.get("prefix"):
                 keys.add(("tx", m["prefix"]))
+        for s in x.get("similar") or []:
+            keys.add(("bundle", s["id"]))
     insts.discard(None)
     traced = traced_instances(ch, insts, lo, hi)
     tr = order_traces(ch, keys, traced, lo, hi)
@@ -1784,17 +1811,110 @@ def attach_traces(ch, rows, lo=None, hi=None, marks_by_slot=None):
         mk = ((marks_by_slot or {}).get(x["slot"]) or {}).get(
             (inst, int(x["round"])))
         off = ob.get((inst, x.get("our_uuid")))
-        ks = []
-        if x.get("bundle_id"):
-            ks.append(("bundle", x["bundle_id"]))
-        if x.get("sigprefix"):
-            ks.append(("tx", x["sigprefix"]))
+        ks = ([("bundle", x["bundle_id"])] if x.get("bundle_id")
+              else [("tx", x["sigprefix"])] if x.get("sigprefix") else [])
         x["trace"] = _trace_one(tr, ks, inst, off, traced, mk,
                                 wc.get(inst, ()))
         for m in x.get("members") or []:
             if m.get("prefix") and "trace" not in m:
                 m["trace"] = _trace_one(tr, [("tx", m["prefix"])], inst, off,
                                         traced, mk, wc.get(inst, ()))
+        for s in x.get("similar") or []:
+            s["trace"] = _trace_one(tr, [("bundle", s["id"])], inst, off,
+                                    traced, mk, wc.get(inst, ()))
+    return rows
+
+
+# ------------------------------------------------------- similar bundles
+#
+# A bundle id is the hash of its packets plus whatever the gateway folds
+# in (target slot, target accounts, a dropping mask), so the same
+# transactions often reach us under a DIFFERENT id than the one in the
+# winner: another searcher's wrapper, a resend, our router's GBX-lane
+# copy. Matching on ids calls those "never received". These are the
+# bundles we did receive (scheduler/received, entity_kind = bundle, whose
+# `signatures` array is the member list) that carry every signature of
+# the diff row -- the bundle's members, or a plain tx's one signature --
+# with their own trace on our builder. Bundles that share only some of
+# them are kept apart as overlaps.
+
+SIM_BATCH = 100            # signatures per query; the SQL travels in the URL
+SIM_PAD = dt.timedelta(minutes=1)
+SIM_SHOW = 12              # similar bundles listed per row; the rest counted
+
+
+def received_bundles_with(ch, sigs, lo, hi):
+    """{bundle_id: {"sigs": [...], "recv": {instance: first ts}}} for every
+    bundle we admitted that contains any of these signatures."""
+    out = {}
+    sigs = sorted({s for s in sigs if s})
+    if not sigs:
+        return out
+    f = "%Y-%m-%d %H:%M:%S"
+    tb = (f"ts >= '{lo - SIM_PAD:{f}}' AND ts <= '{hi:{f}}'" if lo and hi
+          else "ts > now() - INTERVAL 2 HOUR")
+    for i in range(0, len(sigs), SIM_BATCH):
+        lst = ", ".join("'%s'" % _q(s) for s in sigs[i:i + SIM_BATCH])
+        _, rows = ch(
+            "SELECT entity, instance_id, toString(min(ts)), "
+            "  arrayStringConcat(argMin(signatures, ts), ' ') "
+            f"FROM bifrost_events WHERE {tb} AND stage = 'scheduler' "
+            "  AND event = 'received' AND entity_kind = 'bundle' "
+            f"  AND hasAny(signatures, [{lst}]) "
+            "GROUP BY entity, instance_id")
+        for ent, inst, at, sg in rows:
+            b = out.setdefault(ent, {"sigs": [], "recv": {}})
+            if not b["sigs"]:
+                b["sigs"] = [z for z in (sg or "").split() if z]
+            b["recv"][inst] = at
+    return out
+
+
+def _row_sig_list(x):
+    if x.get("members"):
+        return [m["sig"] for m in x["members"] if m.get("sig")]
+    return [x["signature"]] if x.get("signature") else []
+
+
+def attach_similar(ch, rows, lo=None, hi=None, marks_by_slot=None):
+    """On every diff row: `similar` = bundles we received, other than the
+    row's own, that contain ALL of the row's signatures; `overlap` = ones
+    that contain only some. Each with its members, which of them are not
+    the row's, and when each of our instances admitted it (ms from that
+    instance's round_started)."""
+    want = [x for x in rows if x.get("verdict") in DIFF_VERDICTS]
+    got = received_bundles_with(
+        ch, {s for x in want for s in _row_sig_list(x)}, lo, hi)
+    for x in want:
+        mine = _row_sig_list(x)
+        if not mine:
+            x["similar"], x["overlap"], x["similar_why"] = [], [], "no signature"
+            continue
+        want_set = set(mine)
+        mk = (marks_by_slot or {}).get(x["slot"]) or {}
+        sim, ovl = [], []
+        for bid, b in got.items():
+            if bid == x.get("bundle_id"):
+                continue
+            have = want_set.intersection(b["sigs"])
+            if not have:
+                continue
+            recv = {}
+            for inst, at in b["recv"].items():
+                m = mk.get((inst, int(x["round"]))) or {}
+                recv[inst] = (at, _ms(m["open"], at) if "open" in m else None)
+            rec = {"id": bid, "n": len(b["sigs"]), "sigs": b["sigs"],
+                   "shared": len(have), "of": len(want_set),
+                   "extra": [z for z in b["sigs"] if z not in want_set],
+                   "recv": recv,
+                   "first": min(at for at, _a in recv.values())}
+            (sim if len(have) == len(want_set) else ovl).append(rec)
+        # the row's own builder first: that is where the trace is read
+        own = x.get("our_builder")
+        sim.sort(key=lambda r: (own not in r["recv"], r["first"]))
+        ovl.sort(key=lambda r: (own not in r["recv"], -r["shared"],
+                                r["first"]))
+        x["similar"], x["overlap"] = sim, ovl
     return rows
 
 
@@ -2615,14 +2735,19 @@ def selection_diff(relay_q, ch, rounds_, window, blocks=None,
                               round_weight(segs, rnd)))
     flat_rows = [x for part in rows for x in part]
     # the chunk's own window, so the scan stays narrow even over a range
-    attach_notes(ch, flat_rows, *(window or (None, None)))
+    attach_notes(ch, flat_rows, *(window or (None, None)), by_kind=True)
     lo, hi = window or (None, None)
     marks_by_slot = {}
     for sl in {x["slot"] for x in flat_rows}:
         part = [x for x in flat_rows if x["slot"] == sl]
         marks = marks_by_slot[sl] = round_marks(ch, sl, lo, hi)
-        attach_recv(ch, part, sl, lo, hi, marks=marks)
+        attach_recv(ch, part, sl, lo, hi, marks=marks, by_kind=True)
         attach_member_recv(ch, part, marks, lo, hi)
+    try:
+        attach_similar(ch, flat_rows, lo, hi, marks_by_slot)
+    except Exception as exc:
+        for x in flat_rows:
+            x["similar_why"] = f"could not be read: {str(exc)[:120]}"
     try:
         attach_traces(ch, flat_rows, lo, hi, marks_by_slot)
     except Exception as exc:
@@ -2650,6 +2775,14 @@ def _sel_flat(x, col):
         return {"titan_off_ms": round(t["ms"], 3),
                 "titan_off_err_ms": round(t["err"], 3),
                 "titan_off_on": t["inst"], "titan_first_by": t["by"]}[col]
+    if col in ("similar_bundles", "similar_at_our_offer", "overlap_bundles"):
+        sim = x.get("similar") or []
+        if col == "overlap_bundles":
+            return ";".join(f'{o["id"]}:{o["shared"]}/{o["of"]}'
+                            for o in x.get("overlap") or [])
+        if col == "similar_bundles":
+            return ";".join(z["id"] for z in sim)
+        return ";".join((z.get("trace") or {}).get("key") or "" for z in sim)
     if col.startswith("trace_"):
         t = x.get("trace")
         if not t:
@@ -3083,6 +3216,10 @@ def _row_copy(i, kind):
         "trace_at_our_offer": (i.get("trace") or {}).get("key") or None,
         "trace_then": (i.get("trace") or {}).get("then") or None,
         "trace_path": _trace_path(i.get("trace")) or None,
+        "similar_bundles": [
+            {"bundle_id": z["id"], "members": z["n"],
+             "at_our_offer": (z.get("trace") or {}).get("key") or None}
+            for z in i.get("similar") or []],
         "slot": i["slot"], "rn": i["round"]}, separators=(",", ":"))
 
 
@@ -3168,15 +3305,11 @@ def _trace_flabel(k):
     return "no trace" if k == "__none" else trace_label(k)[0]
 
 
-def _trace_summary(t, bundle_row=False):
+def _trace_summary(t):
     """Chip for the state at our offer, then what became of the order."""
     if not t:
         return '<span class="dim">&mdash;</span>'
     out = _trace_chip(t["key"])
-    if t.get("by") == "tx" and bundle_row:
-        out += (' <span class="dim" title="the bundle itself was not in hand '
-                "at our offer; this is the state of its transaction, which "
-                'had arrived on its own">as tx</span>')
     if t.get("then") and t["then"] != t["key"]:
         out += '<div class="trthen">then ' + _trace_chip(t["then"]) + "</div>"
     if t.get("closed"):
@@ -3196,16 +3329,109 @@ def _trace_cell(x, tid):
         return f'<td class="trc dim" title="{why}">&mdash;</td>'
     off = t.get("offer") or {}
     title = html.escape(
-        f"{t['inst']}: the order's last state when our offer "
+        f"{t['inst']}: the {'bundle' if x.get('bundle_id') else 'order'}'s"
+        " own last state (builder_order_traces, entity_kind = "
+        f"{'bundle' if x.get('bundle_id') else 'tx'}) when our offer "
         f"{(x.get('our_uuid') or '?')[:8]} (the one compared here) was "
         f"dispatched" + (f", trace_seq {off['seq']}" if off else "")
         + ". " + (trace_label(t["key"])[2] or "")
         + " Click for every state change.", quote=True)
-    body = _trace_summary(t, bool(x.get("bundle_id")))
+    body = _trace_summary(t)
     if t.get("rows"):
         body = (f'<span class="scopen" data-sx="{tid}" role="button" '
                 f'tabindex="0">{body}</span>')
     return f'<td class="trc" title="{title}">{body}</td>'
+
+
+def _similar_cell(x, sid):
+    sim, ovl = x.get("similar"), x.get("overlap") or []
+    if sim is None:
+        why = html.escape(x.get("similar_why") or "not looked up", quote=True)
+        return f'<td class="dim" title="{why}">&mdash;</td>'
+    if not sim and not ovl:
+        return ('<td class="dim" title="no bundle we received carries these '
+                'signatures">none</td>')
+    what = "these signatures" if x.get("bundle_id") else "this transaction"
+    body = ""
+    if sim:
+        top = sim[0]
+        body = (f'<b>{len(sim)}</b> bundle{"" if len(sim) == 1 else "s"} '
+                + _trace_chip((top.get("trace") or {}).get("key") or "")
+                + ("" if len(sim) == 1 else
+                   ' <span class="dim">(first)</span>'))
+    if ovl:
+        body += (f'<div class="trthen">{len(ovl)} share some</div>')
+    title = html.escape(
+        f"bundles we received under another id that carry ALL of {what} "
+        f"({len(sim)}), and ones that carry only some ({len(ovl)}). The "
+        "chip is the first one's own state (received on our builder first, "
+        "then earliest) when our compared offer was "
+        "dispatched. Click for each, with its trace.", quote=True)
+    return (f'<td class="trc" title="{title}"><span class="scopen" '
+            f'data-sx="{sid}" role="button" tabindex="0">{body}</span></td>')
+
+
+def _recv_list(r):
+    return " ".join(
+        f'{html.escape(inst.replace("ASTRALANE_", ""))} '
+        f'<span class="m">{after:+.1f}</span>' if after is not None else
+        f'{html.escape(inst.replace("ASTRALANE_", ""))} '
+        f'<span class="m">{html.escape(at[11:23])}</span>'
+        for inst, (at, after) in sorted(r["recv"].items()))
+
+
+def _similar_panel(x, sid):
+    """Each similar bundle: id, members (the row's + any extra), when each
+    instance admitted it, and its own trace on our builder, openable."""
+    sim, ovl = x.get("similar") or [], x.get("overlap") or []
+    out = ['<div class="sxbox"><div class="sxh">bundles we received that '
+           "carry " + ("every signature of this bundle" if x.get("bundle_id")
+                       else "this transaction")
+           + ' <span class="dim">&middot; scheduler/received with '
+           "entity_kind = bundle, matched on its signatures array; ms from "
+           "round_started on each instance; trace on "
+           + html.escape(x.get("our_builder") or "") + "</span></div>"]
+    if sim:
+        out.append('<table class="otab"><tr><th>bundle</th>'
+                   '<th class="n">txs</th><th>extra members</th>'
+                   "<th>received (ms after open)</th><th>at our offer</th>"
+                   "</tr>")
+        for n, z in enumerate(sim[:SIM_SHOW]):
+            t = z.get("trace")
+            zid = f"{sid}s{n}"
+            tc = _trace_summary(t)
+            if t and t.get("rows"):
+                tc = (f'<span class="scopen" data-sx="{zid}" role="button" '
+                      f'tabindex="0" title="{html.escape(_trace_path(t), quote=True)}">'
+                      f"{tc}</span>")
+            extra = (" ".join(copy_val(e, e[:12] + "\u2026") for e in z["extra"])
+                     or '<span class="dim">none &mdash; same content</span>')
+            out.append(f'<tr><td>{copy_val(z["id"], z["id"][:16] + "\u2026")}</td>'
+                       f'<td class="n">{z["n"]}</td><td>{extra}</td>'
+                       f"<td>{_recv_list(z)}</td><td class=\"trc\">{tc}</td></tr>")
+            if t and t.get("rows"):
+                out.append(f'<tr class="sxrow" id="{zid}" hidden><td colspan=5>'
+                           + _trace_panel(dict(x, bundle_id=z["id"], trace=t))
+                           + "</td></tr>")
+        out.append("</table>")
+        if len(sim) > SIM_SHOW:
+            out.append(f'<div class="dim">+{len(sim) - SIM_SHOW} more: '
+                       + " ".join(copy_val(z["id"], z["id"][:12] + "\u2026")
+                                  for z in sim[SIM_SHOW:]) + "</div>")
+    if ovl:
+        out.append('<div class="sxh">share only some of them</div>'
+                   '<table class="otab"><tr><th>bundle</th>'
+                   '<th class="n">shared</th><th class="n">txs</th>'
+                   "<th>received (ms after open)</th></tr>")
+        for z in ovl[:SIM_SHOW]:
+            out.append(f'<tr><td>{copy_val(z["id"], z["id"][:16] + "\u2026")}</td>'
+                       f'<td class="n">{z["shared"]} of {z["of"]}</td>'
+                       f'<td class="n">{z["n"]}</td><td>{_recv_list(z)}</td></tr>')
+        out.append("</table>")
+        if len(ovl) > SIM_SHOW:
+            out.append(f'<div class="dim">+{len(ovl) - SIM_SHOW} more</div>')
+    out.append("</div>")
+    return "".join(out)
 
 
 def _trace_panel(x):
@@ -3270,7 +3496,11 @@ def _trace_panel(x):
                   r["kind"], r["event"], r["status"], r["reason"],
                   r["branch"], r["checkpoint"]] for r in t["rows"]]},
         separators=(",", ":"))
-    return ('<div class="sxbox"><div class="sxh">order trace on '
+    what = ("bundle " + html.escape((x.get("bundle_id") or "")[:12]) + "\u2026"
+            if x.get("bundle_id") else
+            "tx " + html.escape(x.get("sigprefix") or ""))
+    return ('<div class="sxbox"><div class="sxh">trace of '
+            f'<b>{what}</b> on '
             f'<b>{html.escape(t["inst"])}</b> &middot; at our offer '
             f'<span class="tr {trace_label(t["key"])[1]}">'
             f'{html.escape(trace_label(t["key"])[0])}</span> &middot; '
@@ -3322,11 +3552,15 @@ def _sel_table(group):
            '<th class="n" title="the relay&#39;s hold on the order (scheduler/received nums wait_us), ms: the builder may not extend it before admission + wait. 0 = no hold (votes, non-nonce bundles, searcher flow); blank = not logged">wait</th>'
            '<th class="n" title="titan_off: ms from our builder admitting the order (scheduler/received) to Titan&#39;s FIRST offer carrying it on this connector, this slot or the 3 before (relay submitted stamp). Our stamp is moved onto the relay clock with the relay - builder offset measured around that moment (two-sided bound, error on hover). Negative = Titan offered it before we had it">titan off</th>'
            '<th title="builder_order_traces: the order&#39;s state on our builder when the offer compared here was dispatched (same trace_seq counter, no clock), then what became of it. Click for the full sequence">at our offer</th>'
+           '<th title="bundles we received under a different id that carry every signature of this row (a plain tx: bundles containing it), with their own state at our offer. Click for each">similar bundles</th>'
            "<th>scheduler said</th></tr>"]
     real = _units([i for i in group
                    if i["verdict"] not in ("no_accepted_offer",
                                            "no_content")])
-    shown = _sel_show(group)
+    # the cap picks from the display rows themselves: picking from the
+    # per-signature rows put every bundle on the page twice, once as its
+    # first member's row and once as the merged row
+    shown = _sel_show(real)
     front = {id(i) for i in shown}
     # the capped order first, then everything else -- hidden, not dropped
     ordered = shown + sorted((i for i in real if id(i) not in front),
@@ -3351,7 +3585,7 @@ def _sel_table(group):
                        f'{n} txn{"" if n == 1 else "s"}</span></span>')
             bid += (f' <span class="dim bxo" title="members of this bundle '
                     f'that are in the diff">{k} of {n} in diff</span>')
-            bx = (f'<tr class="sxrow" id="{bxid}" hidden><td colspan=14>'
+            bx = (f'<tr class="sxrow" id="{bxid}" hidden><td colspan=15>'
                   + _bundle_panel(i) + "</td></tr>")
         vcls = "us" if i["verdict"] == "us_inc_not_titan" else "ti"
         pairs = _sched_pairs(i)
@@ -3382,6 +3616,7 @@ def _sel_table(group):
                   f'data-r="{html.escape(_trace_fkey(i), quote=True)}"')
         tid = "tr" + rid[2:]
         aid = "ap" + rid[2:]
+        sid = "sm" + rid[2:]
         atag = _api_tag(i, aid)
         # the row number copies the whole row
         rowcp = (f'<span class="cpv" data-c="{html.escape(_row_copy(i, kind), quote=True)}" '
@@ -3394,6 +3629,7 @@ def _sel_table(group):
                    + ('' if i.get("received_by_us") else
                       ' title="no scheduler/received on any of our builders"')
                    + f'>{kind}{"" if i.get("received_by_us") else " <i>unseen</i>"}'
+                   + _alone_hint(i)
                    + atag + '</td>'
                    f'<td>{sigcell}</td>'
                    f'<td>{copy_val(i["sigprefix"])}</td>'
@@ -3404,17 +3640,21 @@ def _sel_table(group):
                    f'{_recv_cells(i, i.get("our_builder"))}'
                    f'{_toff_cell(i)}'
                    f'{_trace_cell(i, tid)}'
+                   f'{_similar_cell(i, sid)}'
                    f"<td>{cell}</td></tr>")
         if bx:
             out.append(bx)
         if (i.get("trace") or {}).get("rows"):
-            out.append(f'<tr class="sxrow" id="{tid}" hidden><td colspan=14>'
+            out.append(f'<tr class="sxrow" id="{tid}" hidden><td colspan=15>'
                        + _trace_panel(i) + "</td></tr>")
+        if i.get("similar") or i.get("overlap"):
+            out.append(f'<tr class="sxrow" id="{sid}" hidden><td colspan=15>'
+                       + _similar_panel(i, sid) + "</td></tr>")
         if pairs:
-            out.append(f'<tr class="sxrow" id="{rid}" hidden><td colspan=14>'
+            out.append(f'<tr class="sxrow" id="{rid}" hidden><td colspan=15>'
                        + _sched_panel(i) + "</td></tr>")
         if i.get("api_bundles") or i.get("api_txs"):
-            out.append(f'<tr class="sxrow" id="{aid}" hidden><td colspan=14>'
+            out.append(f'<tr class="sxrow" id="{aid}" hidden><td colspan=15>'
                        + _api_panel(i) + "</td></tr>")
     out.append("</table>")
     if len(real) > len(shown):
@@ -3429,6 +3669,21 @@ def _sel_table(group):
     return "".join(out)
 
 
+def _alone_hint(i):
+    """On a bundle row: how many of its members we had as plain txs. Their
+    events are in the member panel, not on this row."""
+    ms = i.get("members") or []
+    if not i.get("bundle_id") or not ms:
+        return ""
+    k = sum(1 for m in ms if m.get("recv_alone"))
+    if not k:
+        return ""
+    return (f'<div class="trthen" title="members that reached our builders '
+            "as plain transactions (their own scheduler/received). The "
+            "bundle row shows the bundle's own events only; open the "
+            f'signature for each member\'s">{k} of {len(ms)} txs seen alone</div>')
+
+
 def _bundle_panel(i):
     """Every member of the bundle this row came from, in bundle order.
 
@@ -3437,7 +3692,14 @@ def _bundle_panel(i):
     it is still part of the bundle, and usually the one paying the tip."""
     rows = []
     mine = {r.get("sigprefix"): r for r in (i.get("_rows") or [i])}
-    for m in i["members"]:
+    base = f'bm{abs(hash((i["slot"], i["round"], i["bundle_id"], i["verdict"], i.get("our_builder")))):x}'
+    for n, m in enumerate(i["members"]):
+        t = m.get("trace")
+        mid = f"{base}m{n}"
+        tc = _trace_summary(t)
+        if t and t.get("rows"):
+            tc = (f'<span class="scopen" data-sx="{mid}" role="button" '
+                  f'tabindex="0">{tc}</span>')
         tag = ('<span class="vd us">in diff</span>' if m["in_diff"]
                else ('<span class="vd na">both sides</span>' if m["shared"]
                      else ""))
@@ -3452,8 +3714,12 @@ def _bundle_panel(i):
                else '<td class="n dim">&mdash;</td>')
             + f"<td>{_alone_cell(m)}</td>"
             + f"<td>{_alone_sched_cell(m)}</td>"
-            + f'<td class="trc" title="{html.escape(_trace_path(m.get("trace")), quote=True)}">'
-            + _trace_summary(m.get("trace")) + "</td></tr>")
+            + f'<td class="trc" title="{html.escape(_trace_path(t), quote=True)}">'
+            + tc + "</td></tr>")
+        if t and t.get("rows"):
+            rows.append(f'<tr class="sxrow" id="{mid}" hidden><td colspan=10>'
+                        + _trace_panel(dict(i, bundle_id="", sigprefix=m["prefix"],
+                                            trace=t)) + "</td></tr>")
     return ('<div class="sxbox"><div class="sxh">bundle '
             + copy_val(i["bundle_id"], i["bundle_id"][:16] + "\u2026")
             + f' &middot; {len(i["members"])} member'
@@ -3478,7 +3744,7 @@ def _bundle_panel(i):
             "scheduler events as a tx</th>"
             '<th title="builder_order_traces for the member as a plain tx on '
             "our builder: its state when the compared offer was dispatched, "
-            'then what became of it. Hover for the whole path">trace as a tx'
+            'then what became of it. Click for every row">trace as a tx'
             "</th></tr>"
             + "".join(rows) + "</table></div>")
 
@@ -3599,9 +3865,12 @@ def _sel_show(group):
 
 
 def _sel_counts(group):
-    c = collections.Counter(i["verdict"] for i in group)
+    """Per verdict: rows as shown (a bundle once), then signatures."""
+    units = _units(group)
+    c = collections.Counter(i["verdict"] for i in units)
+    nsig = collections.Counter(i["verdict"] for i in group)
     land = collections.Counter(
-        (i["verdict"], i["landed"]) for i in group if i["landed"])
+        (i["verdict"], i["landed"]) for i in units if i["landed"])
     bits = []
     for v in ("titan_inc_not_us", "us_inc_not_titan",
               "no_accepted_offer", "no_content"):
@@ -3611,6 +3880,9 @@ def _sel_counts(group):
         cls = "us" if v == "us_inc_not_titan" else ("ti" if diff else "na")
         yes, und = land[(v, "yes")], c[v] - land[(v, "yes")] - land[(v, "no")]
         bits.append(f'<span class="vd {cls}">{v}</span> <b>{c[v]:,}</b>'
+                    + (f' <span class="dim" title="signature-level diff rows '
+                       f'(the CSV)">[{nsig[v]:,} sigs]</span>'
+                       if diff and nsig[v] != c[v] else "")
                     + (f' <span class="dim">({yes} landed'
                        + (f", {und} undecidable" if und else "") + ")</span>"
                        if diff else "")
