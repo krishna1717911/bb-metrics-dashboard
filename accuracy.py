@@ -1055,7 +1055,9 @@ SEL_COLS = ["kind", "received_by_us",
             "our_bid", "titan_bid", "bid_gap",
             "our_cost", "titan_cost", "our_orders", "titan_orders",
             "our_reason", "titan_reason", "is_last",
-            "sched_event", "sched_reason", "sched_detail"]
+            "sched_event", "sched_reason", "sched_detail",
+            "our_uuid", "trace_on", "trace_at_our_offer", "trace_then",
+            "trace_window_closed", "trace_path"]
 
 
 def _is_ours(b):
@@ -1477,6 +1479,349 @@ def _recv_cells(x, prefer=None):
     return (cell(after, " neg" if after < 0 else " pos")
             + cell(before, " neg" if before is not None and before < 0 else "")
             + wcell)
+
+
+# ---------------------------------------------------------- order traces
+#
+# builder_order_traces (builder #134, on AMS_1/AMS_2/MOCK since build
+# d57f5721b; FRA_1 and JP_1 do not write it yet): one row per state change
+# of every non-vote order the scheduler admitted, written only when the
+# status, reason or round changes. `trace_seq` is a per-instance, per-run
+# counter shared by every row the scheduler writes, including the
+# `offer_dispatched` row for each mini-block (entity_id = its uuid), so
+# "what state was this order in when that offer went out" is a sequence
+# comparison on one counter -- no clock involved.
+#
+# The diff compares one offer of ours per round (our best as it stood when
+# the winning offer was submitted). The trace answers why THAT offer did
+# not carry an order: its last state at or before that offer's
+# offer_dispatched row. Rows after it say what became of the order.
+#
+# Limits, from the builder's docs/order-tracing.md: delivery is best
+# effort (a missing row does not prove the order was never received);
+# included_in_prefix is not proof of offer or landing; `liveness`
+# retirement is broad -- after a round it almost always means the
+# winner carried the order. Rows live 7 days.
+
+TRACE_CAP = 300                 # rows per order per instance, oldest first
+TRACE_PAD = dt.timedelta(minutes=3)   # admitted well before its round
+DIFF_VERDICTS = ("titan_inc_not_us", "us_inc_not_titan")
+
+# status -> (words, colour class). Order: the pipeline.
+TRACE_STATUS = {
+    "check_pending": ("in check", "pend"),
+    "probe_pending": ("in probe", "pend"),
+    "auction_ready": ("ready, not picked", "pend"),
+    "selection_skipped": ("skipped", "hold"),
+    "extend_pending": ("in extend", "pend"),
+    "included_in_prefix": ("in our prefix", "inc"),
+    "deferred": ("deferred", "pend"),
+    "branch_pending": ("branch pending", "pend"),
+    "branch_accepted": ("branch accepted", "pend"),
+    "removed_from_prefix": ("removed by branch switch", "bad"),
+    "retired": ("retired", "bad"),
+}
+# what each state means, for hovers
+TRACE_HELP = {
+    "check_pending": "received, waiting for Check",
+    "probe_pending": "a bundle waiting for Probe (simulation = queued or in "
+                     "flight, target_write = #118 target-account park, "
+                     "retry_cooldown = 50 ms cooldown, target_slot = pinned "
+                     "to a later slot)",
+    "auction_ready": "passed Check/Probe and eligible for a cut, but no cut "
+                     "had taken it yet (rank: cheaper orders sort last)",
+    "selection_skipped": "a cut looked at it and left it out (relay_delay = "
+                         "the relay's wait_us hold not over, compute_budget "
+                         "= would not fit the round's CU, signature_conflict "
+                         "= shares a signature or nonce account with an "
+                         "order already in, dependency_depth = deeper than "
+                         "16)",
+    "extend_pending": "picked and sent to the simulator in an Extend batch, "
+                      "reply not back yet",
+    "included_in_prefix": "the simulator applied it to our draft",
+    "deferred": "parked until the winner's commit lands (needs_round)",
+    "removed_from_prefix": "a branch switch cut it out of our draft",
+    "retired": "finished (liveness = executed elsewhere / blockhash or "
+               "nonce dead -- usually the winner carried it; check_failed, "
+               "probe_failed, extend_failed = the simulator said no, error "
+               "text under 'scheduler said'; retry_expired = 10 s target "
+               "wait ran out; superseded; retention_horizon; "
+               "branch_evaluation_rejected)",
+}
+# keys that are not a builder state
+TRACE_SPECIAL = {
+    "after": ("arrived after our offer", "na",
+              "the builder admitted it only after the offer compared here "
+              "had been dispatched"),
+    "notrecv": ("not received here", "na",
+                "no trace row on this instance: it never admitted the order"),
+    "untraced": ("not traced", "na",
+                 "this builder runs a build without order traces (#134)"),
+    "noboundary": ("offer not in trace", "na",
+                   "the offer compared here has no offer_dispatched row "
+                   "(trace delivery is best effort); showing its last state"),
+    "": ("", "na", ""),
+}
+
+
+def _trace_key(status, reason):
+    return f"{status}:{reason}" if reason else status
+
+
+def trace_label(key):
+    """-> (words, class, hover) for a trace key ('status[:reason]' or one
+    of TRACE_SPECIAL)."""
+    if key in TRACE_SPECIAL:
+        return TRACE_SPECIAL[key]
+    st, _, rs = key.partition(":")
+    words, cls = TRACE_STATUS.get(st, (st, "pend"))
+    if st == "selection_skipped" and rs == "relay_delay":
+        words, cls = "held by relay delay", "hold"
+    elif st == "retired" and rs == "liveness":
+        words = "retired"
+    return ((words + (f" {rs}" if rs and not words.startswith("held") else "")),
+            cls, TRACE_HELP.get(st, ""))
+
+
+def order_traces(ch, keys, insts, lo, hi):
+    """{(kind, id)} -> {(kind, id, instance): [row, ...]} in trace order.
+
+    The table is sorted (instance_id, entity_kind, entity_id, run_id,
+    trace_seq), so an instance + id list is an index seek, not a scan."""
+    out = {}
+    keys, insts = sorted(k for k in keys if k[1]), sorted(i for i in insts if i)
+    if not keys or not insts:
+        return out
+    f = "%Y-%m-%d %H:%M:%S"
+    tb = (f"ts >= '{lo - TRACE_PAD:{f}}' AND ts <= '{hi:{f}}'" if lo and hi
+          else "ts > now() - INTERVAL 2 HOUR")
+    il = ", ".join("'%s'" % _q(i) for i in insts)
+    for i in range(0, len(keys), ENTITY_BATCH):
+        part = keys[i:i + ENTITY_BATCH]
+        conds = []
+        for kind in ("tx", "bundle"):
+            ids = [e for k, e in part if k == kind]
+            if ids:
+                conds.append(f"(entity_kind = '{kind}' AND entity_id IN ("
+                             + ", ".join("'%s'" % _q(e) for e in ids) + "))")
+        _, rows = ch(
+            "SELECT entity_kind, entity_id, instance_id, toString(run_id), "
+            "  trace_seq, first_trace_seq, toString(ts), "
+            "  ifNull(toString(slot), ''), ifNull(toString(round_index), ''), "
+            "  event, status, reason, ifNull(toString(bank_slot), ''), "
+            "  ifNull(toString(branch_id), ''), "
+            "  ifNull(toString(checkpoint_id), ''), "
+            "  ifNull(toString(branch_request_id), ''), "
+            "  ifNull(toString(common_prefix_len), '') "
+            f"FROM builder_order_traces WHERE instance_id IN ({il}) "
+            f"  AND {tb} AND ({' OR '.join(conds)}) "
+            "ORDER BY instance_id, entity_kind, entity_id, run_id, trace_seq "
+            f"LIMIT {TRACE_CAP} BY instance_id, entity_kind, entity_id")
+        for (k, e, inst, run, seq, first, at, sl, rd, ev, st, rs, bsl, br,
+             ck, req, cpl) in rows:
+            out.setdefault((k, e, inst), []).append({
+                "kind": k, "run": run, "seq": int(seq), "first": int(first),
+                "at": at, "slot": sl, "round": rd, "event": ev,
+                "status": st, "reason": rs, "bank_slot": bsl, "branch": br,
+                "checkpoint": ck, "request": req, "common": cpl})
+    return out
+
+
+def offer_boundaries(ch, uuids, insts, lo, hi):
+    """{(instance, uuid): {run, seq, at}} -- each of our offers'
+    offer_dispatched row."""
+    out = {}
+    uuids, insts = sorted(u for u in uuids if u), sorted(i for i in insts if i)
+    if not uuids or not insts:
+        return out
+    f = "%Y-%m-%d %H:%M:%S"
+    tb = (f"ts >= '{lo - TRACE_PAD:{f}}' AND ts <= '{hi:{f}}'" if lo and hi
+          else "ts > now() - INTERVAL 2 HOUR")
+    il = ", ".join("'%s'" % _q(i) for i in insts)
+    for i in range(0, len(uuids), ENTITY_BATCH):
+        ul = ", ".join("'%s'" % _q(u) for u in uuids[i:i + ENTITY_BATCH])
+        _, rows = ch(
+            "SELECT instance_id, entity_id, toString(run_id), min(trace_seq), "
+            "  toString(min(ts)) "
+            f"FROM builder_order_traces WHERE instance_id IN ({il}) "
+            f"  AND entity_kind = 'offer' AND entity_id IN ({ul}) AND {tb} "
+            "GROUP BY instance_id, entity_id, run_id")
+        for inst, u, run, seq, at in rows:
+            out[(inst, u)] = {"run": run, "seq": int(seq), "at": at}
+    return out
+
+
+def traced_instances(ch, insts, lo, hi):
+    """Which of these instances wrote any offer_dispatched row in the
+    window -- the ones running a build with order traces."""
+    insts = sorted(i for i in insts if i)
+    if not insts:
+        return set()
+    f = "%Y-%m-%d %H:%M:%S"
+    tb = (f"ts >= '{lo:{f}}' AND ts <= '{hi:{f}}'" if lo and hi
+          else "ts > now() - INTERVAL 2 HOUR")
+    out = set()
+    for inst in insts:
+        _, rows = ch(
+            "SELECT 1 FROM builder_order_traces "
+            f"WHERE instance_id = '{_q(inst)}' AND entity_kind = 'offer' "
+            f"  AND {tb} LIMIT 1")
+        if rows:
+            out.add(inst)
+    return out
+
+
+def _states(rows):
+    """Rows that set a state (order_transition and branch pending/accepted);
+    branch_evaluated / probe_invalidated / ... are observations only."""
+    return [r for r in rows if r["status"]]
+
+
+def window_closes(ch, insts, lo, hi):
+    """{instance: [(run, seq, at)]} -- each `window_closed` boundary: our
+    leader window ended and every order still in flight was dropped
+    without a retire row of its own."""
+    out = {}
+    insts = sorted(i for i in insts if i)
+    if not insts:
+        return out
+    f = "%Y-%m-%d %H:%M:%S"
+    tb = (f"ts >= '{lo - TRACE_PAD:{f}}' AND ts <= '{hi:{f}}'" if lo and hi
+          else "ts > now() - INTERVAL 2 HOUR")
+    il = ", ".join("'%s'" % _q(i) for i in insts)
+    _, rows = ch(
+        "SELECT instance_id, toString(run_id), trace_seq, toString(ts) "
+        f"FROM builder_order_traces WHERE instance_id IN ({il}) "
+        f"  AND entity_kind = 'window' AND {tb} ORDER BY trace_seq")
+    for inst, run, seq, at in rows:
+        out.setdefault(inst, []).append((run, int(seq), at))
+    return out
+
+
+def _state_at(rows, off):
+    """(key, row) -- the last state at or before the offer, or ('after',
+    None) when the order only arrived later, ('', None) without rows."""
+    st = _states(rows)
+    if not st:
+        return "", None
+    if not off:
+        return "noboundary", None
+    before = [r for r in st if r["run"] == off["run"] and r["seq"] <= off["seq"]]
+    if not before:
+        return "after", None
+    b = before[-1]
+    return _trace_key(b["status"], b["reason"]), b
+
+
+def _trace_one(tr, keys, inst, off, traced, marks, closes=()):
+    """One order on one instance -> its trace record.
+
+    `keys` in preference order (a bundle's own id before its member's
+    plain-tx copy). The state at our offer comes from the first key that
+    was in hand by then; if none was, from the first that has rows at all
+    ("arrived after our offer"). Every key's rows go in the timeline,
+    tagged by entity kind."""
+    rec = {"inst": inst, "rows": [], "key": "", "then": "", "offer": off,
+           "by": "", "open": (marks or {}).get("open"),
+           "win": (marks or {}).get("win"), "closed": None}
+    if inst not in traced:
+        rec["key"] = "untraced"
+        return rec
+    per = [(k, tr.get((k[0], k[1], inst)) or []) for k in keys]
+    rec["rows"] = sorted((r for _k, rs in per for r in rs),
+                         key=lambda r: (r["at"], r["seq"]))
+    have = [(k, rs) for k, rs in per if _states(rs)]
+    if not have:
+        rec["key"] = "notrecv"
+        return rec
+    pick = None
+    for k, rs in have:
+        key, row = _state_at(rs, off)
+        if key not in ("after", ""):
+            pick = (k, rs, key, row)
+            break
+    if pick is None:
+        k, rs = have[0]
+        key, row = _state_at(rs, off)
+        pick = (k, rs, key, row)
+    k, rs, key, row = pick
+    rec["key"], rec["at_row"], rec["by"] = key, row, k[0]
+    rec["truncated"] = len(rs) >= TRACE_CAP
+    last = _states(rs)[-1]
+    rec["then"] = _trace_key(last["status"], last["reason"])
+    if last["status"] != "retired":
+        nxt = [c for c in closes if c[0] == last["run"] and c[1] > last["seq"]]
+        if nxt:
+            rec["closed"] = nxt[0]
+    return rec
+
+
+def attach_traces(ch, rows, lo=None, hi=None, marks_by_slot=None):
+    """On every diff row, `trace`: the order's builder_order_traces history
+    on the row's own builder, and its state when the offer compared here
+    went out. Bundle members get `trace` too: the member as a plain tx."""
+    want = [x for x in rows if x.get("verdict") in DIFF_VERDICTS]
+    if not want:
+        return rows
+    keys, insts, uuids = set(), set(), set()
+    for x in want:
+        insts.add(x.get("our_builder"))
+        uuids.add(x.get("our_uuid"))
+        if x.get("bundle_id"):
+            keys.add(("bundle", x["bundle_id"]))
+        if x.get("sigprefix"):
+            keys.add(("tx", x["sigprefix"]))
+        for m in x.get("members") or []:
+            if m.get("prefix"):
+                keys.add(("tx", m["prefix"]))
+    insts.discard(None)
+    traced = traced_instances(ch, insts, lo, hi)
+    tr = order_traces(ch, keys, traced, lo, hi)
+    ob = offer_boundaries(ch, uuids, traced, lo, hi)
+    wc = window_closes(ch, traced, lo, hi)
+    for x in want:
+        inst = x.get("our_builder")
+        mk = ((marks_by_slot or {}).get(x["slot"]) or {}).get(
+            (inst, int(x["round"])))
+        off = ob.get((inst, x.get("our_uuid")))
+        ks = []
+        if x.get("bundle_id"):
+            ks.append(("bundle", x["bundle_id"]))
+        if x.get("sigprefix"):
+            ks.append(("tx", x["sigprefix"]))
+        x["trace"] = _trace_one(tr, ks, inst, off, traced, mk,
+                                wc.get(inst, ()))
+        for m in x.get("members") or []:
+            if m.get("prefix") and "trace" not in m:
+                m["trace"] = _trace_one(tr, [("tx", m["prefix"])], inst, off,
+                                        traced, mk, wc.get(inst, ()))
+    return rows
+
+
+def _trace_path(rec):
+    """'r190/2 check_pending > auction_ready > selection_skipped:relay_delay
+    | r191/0 ...' -- the state path, the round written when it changes,
+    '*' at the offer compared here."""
+    if not rec or not rec.get("rows"):
+        return ""
+    out, cur = [], None
+    at = rec.get("at_row")
+    for r in rec["rows"]:
+        if not r["status"] and r["event"] == "order_transition":
+            continue
+        rd = f"{r['slot']}/{r['round']}" if r["slot"] else "pre"
+        lab = (_trace_key(r["status"], r["reason"]) if r["status"]
+               else f"{r['event']}:{r['reason']}")
+        if r["kind"] == "bundle" and any(z["kind"] == "tx" for z in rec["rows"]):
+            lab = "bundle " + lab
+        if r is at:
+            lab += "*"
+        if rd != cur:
+            out.append(f"| r{rd} {lab}" if out else f"r{rd} {lab}")
+            cur = rd
+        else:
+            out.append(f"> {lab}")
+    return " ".join(out)
 
 
 # ------------------------------------------------------------- titan_off
@@ -1925,6 +2270,12 @@ def _sel_filters(rows):
         f'data-l="{html.escape(_sched_label(k), quote=True)}">'
         f"{html.escape(_sched_label(k))} ({n:,})</option>"
         for k, n in sorted(sc.items(), key=lambda kv: -kv[1]))
+    rc = collections.Counter(_trace_fkey(i) for i in real)
+    ropts = "".join(
+        f'<option value="{html.escape(k, quote=True)}" '
+        f'data-l="{html.escape(_trace_flabel(k), quote=True)}">'
+        f"{html.escape(_trace_flabel(k))} ({n:,})</option>"
+        for k, n in sorted(rc.items(), key=lambda kv: -kv[1]))
     return ('<div class="selfilt"><span class="dim">filter</span> '
             f'<label>verdict <select class="sf-v"><option value="">both '
             f"({len(real):,})</option>{vopts}</select></label> "
@@ -1934,6 +2285,10 @@ def _sel_filters(rows):
             f'<span class="sfks">{kbox}</span> '
             '<label>scheduler said <select class="sf-s"><option value="">'
             f"anything</option>{sopts}</select></label> "
+            '<label title="builder_order_traces: the state on our builder '
+            "when the compared offer was dispatched\">at our offer "
+            '<select class="sf-r"><option value="">anything</option>'
+            f"{ropts}</select></label> "
             '<span class="sf-n dim"></span> '
             '<span class="sf-use" role="button" tabindex="0" hidden '
             'title="drop this slot\'s own filter and follow the page '
@@ -1962,6 +2317,8 @@ def global_filter_html(builders=()):
             f"</option>{bopts}</select></label> "
             f'<span class="sfks">{kbox}</span> '
             '<label>scheduler said <select class="gf-s"><option value="">'
+            "anything</option></select></label> "
+            '<label>at our offer <select class="gf-r"><option value="">'
             "anything</option></select></label> "
             '<span class="gfnote dim">a slot\'s own filter overrides this '
             "once changed</span></div>")
@@ -2007,6 +2364,7 @@ def _sel_rows(rnd, titan_builder, titan_side, our_sides, contents,
             "connector": rnd["connector"], "won_by": rnd["winner"],
             "we_won": _is_ours(rnd["winner"]),
             "our_builder": our_builder, "titan_builder": titan_builder,
+            "our_uuid": our.get("uuid") or "",
             "our_bid": our["bid"], "titan_bid": titan_side["bid"],
             "bid_gap": our["bid"] - titan_side["bid"],
             "our_cost": our["cost"], "titan_cost": titan_side["cost"],
@@ -2259,11 +2617,17 @@ def selection_diff(relay_q, ch, rounds_, window, blocks=None,
     # the chunk's own window, so the scan stays narrow even over a range
     attach_notes(ch, flat_rows, *(window or (None, None)))
     lo, hi = window or (None, None)
+    marks_by_slot = {}
     for sl in {x["slot"] for x in flat_rows}:
         part = [x for x in flat_rows if x["slot"] == sl]
-        marks = round_marks(ch, sl, lo, hi)
+        marks = marks_by_slot[sl] = round_marks(ch, sl, lo, hi)
         attach_recv(ch, part, sl, lo, hi, marks=marks)
         attach_member_recv(ch, part, marks, lo, hi)
+    try:
+        attach_traces(ch, flat_rows, lo, hi, marks_by_slot)
+    except Exception as exc:
+        for x in flat_rows:
+            x["trace_why"] = f"could not be read: {str(exc)[:120]}"
     try:
         attach_titan_off(relay_q, ch, flat_rows, window)
     except Exception as exc:
@@ -2286,6 +2650,14 @@ def _sel_flat(x, col):
         return {"titan_off_ms": round(t["ms"], 3),
                 "titan_off_err_ms": round(t["err"], 3),
                 "titan_off_on": t["inst"], "titan_first_by": t["by"]}[col]
+    if col.startswith("trace_"):
+        t = x.get("trace")
+        if not t:
+            return x.get("trace_why", "") if col == "trace_at_our_offer" else ""
+        return {"trace_on": t["inst"], "trace_at_our_offer": t["key"],
+                "trace_then": t["then"],
+                "trace_window_closed": "yes" if t.get("closed") else "",
+                "trace_path": _trace_path(t)}[col]
     if col == "wait_us":
         rec = x.get("recv") or {}
         if not rec:
@@ -2708,6 +3080,9 @@ def _row_copy(i, kind):
                            else None),
         "scheduler": "; ".join(e + (f" {r}" if r else "")
                                for e, r in _sched_pairs(i)),
+        "trace_at_our_offer": (i.get("trace") or {}).get("key") or None,
+        "trace_then": (i.get("trace") or {}).get("then") or None,
+        "trace_path": _trace_path(i.get("trace")) or None,
         "slot": i["slot"], "rn": i["round"]}, separators=(",", ":"))
 
 
@@ -2776,6 +3151,166 @@ def _units(rows):
     return out
 
 
+def _trace_chip(key):
+    """No hover of its own: the help text is long and the chip repeats in
+    every row; the cell's title carries it once."""
+    words, cls, _hlp = trace_label(key)
+    return f'<span class="tr {cls}">{html.escape(words)}</span>'
+
+
+def _trace_fkey(x):
+    """The filter key: the state at our offer, '__none' without a trace."""
+    t = x.get("trace")
+    return (t or {}).get("key") or "__none"
+
+
+def _trace_flabel(k):
+    return "no trace" if k == "__none" else trace_label(k)[0]
+
+
+def _trace_summary(t, bundle_row=False):
+    """Chip for the state at our offer, then what became of the order."""
+    if not t:
+        return '<span class="dim">&mdash;</span>'
+    out = _trace_chip(t["key"])
+    if t.get("by") == "tx" and bundle_row:
+        out += (' <span class="dim" title="the bundle itself was not in hand '
+                "at our offer; this is the state of its transaction, which "
+                'had arrived on its own">as tx</span>')
+    if t.get("then") and t["then"] != t["key"]:
+        out += '<div class="trthen">then ' + _trace_chip(t["then"]) + "</div>"
+    if t.get("closed"):
+        out += ('<div class="trthen" title="our leader window closed with '
+                "the order still pending; no retire row is written for "
+                'that">window closed</div>')
+    if t.get("truncated"):
+        out += f'<div class="trthen">first {TRACE_CAP} rows</div>'
+    return out
+
+
+def _trace_cell(x, tid):
+    t = x.get("trace")
+    if not t:
+        why = html.escape(x.get("trace_why") or "no trace looked up",
+                          quote=True)
+        return f'<td class="trc dim" title="{why}">&mdash;</td>'
+    off = t.get("offer") or {}
+    title = html.escape(
+        f"{t['inst']}: the order's last state when our offer "
+        f"{(x.get('our_uuid') or '?')[:8]} (the one compared here) was "
+        f"dispatched" + (f", trace_seq {off['seq']}" if off else "")
+        + ". " + (trace_label(t["key"])[2] or "")
+        + " Click for every state change.", quote=True)
+    body = _trace_summary(t, bool(x.get("bundle_id")))
+    if t.get("rows"):
+        body = (f'<span class="scopen" data-sx="{tid}" role="button" '
+                f'tabindex="0">{body}</span>')
+    return f'<td class="trc" title="{title}">{body}</td>'
+
+
+def _trace_panel(x):
+    """Every row the builder traced for this order on our builder, in
+    order, with the round's boundaries on the same clock: round opened,
+    our compared offer dispatched, the winner announced, window closed.
+    ms are from this round's round_started on that instance."""
+    t = x["trace"]
+    opn = t.get("open")
+    first = t["rows"][0]["seq"] if t["rows"] else 0
+    ev = []
+    for r in t["rows"]:
+        lab = (r["status"] or r["event"])
+        ck = " / ".join(v for v in (
+            f"branch {r['branch']}" if r["branch"] else "",
+            f"ckpt {r['checkpoint']}" if r["checkpoint"] else "",
+            f"req {r['request']}" if r["request"] else "",
+            f"common {r['common']}" if r["common"] else "") if v)
+        cls = trace_label(_trace_key(r["status"], r["reason"]))[1] \
+            if r["status"] else "na"
+        mark = " trat" if r is t.get("at_row") else ""
+        ev.append((r["at"], r["seq"], 1,
+                   f'<tr class="trrow{mark}"><td class="n m">'
+                   f'{r["seq"]}<span class="dim"> +{r["seq"] - first}</span>'
+                   f'</td><td class="n m">{_fmt_ms(opn, r["at"])}</td>'
+                   f'<td class="m">{r["slot"] + "/" + r["round"] if r["slot"] else "&mdash;"}</td>'
+                   f'<td class="kd {"bundle" if r["kind"] == "bundle" else "txn"}">'
+                   f'{"bundle" if r["kind"] == "bundle" else "tx"}</td>'
+                   f'<td class="dim">{html.escape(r["event"])}</td>'
+                   f'<td><span class="tr {cls}">{html.escape(r["status"])}'
+                   f'</span></td><td>{html.escape(r["reason"])}</td>'
+                   f'<td class="dim">{html.escape(ck)}</td></tr>'))
+
+    def marker(at, seq, text):
+        if at:
+            ev.append((at, seq if seq is not None else -1, 0,
+                       f'<tr class="trmark"><td class="n m">'
+                       f'{"" if seq is None else seq}</td>'
+                       f'<td class="n m">{_fmt_ms(opn, at)}</td>'
+                       f"<td colspan=6>{text}</td></tr>"))
+    off = t.get("offer")
+    marker(opn, None, f"round r{x['round']} opened (round_started)")
+    if off:
+        marker(off["at"], off["seq"],
+               f"<b>our offer {html.escape((x.get('our_uuid') or '')[:8])} "
+               "dispatched</b> &mdash; the one compared on this row")
+    marker(t.get("win"), None, "winner announced to us (winner row)")
+    if t.get("closed"):
+        marker(t["closed"][2], t["closed"][1], "our leader window closed")
+    ev.sort(key=lambda e: (e[0], e[1]))
+    # compact on purpose: one panel per diff row, and a pretty-printed
+    # dict per trace row made the panels 40% of a slot's page
+    blob = json.dumps({
+        "slot": x["slot"], "round": x["round"], "instance": t["inst"],
+        "our_offer": x.get("our_uuid"),
+        "offer_trace_seq": (off or {}).get("seq"),
+        "at_our_offer": t["key"], "then": t["then"],
+        "sigprefix": x.get("sigprefix"), "bundle_id": x.get("bundle_id"),
+        "cols": ["trace_seq", "ts", "slot/round", "entity", "event",
+                 "status", "reason", "branch", "checkpoint"],
+        "rows": [[r["seq"], r["at"], f"{r['slot']}/{r['round']}",
+                  r["kind"], r["event"], r["status"], r["reason"],
+                  r["branch"], r["checkpoint"]] for r in t["rows"]]},
+        separators=(",", ":"))
+    return ('<div class="sxbox"><div class="sxh">order trace on '
+            f'<b>{html.escape(t["inst"])}</b> &middot; at our offer '
+            f'<span class="tr {trace_label(t["key"])[1]}">'
+            f'{html.escape(trace_label(t["key"])[0])}</span> &middot; '
+            + copy_val(blob, "copy as JSON")
+            + ' <span class="dim">&middot; builder_order_traces: one row per '
+            "change of status, reason or round; ms from round_started on the "
+            "same instance</span></div>"
+            '<table class="otab trtab"><tr><th class="n">trace_seq</th>'
+            '<th class="n">ms</th><th>slot/r</th><th>entity</th>'
+            "<th>event</th><th>status</th><th>reason</th>"
+            "<th>branch / checkpoint</th></tr>"
+            + "".join(e[3] for e in ev) + "</table></div>")
+
+
+def _fmt_ms(a, b):
+    v = _ms(a, b) if a and b else None
+    return "&mdash;" if v is None else f"{v:+.1f}"
+
+
+def _trace_mix(group, verdict="titan_inc_not_us"):
+    """One line: for this verdict's orders that our builder received,
+    where each stood when our compared offer went out."""
+    rows = [i for i in _units([i for i in group if i["verdict"] == verdict])
+            if i.get("trace") and i["trace"]["key"] not in ("", "untraced")]
+    if not rows:
+        t = next((i.get("trace") for i in group if i.get("trace")), None)
+        if t and t["key"] == "untraced":
+            return (f'<div class="selcnt dim">no order traces: '
+                    f"{html.escape(t['inst'])} runs a build without them "
+                    "(builder #134)</div>")
+        return ""
+    c = collections.Counter(i["trace"]["key"] for i in rows)
+    bits = " &middot; ".join(f"{_trace_chip(k)} <b>{n:,}</b>"
+                             for k, n in c.most_common())
+    return (f'<div class="selcnt"><span class="vd ti">{verdict}</span> '
+            f"at our offer: {bits} <span class=\"dim\">(state of each order "
+            "on our builder when the compared offer was dispatched)</span>"
+            "</div>")
+
+
 def _sel_table(group):
     out = ['<table class="otab"><tr><th>#</th><th>verdict</th><th>type</th>'
            "<th>signature</th><th>sigprefix</th><th>bundle</th>"
@@ -2786,6 +3321,7 @@ def _sel_table(group):
            '<th class="n" title="ms from the builder admitting the order to that builder&#39;s own winner row (bifrost_miniblocks kind = winner) for this slot and round, same clock">win &minus;recv</th>'
            '<th class="n" title="the relay&#39;s hold on the order (scheduler/received nums wait_us), ms: the builder may not extend it before admission + wait. 0 = no hold (votes, non-nonce bundles, searcher flow); blank = not logged">wait</th>'
            '<th class="n" title="titan_off: ms from our builder admitting the order (scheduler/received) to Titan&#39;s FIRST offer carrying it on this connector, this slot or the 3 before (relay submitted stamp). Our stamp is moved onto the relay clock with the relay - builder offset measured around that moment (two-sided bound, error on hover). Negative = Titan offered it before we had it">titan off</th>'
+           '<th title="builder_order_traces: the order&#39;s state on our builder when the offer compared here was dispatched (same trace_seq counter, no clock), then what became of it. Click for the full sequence">at our offer</th>'
            "<th>scheduler said</th></tr>"]
     real = _units([i for i in group
                    if i["verdict"] not in ("no_accepted_offer",
@@ -2815,7 +3351,7 @@ def _sel_table(group):
                        f'{n} txn{"" if n == 1 else "s"}</span></span>')
             bid += (f' <span class="dim bxo" title="members of this bundle '
                     f'that are in the diff">{k} of {n} in diff</span>')
-            bx = (f'<tr class="sxrow" id="{bxid}" hidden><td colspan=13>'
+            bx = (f'<tr class="sxrow" id="{bxid}" hidden><td colspan=14>'
                   + _bundle_panel(i) + "</td></tr>")
         vcls = "us" if i["verdict"] == "us_inc_not_titan" else "ti"
         pairs = _sched_pairs(i)
@@ -2842,14 +3378,16 @@ def _sel_table(group):
         kind = i.get("kind") or "txn"
         battr += (f' data-v="{i["verdict"]}" data-k="{kind}" '
                   f'data-o="{html.escape(i.get("our_builder") or "", quote=True)}" '
-                  f'data-s="{html.escape(_sched_key(i), quote=True)}"')
+                  f'data-s="{html.escape(_sched_key(i), quote=True)}" '
+                  f'data-r="{html.escape(_trace_fkey(i), quote=True)}"')
+        tid = "tr" + rid[2:]
         aid = "ap" + rid[2:]
         atag = _api_tag(i, aid)
         # the row number copies the whole row
         rowcp = (f'<span class="cpv" data-c="{html.escape(_row_copy(i, kind), quote=True)}" '
                  'role="button" tabindex="0" title="click to copy this row (type, '
                  "signature, sigprefix, bundle, landed, reward, recv_open, win_recv, "
-                 f'wait_us, scheduler, slot, rn) as JSON">{i["order_index"]} &#x29C9;</span>')
+                 f'wait_us, titan_off, scheduler, trace at our offer and path, slot, rn) as JSON">{i["order_index"]} &#x29C9;</span>')
         out.append(f'<tr{battr}{extra}><td class="n">{rowcp}</td>'
                    f'<td><span class="vd {vcls}">{i["verdict"]}</span></td>'
                    f'<td class="kd {kind}"'
@@ -2865,14 +3403,18 @@ def _sel_table(group):
                    f'<td class="n">{_rw_cell(i)}</td>'
                    f'{_recv_cells(i, i.get("our_builder"))}'
                    f'{_toff_cell(i)}'
+                   f'{_trace_cell(i, tid)}'
                    f"<td>{cell}</td></tr>")
         if bx:
             out.append(bx)
+        if (i.get("trace") or {}).get("rows"):
+            out.append(f'<tr class="sxrow" id="{tid}" hidden><td colspan=14>'
+                       + _trace_panel(i) + "</td></tr>")
         if pairs:
-            out.append(f'<tr class="sxrow" id="{rid}" hidden><td colspan=13>'
+            out.append(f'<tr class="sxrow" id="{rid}" hidden><td colspan=14>'
                        + _sched_panel(i) + "</td></tr>")
         if i.get("api_bundles") or i.get("api_txs"):
-            out.append(f'<tr class="sxrow" id="{aid}" hidden><td colspan=13>'
+            out.append(f'<tr class="sxrow" id="{aid}" hidden><td colspan=14>'
                        + _api_panel(i) + "</td></tr>")
     out.append("</table>")
     if len(real) > len(shown):
@@ -2909,7 +3451,9 @@ def _bundle_panel(i):
             + (_toff_cell(mine[m["prefix"]]) if m.get("prefix") in mine
                else '<td class="n dim">&mdash;</td>')
             + f"<td>{_alone_cell(m)}</td>"
-            + f"<td>{_alone_sched_cell(m)}</td></tr>")
+            + f"<td>{_alone_sched_cell(m)}</td>"
+            + f'<td class="trc" title="{html.escape(_trace_path(m.get("trace")), quote=True)}">'
+            + _trace_summary(m.get("trace")) + "</td></tr>")
     return ('<div class="sxbox"><div class="sxh">bundle '
             + copy_val(i["bundle_id"], i["bundle_id"][:16] + "\u2026")
             + f' &middot; {len(i["members"])} member'
@@ -2931,7 +3475,11 @@ def _bundle_panel(i):
             "per instance, ms after that instance\'s round_started. The "
             "bundle\'s own verdicts are on the row above, under its bundle "
             'id. Hover a line for the raw attrs and nums">'
-            "scheduler events as a tx</th></tr>"
+            "scheduler events as a tx</th>"
+            '<th title="builder_order_traces for the member as a plain tx on '
+            "our builder: its state when the compared offer was dispatched, "
+            'then what became of it. Hover for the whole path">trace as a tx'
+            "</th></tr>"
             + "".join(rows) + "</table></div>")
 
 
@@ -3132,7 +3680,7 @@ def selection_html(rows, slot):
                    + html.escape(g[0].get("our_builder") or "", quote=True)
                    + '">' + _sel_head(g[0])
                    + f'<div class="selcnt">{_sel_counts(g)}</div>'
-                   + _kind_mix(g) + extra + _sel_table(g) + "</div>")
+                   + _kind_mix(g) + _trace_mix(g) + extra + _sel_table(g) + "</div>")
     out.append("</div>")
 
     lost = [x for x in rows if not x["we_won"]]
@@ -4578,6 +5126,13 @@ td.kd i{font-style:normal;color:var(--bad);font-size:10px;margin-left:4px}
   white-space:nowrap}
 .sc i{color:var(--text2);font-style:normal;margin-left:4px}
 .scopen{cursor:pointer;border-bottom:1px dotted var(--line2)}
+.tr{font:10px ui-monospace,Menlo,monospace;white-space:nowrap}
+.tr.pend{color:var(--accent)}.tr.hold{color:var(--violet)}
+.tr.bad{color:var(--bad)}.tr.inc{color:var(--good)}.tr.na{color:var(--text3)}
+.trthen{font-size:10px;color:var(--text3);white-space:nowrap}
+td.trc{min-width:120px}
+.trtab tr.trmark td{background:var(--accent-bg);color:var(--text2);font-size:10.5px}
+.trtab tr.trat td{box-shadow:inset 0 -1px 0 var(--accent)}
 .scopen:hover,.scopen:focus{border-bottom-color:var(--accent);outline:none}
 /* A hovered value GLOWS, not just recolours: these are 88-char
    signatures in an 11.5px table, and the eye needs help finding the one
@@ -4846,6 +5401,8 @@ ACCURACY_JS = r'''
     if (!sec) return;
     var v = bar.querySelector('.sf-v').value;
     var s = bar.querySelector('.sf-s').value;
+    var rb = bar.querySelector('.sf-r');
+    var r = rb ? rb.value : '';
     var ob = bar.querySelector('.sf-o');
     var o = ob ? ob.value : '';
     sec.querySelectorAll('.selblk[data-o]').forEach(function(blk){
@@ -4854,7 +5411,7 @@ ACCURACY_JS = r'''
     var boxes = bar.querySelectorAll('.sf-t');
     var kinds = [].filter.call(boxes, function(b){ return b.checked; })
                   .map(function(b){ return b.value; });
-    var active = !!(v || s || o || kinds.length !== boxes.length);
+    var active = !!(v || s || r || o || kinds.length !== boxes.length);
     var shown = 0, total = 0;
     sec.querySelectorAll('table.otab').forEach(function(tab){
       var note = tab.nextElementSibling;
@@ -4868,7 +5425,8 @@ ACCURACY_JS = r'''
             && (!o || tr.getAttribute('data-o') === o)
             && kinds.indexOf(tr.getAttribute('data-k')) >= 0
             && (!s || ('|' + tr.getAttribute('data-s') + '|')
-                        .indexOf('|' + s + '|') >= 0);
+                        .indexOf('|' + s + '|') >= 0)
+            && (!r || tr.getAttribute('data-r') === r);
           if (active) tr.hidden = !ok;
           else tr.hidden = capped && tr.classList.contains('selx');
           parentHidden = tr.hidden;
@@ -4886,7 +5444,7 @@ ACCURACY_JS = r'''
   // are taken over those rows alone, not narrowed by each other. The
   // builder counts follow the verdict.
   function recount(bar, sec, v, o){
-    var kc = {}, sc = {}, oc = {};
+    var kc = {}, sc = {}, oc = {}, rc = {};
     sec.querySelectorAll('tr[data-v]').forEach(function(tr){
       if (v && tr.getAttribute('data-v') !== v) return;
       var ob = tr.getAttribute('data-o');
@@ -4897,6 +5455,13 @@ ACCURACY_JS = r'''
       tr.getAttribute('data-s').split('|').forEach(function(x){
         sc[x] = (sc[x] || 0) + 1;
       });
+      var rk = tr.getAttribute('data-r');
+      rc[rk] = (rc[rk] || 0) + 1;
+    });
+    bar.querySelectorAll('.sf-r option[data-l]').forEach(function(op){
+      var c = rc[op.value] || 0;
+      op.textContent = op.getAttribute('data-l') + ' (' + c.toLocaleString() + ')';
+      op.disabled = c === 0 && !op.selected;
     });
     bar.querySelectorAll('.sf-t').forEach(function(b){
       var c = b.parentNode.querySelector('.sf-c');
@@ -4932,11 +5497,12 @@ ACCURACY_JS = r'''
   if (!g) return;
   var KEY = 'accuracy.pagefilter.v1';
   var gv = g.querySelector('.gf-v'), go = g.querySelector('.gf-o'),
-      gs = g.querySelector('.gf-s');
+      gs = g.querySelector('.gf-s'), gr = g.querySelector('.gf-r');
   function state(){
-    var so = gs.selectedOptions[0];
-    return {v: gv.value, o: go.value, s: gs.value,
+    var so = gs.selectedOptions[0], ro = gr.selectedOptions[0];
+    return {v: gv.value, o: go.value, s: gs.value, r: gr.value,
             sl: (so && so.getAttribute('data-l')) || gs.value,
+            rl: (ro && ro.getAttribute('data-l')) || gr.value,
             k: [].filter.call(g.querySelectorAll('.gf-t'),
                               function(b){ return b.checked; })
                  .map(function(b){ return b.value; })};
@@ -4959,7 +5525,8 @@ ACCURACY_JS = r'''
     if (bar.getAttribute('data-local') === '1') return;
     var st = state();
     var v = bar.querySelector('.sf-v'), o = bar.querySelector('.sf-o'),
-        s = bar.querySelector('.sf-s');
+        s = bar.querySelector('.sf-s'), rr = bar.querySelector('.sf-r');
+    ensure(rr, st.r, st.rl); if (rr) rr.value = st.r || '';
     ensure(v, st.v); if (v) v.value = st.v;
     ensure(o, st.o); if (o) o.value = st.o;
     ensure(s, st.s, st.sl); if (s) s.value = st.s;
@@ -4976,6 +5543,9 @@ ACCURACY_JS = r'''
     bar.querySelectorAll('.sf-o option[data-l]').forEach(function(op){
       ensure(go, op.value, op.getAttribute('data-l'));
     });
+    bar.querySelectorAll('.sf-r option[data-l]').forEach(function(op){
+      ensure(gr, op.value, op.getAttribute('data-l'));
+    });
   }
   function save(){
     try { localStorage.setItem(KEY, JSON.stringify(state())); } catch(e) {}
@@ -4987,6 +5557,7 @@ ACCURACY_JS = r'''
       ensure(gv, st.v); gv.value = st.v || '';
       ensure(go, st.o); go.value = st.o || '';
       ensure(gs, st.s, st.sl || st.s); gs.value = st.s || '';
+      ensure(gr, st.r, st.rl || st.r); gr.value = st.r || '';
       g.querySelectorAll('.gf-t').forEach(function(b){
         b.checked = !st.k || st.k.indexOf(b.value) >= 0;
       });
