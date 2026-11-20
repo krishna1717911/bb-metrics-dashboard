@@ -3165,6 +3165,8 @@ DEP_FREE_PATHS = {HEALTH_PATH, ACCURACY_PATH, ACCURACY_PATH + '/slot',
                   HOME_PATH, DEPLOYHIST_PATH, VALCOMP_PATH,
                   ACCURACY_PATH + '/export.csv',
                   '/tech/offer-timelines', '/tech/offer-timelines/slot',
+                  '/tech/offer-diff', '/tech/offer-diff/slot',
+                  '/tech/offer-diff/pair',
                   '/api/accuracy/export', '/api/accuracy/status',
                   SNAPSHOT_PATH,
                   REWARDS_PATH,
@@ -4263,10 +4265,17 @@ window.__renderOffers = function(){
         if(top && b.u === top.u)
           mk('circle', {cx: colX(i), cy: cy, r: r + 4.2, class: 'ohalo'}, g);
         var m = marker(g, st.s, colX(i), cy, r, st.c, cls);
+        if(b.u) m.setAttribute('data-ou', b.u);
         m.addEventListener('mouseenter', function(ev){ show(ev, rd, b, base); });
         m.addEventListener('mouseleave', hide);
-        if(b.x) m.addEventListener('click', function(){ copyOffer(b); });
+        // the offer diff page: a click picks the offer instead of copying it
+        if(D.pick && window.__offerPick) m.addEventListener('click', function(){
+          window.__offerPick(b.u, D.slot, b.b + ' r' + rd.round + ' +'
+                             + (b.t - base) + ' ms \u00b7 ' + b.r.toLocaleString());
+        });
+        else if(b.x) m.addEventListener('click', function(){ copyOffer(b); });
       });
+      if(window.__offerPaint) window.__offerPaint();
     }
     draw();
     card._draw = draw;
@@ -4289,7 +4298,8 @@ window.__renderOffers = function(){
             + ' ms after the deadline</span>' : '')
       + (best && best.u === b.u ? '<span class="topT">highest reward this round</span>' : '')
       + (b.v ? '<span class="g">' + esc(b.v) + '</span>' : '')
-      + (b.x ? '<span class="g">click to copy every field as JSON</span>' : '');
+      + (D.pick ? '<span class="g">click to pick for the diff</span>'
+         : b.x ? '<span class="g">click to copy every field as JSON</span>' : '');
     document.body.appendChild(tip);
     var r = ev.target.getBoundingClientRect();
     var left = Math.min(r.right + 10, window.innerWidth - tip.offsetWidth - 10);
@@ -9238,6 +9248,13 @@ PAGES = [
                "down the spine, one column per builder, one bullet per "
                "offer, against when the relay opened the round.",
          ready=True),
+    dict(id="offerdiff", section="tech", path="/tech/offer-diff",
+         title="offer diff",
+         blurb="Any two offers off a slot's race, side by side: which "
+               "transactions and bundles each carries that the other does "
+               "not, what each pays as the relay scores it, and for our "
+               "builder's missing ones, why it left them out.",
+         ready=True),
     dict(id="accuracy", section="tech", path=ACCURACY_PATH,
          title="builder accuracy",
          blurb="How close what we offered is to what actually won — "
@@ -9511,6 +9528,9 @@ ACCURACY_PATH_SLOT = ACCURACY_PATH + "/slot"
 ACCURACY_EXPORT = ACCURACY_PATH + "/export.csv"
 OFFERTL_PATH = "/tech/offer-timelines"
 OFFERTL_PATH_SLOT = OFFERTL_PATH + "/slot"
+OFFERDIFF_PATH = "/tech/offer-diff"
+OFFERDIFF_PATH_SLOT = OFFERDIFF_PATH + "/slot"
+OFFERDIFF_PATH_PAIR = OFFERDIFF_PATH + "/pair"
 # Our own builders, for highlighting a win in a table full of Titan's.
 OURS_RE = re.compile(r"^ASTRALANE", re.I)
 
@@ -9727,11 +9747,15 @@ def lookup_page(qs):
                  extra_css=accuracy.CSS + lookup.CSS)
 
 
-def offer_timeline_page(qs):
+def offer_timeline_page(qs, diff=False):
     """Every builder's bidding, slot by slot. Its own page rather than a
     mode of builder accuracy: it asks a different question (who OFFERED,
     not who won) off a different key, and it is the only view here that
-    is about the auction rather than the block."""
+    is about the auction rather than the block.
+
+    `diff`: the offer diff page -- the same slot list and race, where a
+    click picks an offer and two picks load their diff."""
+    path = OFFERDIFF_PATH if diff else OFFERTL_PATH
     r = accuracy.parse_range(qs)
     # The validator filter lists the connectors the region's relays opened
     # rounds for in this window, named from the Firedancer report where it
@@ -9759,8 +9783,16 @@ def offer_timeline_page(qs):
         except Exception as exc:
             nextlead = ('<div class="nextlead aqcap">next leader slot unknown: '
                         f"{html.escape(str(exc)[:120])}</div>")
-    body = nextlead + accuracy.form_html(r, OFFERTL_PATH, metric=False, region=True,
+    body = nextlead + accuracy.form_html(r, path, metric=False, region=True,
                               connectors=opts)
+    if diff:
+        body += ('<div class="aqhead">Open a slot, then click two offers in '
+                 "its race (or two rows' <b>pick</b>): A, then B. The diff "
+                 "lists what each offer carries that the other does not, "
+                 "what each order pays as the relay scores it, and for an "
+                 "offer of ours, why it left the other's orders out. A third "
+                 "click replaces the older pick; clicking a pick again drops "
+                 "it.</div>")
     if r["err"]:
         body += accuracy.timeline_table_html(r, [], 0, 0, OURS_RE)
     elif not r["connector"] and r["mode"] != "slot":
@@ -9773,20 +9805,24 @@ def offer_timeline_page(qs):
             slots, shown, total = accuracy.timeline_slots(
                 relay, r, region=r["region"], connector=r["connector"],
                 ch=clickhouse_main)
-            body += accuracy.timeline_table_html(r, slots, shown, total,
-                                                 OURS_RE, slot_ref=_slot_ref(),
-                                                 names=names)
+            body += accuracy.timeline_table_html(
+                r, slots, shown, total, OURS_RE, slot_ref=_slot_ref(),
+                names=names,
+                frag=OFFERDIFF_PATH_SLOT if diff else OFFERTL_PATH_SLOT)
         except Exception as exc:
             body += ('<div class="herr" style="margin:20px 28px">the relay '
                      f"could not be read: {html.escape(str(exc)[:300])}</div>")
-    return shell(body, here="offertl", subtitle="offer timelines",
+    return shell(body, here="offerdiff" if diff else "offertl",
+                 subtitle="offer diff" if diff else "offer timelines",
                  extra_css=accuracy.CSS,
                  scripts=(f"<script>{accuracy.ACCURACY_JS}</script>"
-                          f"<script>{OFFERS_JS}</script>"
+                          + (f"<script>{accuracy.OFFDIFF_JS}</script>"
+                             if diff else "")
+                          + f"<script>{OFFERS_JS}</script>"
                           f'<script>{TICK_JS.replace("__SERVER_NOW__", f"{time.time():.3f}")}</script>'))
 
 
-def offer_timeline_slot_html(qs):
+def offer_timeline_slot_html(qs, diff=False):
     try:
         slot = int((qs.get("slot", [""])[0] or "0").strip())
     except ValueError:
@@ -9808,7 +9844,27 @@ def offer_timeline_slot_html(qs):
         if not d.get("rounds"):
             return ('<div class="dmeta">no builder offered into this slot, '
                     "in the relay's store or in ours</div>")
-    return accuracy.timeline_html(d, names=_validator_names())
+    return accuracy.timeline_html(d, names=_validator_names(), pick=diff,
+                                  region=reg)
+
+
+def offer_diff_pair_html(qs):
+    """The diff of two picked offers, for the offer diff page."""
+    one = lambda k: (qs.get(k, [""])[0] or "").strip()
+    try:
+        slot = int(one("slot") or "0")
+    except ValueError:
+        slot = 0
+    if slot <= 0:
+        return '<div class="dmeta">not a slot</div>'
+    try:
+        d = accuracy.offer_pair(relay, clickhouse_main, SOLANA_RPC, slot,
+                                one("a"), one("b"), one("region") or "all",
+                                relayer_q=relayer, quant_q=clickhouse_quant)
+    except Exception as exc:
+        return ('<div class="dmeta aqcap">the diff could not be built: '
+                f"{html.escape(str(exc)[:300])}</div>")
+    return accuracy.pair_html(d)
 
 
 def accuracy_export_start(qs):
@@ -10214,6 +10270,9 @@ class Handler(BaseHTTPRequestHandler):
             ACCURACY_PATH_SLOT: (self._frag_accuracy_slot, True),
             OFFERTL_PATH: (self._page_offertl, False),
             OFFERTL_PATH_SLOT: (self._frag_offertl_slot, True),
+            OFFERDIFF_PATH: (self._page_offerdiff, False),
+            OFFERDIFF_PATH_SLOT: (self._frag_offerdiff_slot, True),
+            OFFERDIFF_PATH_PAIR: (self._frag_offerdiff_pair, True),
             DEPLOYHIST_PATH: (self._page_deployments, False),
             lookup.LOOKUP_PATH: (lambda q: lookup_page(q), False),
             SLOTS_PATH: (self._page_slots, False),
@@ -10238,6 +10297,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def _frag_offertl_slot(self, q):
         return offer_timeline_slot_html(q)
+
+    def _page_offerdiff(self, q):
+        return offer_timeline_page(q, diff=True)
+
+    def _frag_offerdiff_slot(self, q):
+        return offer_timeline_slot_html(q, diff=True)
+
+    def _frag_offerdiff_pair(self, q):
+        return offer_diff_pair_html(q)
 
     def _accuracy_export_file(self, q):
         """The finished CSV, by job id. See accuracy.export_file -- the

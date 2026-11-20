@@ -1527,7 +1527,9 @@ def _recv_cells(x, prefer=None):
 
 TRACE_CAP = 300                 # rows per order per instance, oldest first
 TRACE_PAD = dt.timedelta(minutes=3)   # admitted well before its round
-DIFF_VERDICTS = ("titan_inc_not_us", "us_inc_not_titan")
+# a_only / b_only: the offer diff page, two offers picked by hand
+PAIR_A, PAIR_B = "a_only", "b_only"
+DIFF_VERDICTS = ("titan_inc_not_us", "us_inc_not_titan", PAIR_A, PAIR_B)
 
 # status -> (words, colour class). Order: the pipeline.
 TRACE_STATUS = {
@@ -2189,7 +2191,7 @@ def attach_api(quant_q, rows, window):
     created_at first, so the window bound is what makes this cheap; the
     newest version of each submission wins."""
     want = [x for x in rows if not x.get("received_by_us")
-            and x.get("verdict") in ("titan_inc_not_us", "us_inc_not_titan")]
+            and x.get("verdict") in DIFF_VERDICTS]
     sigs = sorted({s_ for x in want for s_ in _row_sigs(x)})
     if not sigs:
         return rows
@@ -2337,7 +2339,7 @@ def _sched_label(k):
     return f"{e} {r}".strip()
 
 
-def _kind_mix(group, verdict="titan_inc_not_us"):
+def _kind_mix(group, verdict="titan_inc_not_us", label=None):
     """One line: what share of this verdict's rows were bundle / txn,
     and how many of them any builder of ours received."""
     rows = _units([i for i in group if i["verdict"] == verdict])
@@ -2349,7 +2351,7 @@ def _kind_mix(group, verdict="titan_inc_not_us"):
     mix = " &middot; ".join(
         f'<span class="kd {k}">{k}</span> {c[k]:,} ({100 * c[k] / n:.0f}%)'
         for k in ("txn", "bundle") if c[k])
-    return (f'<div class="selcnt"><span class="vd ti">{verdict}</span> '
+    return (f'<div class="selcnt"><span class="vd ti">{label or verdict}</span> '
             f"by type: {mix} <span class=\"dim\">(a bundle counts once)</span>"
             " &middot; received by us "
             f'<b>{got:,}</b> of {n:,} ({100 * got / n:.0f}%) '
@@ -3234,8 +3236,7 @@ def _units(rows):
     out, at = [], {}
     for i in rows:
         b = i.get("bundle_id")
-        if not b or i["verdict"] not in ("titan_inc_not_us",
-                                         "us_inc_not_titan"):
+        if not b or i["verdict"] not in DIFF_VERDICTS:
             out.append(i)
             continue
         k = (i["verdict"], i.get("our_builder"), b)
@@ -3984,6 +3985,351 @@ def selection_html(rows, slot):
     return "".join(out)
 
 
+# ------------------------------------------------------------- offer diff
+#
+# The accuracy diff compares the offers the page chooses (the winner and
+# our best as it stood). This one compares any two offers picked off a
+# slot's race: two of our rungs, AMS_1 against AMS_2, ours against
+# Titan's, or two of Titan's. Same machinery -- contents by uuid from the
+# relay, a signature-level diff, one display row per bundle -- with each
+# side labelled by its own builder instead of "us"/"titan".
+#
+# For every order one offer has and the other lacks, the "why" columns are
+# read for the LACKING offer's builder, when that builder is ours: its
+# builder_order_traces state when that offer was dispatched, what its
+# scheduler said, when it admitted the order, and the bundles it received
+# that carry the same transactions. A lacking Titan offer has no such
+# view -- Titan's internals are not in any store of ours.
+
+PAIR_SHOW = 150
+
+
+def find_offers(relay_q, ch, slot, uuids, region="all"):
+    """-> (timeline, {uuid: offer}) -- each picked offer as the race has
+    it, plus its round, the round's anchor and winner."""
+    win = slot_window(relay_q, slot)
+    tl = slot_timeline(relay_q, slot, win, region=region)
+    if not tl.get("rounds"):
+        tl = slot_timeline_ours(ch, slot)
+    want, out = set(uuids), {}
+    for rnd in tl.get("rounds") or []:
+        for o in rnd["offers"]:
+            if o["uuid"] in want:
+                out[o["uuid"]] = dict(
+                    o, round=rnd["idx"], won_by=rnd.get("won_by") or "",
+                    anchor=rnd.get("anchor") or "",
+                    connector=o.get("connector") or tl.get("connector") or "")
+    return tl, win, out
+
+
+def _pair_rows(slot, a, b, contents, blk_sigs, rewards, bps):
+    """The signature-level diff of two offers, both directions."""
+    aset = {_okey(o): o for o in contents.get(a["uuid"], [])}
+    bset = {_okey(o): o for o in contents.get(b["uuid"], [])}
+    rows = []
+    for verdict, own, lack, pool, other in ((PAIR_A, a, b, aset, bset),
+                                            (PAIR_B, b, a, bset, aset)):
+        src = pool.keys() - other.keys()
+        mine = _is_ours(lack["builder"])
+        base = {
+            "slot": slot,
+            # the LACKING offer's round: its marks and its trace boundary
+            "round": lack["round"], "owner_round": own["round"],
+            "connector": a.get("connector") or b.get("connector") or "",
+            "won_by": lack.get("won_by") or "",
+            "we_won": _is_ours(lack.get("won_by") or ""),
+            "our_builder": lack["builder"] if mine else None,
+            "our_uuid": lack["uuid"] if mine else "",
+            "lack_builder": lack["builder"], "lack_uuid": lack["uuid"],
+            "titan_builder": own["builder"], "owner_uuid": own["uuid"],
+            "our_bid": lack["bid"], "titan_bid": own["bid"],
+            "bid_gap": lack["bid"] - own["bid"],
+            "is_last": own.get("is_last"), "jito_weight_bps": bps}
+        for key in sorted(src, key=lambda k: (
+                pool[k]["order_index"], pool[k]["bundle_tx_index"] or 0, k)):
+            o = pool[key]
+            members = None
+            if o["bundle_id"]:
+                members = sorted(
+                    ({"sig": m["sig"], "prefix": m["prefix"],
+                      "bundle_tx_index": m["bundle_tx_index"],
+                      "landed": _landed_mark(m, blk_sigs),
+                      "in_diff": _okey(m) in src,
+                      "shared": _okey(m) in other,
+                      **_reward_of(m, blk_sigs, rewards, bps)}
+                     for m in pool.values()
+                     if m["bundle_id"] == o["bundle_id"]),
+                    key=lambda m: (m["bundle_tx_index"] is None,
+                                   m["bundle_tx_index"] or 0))
+            rows.append(dict(base, verdict=verdict, builder_id=own["builder"],
+                             members=members, type=o["type"],
+                             signature=o["sig"], sigprefix=o["prefix"],
+                             bundle_id=o["bundle_id"],
+                             bundle_tx_index=o["bundle_tx_index"],
+                             order_index=o["order_index"],
+                             landed=_landed_mark(o, blk_sigs),
+                             **_reward_of(o, blk_sigs, rewards, bps)))
+    shared = len(aset.keys() & bset.keys())
+    return rows, shared, len(aset), len(bset)
+
+
+def offer_pair(relay_q, ch, rpc_url, slot, ua, ub, region="all",
+               relayer_q=None, quant_q=None):
+    """Everything the offer diff page shows for one picked pair."""
+    if not ua or not ub or ua == ub:
+        raise ValueError("pick two different offers")
+    tl, win, offs = find_offers(relay_q, ch, slot, (ua, ub), region)
+    miss = [u for u in (ua, ub) if u not in offs]
+    if miss:
+        raise ValueError("offer not found in slot %d: %s"
+                         % (slot, ", ".join(u[:8] for u in miss)))
+    a, b = offs[ua], offs[ub]
+    if not (win and win[0]):
+        win = _chunk_window([a, b])
+    lo, hi = win
+    try:
+        rew = block_rewards(rpc_url, slot)
+        sigs = set(rew) or None
+    except Exception:
+        rew, sigs = None, None
+    pmap = block_prefixes(sigs) if sigs else {}
+    contents, src = order_contents(relay_q, ch, [ua, ub], win, pmap)
+    bps = a.get("jito_w")
+    if bps is None:
+        try:
+            bps = weight_at(jito_weights(relay_q), a["connector"], a["at"])
+        except Exception:
+            bps = None
+    rows, shared, na, nb = _pair_rows(slot, a, b, contents,
+                                      pmap if sigs else None, rew, bps)
+    attach_notes(ch, rows, lo, hi, by_kind=True)
+    marks = round_marks(ch, slot, lo, hi)
+    attach_recv(ch, rows, slot, lo, hi, marks=marks, by_kind=True)
+    attach_member_recv(ch, rows, marks, lo, hi)
+    for step, why in ((attach_similar, "similar_why"),
+                      (attach_traces, "trace_why")):
+        try:
+            step(ch, rows, lo, hi, {slot: marks})
+        except Exception as exc:
+            for x in rows:
+                x[why] = f"could not be read: {str(exc)[:120]}"
+    if relayer_q is not None:
+        try:
+            price_from_packets(relayer_q, rows, win)
+        except Exception:
+            pass
+    if quant_q is not None:
+        try:
+            attach_api(quant_q, rows, win)
+        except Exception:
+            pass
+    for x in rows:
+        x["kind"] = ("bundle" if x.get("bundle_id") or x.get("type") == "bundle"
+                     else "txn")
+    return {"slot": slot, "a": a, "b": b, "rows": rows, "shared": shared,
+            "na": na, "nb": nb, "src": src, "jito_weight_bps": bps,
+            "chosen": next((o["uuid"] for r in tl.get("rounds") or []
+                            for o in r["offers"] if o.get("chosen")
+                            and r["idx"] in (a["round"], b["round"])), "")}
+
+
+def pair_bar_html(slot, region="all"):
+    """The picker under a slot's race: which two offers are picked, and
+    where their diff lands. Sticky, so it stays in view down the race."""
+    return (f'<div class="odbar" data-slot="{int(slot)}" '
+            f'data-region="{html.escape(region, quote=True)}">'
+            '<span class="odlab">offer diff</span>'
+            '<span class="odpick odA"><b>A</b> <i>click an offer in the race '
+            "or a row's pick</i></span>"
+            '<span class="odpick odB"><b>B</b> <i>then a second one</i></span>'
+            '<button type="button" class="cpsm odswap">swap</button>'
+            '<button type="button" class="cpsm odclr">clear</button>'
+            '<span class="odst dim"></span></div>'
+            f'<div class="odres" id="odres{int(slot)}"></div>')
+
+
+def _offer_card(tag, o, chosen):
+    mine = _is_ours(o["builder"])
+    why = (f"protocol fees {o.get('fees', 0):,} + Jito {o.get('jito', 0):,}"
+           f" x {o.get('jito_w', '?')}/10000 + builder payment "
+           f"{o.get('pay', 0):,}")
+    tms = "" if o.get("t_ms") is None else f" +{o['t_ms']:.1f} ms"
+    return (f'<div class="odcard"><b class="odtag">{tag}</b> '
+            f'<b class="{"ours" if mine else ""}">{html.escape(o["builder"])}</b>'
+            f' &middot; r{o["round"]}{tms} &middot; score '
+            f'<b title="{html.escape(why)}">{o["bid"]:,}</b>'
+            f' <span class="dim">(fees {o.get("fees", 0):,} &middot; jito '
+            f'{o.get("jito", 0):,} &middot; builder {o.get("pay", 0):,})</span>'
+            f' &middot; {o["n"]:,} orders &middot; cost {o["cost"]:,} &middot; '
+            f'graded {html.escape(o.get("reason") or "?")}'
+            + (' &middot; <span class="tlstar">chosen</span>'
+               if o["uuid"] == chosen else "")
+            + f' &middot; {copy_val(o["uuid"], o["uuid"][:8] + "…")}</div>')
+
+
+def _pair_table(rows, lack, mine):
+    """One direction's rows (already one per bundle): the same cells as
+    the accuracy diff, the "why" columns read for the lacking builder."""
+    lk = html.escape(lack["builder"])
+    out = ['<table class="otab"><tr><th>#</th><th>type</th><th>signature</th>'
+           "<th>sigprefix</th><th>bundle</th><th>landed</th>"
+           '<th class="n" title="what the order pays as the relay scores it: '
+           "fee + tips to Titan/Bifrost wallets + Jito x this connector's "
+           "Jito weight. landed: from the block; offered: from its bytes in "
+           'our relayer\'s packet log; blank: no bytes anywhere">reward</th>'
+           f'<th class="n" title="ms from {lk}\'s round_started to our builder '
+           'admitting the order (scheduler/received); a bundle row is the '
+           'bundle itself">recv +open</th>'
+           '<th class="n" title="ms from admission to that builder\'s own '
+           'winner row">win &minus;recv</th>'
+           '<th class="n" title="the relay\'s hold (wait_us), ms">wait</th>'
+           f'<th title="builder_order_traces on {lk}: the order\'s own state '
+           f'when {lk}\'s picked offer was dispatched, then what became of it">'
+           f"at {lk}'s offer</th>"
+           '<th title="bundles we received under another id carrying every '
+           'signature of this row">similar bundles</th>'
+           f'<th title="scheduler events on our builders for this order">'
+           "scheduler said</th></tr>"]
+    for n, i in enumerate(rows):
+        extra = ' class="selx" hidden' if n >= PAIR_SHOW else ""
+        kind = i.get("kind") or "txn"
+        key = (i["slot"], i["verdict"], i["order_index"], i["signature"],
+               i["bundle_id"], i.get("owner_uuid"))
+        rid = f'pd{abs(hash(key)):x}'
+        tid, sid, aid = "t" + rid, "s" + rid, "a" + rid
+        bid = (copy_val(i["bundle_id"], i["bundle_id"][:12] + "…")
+               if i["bundle_id"] else '<span class="dim">&mdash;</span>')
+        sigcell, bx = copy_val(i["signature"]), ""
+        if i["bundle_id"] and i.get("members"):
+            m_n, k = len(i["members"]), len(i.get("_rows") or [i])
+            bxid = "b" + rid
+            short = ((i["signature"] or "")[:24] + "…"
+                     if i["signature"] else "&mdash;")
+            sigcell = (f'<span class="scopen sigl" data-sx="{bxid}" '
+                       'role="button" tabindex="0" title="click for every '
+                       f'transaction in the bundle">{short} <span class="dim">'
+                       f'{m_n} txn{"" if m_n == 1 else "s"}</span></span>')
+            bid += (f' <span class="dim bxo">{k} of {m_n} in diff</span>')
+            bx = (f'<tr class="sxrow" id="{bxid}" hidden><td colspan=13>'
+                  + _bundle_panel(i) + "</td></tr>")
+        pairs = _sched_pairs(i)
+        if pairs:
+            lab = " ".join(
+                f'<span class="sc">{html.escape(e)}'
+                + (f'<i>{html.escape(rs[:34])}</i>' if rs else "") + "</span>"
+                for e, rs in pairs[:2])
+            if len(pairs) > 2:
+                lab += f' <span class="dim">+{len(pairs) - 2}</span>'
+            cell = (f'<span class="scopen" data-sx="{rid}" role="button" '
+                    f'tabindex="0">{lab}</span>')
+        else:
+            cell = '<span class="dim">&mdash;</span>'
+        if mine:
+            tcell = _trace_cell(i, tid)
+        else:
+            tcell = (f'<td class="dim" title="{lk} is not one of our '
+                     "builders: why it left the order out is not in any store "
+                     'of ours">n/a</td>')
+        rowcp = (f'<span class="cpv" data-c="{html.escape(_row_copy(i, kind), quote=True)}" '
+                 'role="button" tabindex="0" title="the order\'s position in '
+                 f'the offer that has it; click to copy the row as JSON">'
+                 f'{i["order_index"]} &#x29C9;</span>')
+        battr = (f' data-b="{html.escape(i["bundle_id"], quote=True)}"'
+                 if i["bundle_id"] else "")
+        out.append(
+            f'<tr{battr}{extra}><td class="n">{rowcp}</td>'
+            f'<td class="kd {kind}"'
+            + ('' if i.get("received_by_us") else
+               ' title="no scheduler/received on any of our builders"')
+            + f'>{kind}{"" if i.get("received_by_us") else " <i>unseen</i>"}'
+            + _alone_hint(i) + _api_tag(i, aid) + "</td>"
+            f"<td>{sigcell}</td><td>{copy_val(i['sigprefix'])}</td>"
+            f"<td>{bid}</td>"
+            f'<td class="land {"y" if i["landed"] == "yes" else "n"}">'
+            f'{i["landed"] or "?"}</td>'
+            f'<td class="n">{_rw_cell(i)}</td>'
+            f'{_recv_cells(i, i.get("our_builder"))}'
+            f"{tcell}{_similar_cell(i, sid)}<td>{cell}</td></tr>")
+        if bx:
+            out.append(bx)
+        if mine and (i.get("trace") or {}).get("rows"):
+            out.append(f'<tr class="sxrow" id="{tid}" hidden><td colspan=13>'
+                       + _trace_panel(i) + "</td></tr>")
+        if i.get("similar") or i.get("overlap"):
+            out.append(f'<tr class="sxrow" id="{sid}" hidden><td colspan=13>'
+                       + _similar_panel(i, sid) + "</td></tr>")
+        if pairs:
+            out.append(f'<tr class="sxrow" id="{rid}" hidden><td colspan=13>'
+                       + _sched_panel(i) + "</td></tr>")
+        if i.get("api_bundles") or i.get("api_txs"):
+            out.append(f'<tr class="sxrow" id="{aid}" hidden><td colspan=13>'
+                       + _api_panel(i) + "</td></tr>")
+    out.append("</table>")
+    if len(rows) > PAIR_SHOW:
+        out.append(f'<div class="more">showing {PAIR_SHOW} of {len(rows):,} '
+                   '<button type="button" class="cpsm selmore">show all'
+                   "</button></div>")
+    return "".join(out)
+
+
+def _pair_verdicts(units):
+    """The lacking side's state at its offer, counted -- the line that
+    says, at a glance, why most of these orders were left out."""
+    c = collections.Counter(
+        (i.get("trace") or {}).get("key") or "" for i in units)
+    c.pop("", None)
+    if not c:
+        return ""
+    return ('<div class="selcnt">state at that offer: ' + " &middot; ".join(
+        f"{_trace_chip(k)} <b>{n:,}</b>" for k, n in c.most_common()) + "</div>")
+
+
+def pair_html(d):
+    a, b, rows = d["a"], d["b"], d["rows"]
+    out = ['<div class="odout">',
+           _offer_card("A", a, d["chosen"]), _offer_card("B", b, d["chosen"]),
+           f'<div class="selcnt">A carries {d["na"]:,} order refs '
+           f'(bundles expanded to members), B {d["nb"]:,}, '
+           f'<b>{d["shared"]:,}</b> in both &middot; contents from the '
+           f'{"relay" if d["src"] == RELAY_SRC else "our own store"}'
+           + (f' &middot; Jito weight {d["jito_weight_bps"]:,} bps'
+              if d.get("jito_weight_bps") is not None else "")
+           + " &middot; " + copy_sel(rows, f"copy {len(rows):,} rows as CSV")
+           + "</div>"]
+    if a["round"] != b["round"]:
+        out.append('<div class="selcnt aqcap">the two offers are in '
+                   f'different rounds (r{a["round"]} and r{b["round"]}): an '
+                   "order the earlier round's winner carried is gone from "
+                   "the later round's pool, so part of this diff is the "
+                   "round, not the builder</div>")
+    for verdict, own, lack, tag, ltag in ((PAIR_A, a, b, "A", "B"),
+                                          (PAIR_B, b, a, "B", "A")):
+        group = [x for x in rows if x["verdict"] == verdict]
+        units = sorted(_units(group), key=lambda i: i["order_index"])
+        mine = _is_ours(lack["builder"])
+        nb_ = sum(1 for i in units if i.get("bundle_id"))
+        out.append(
+            f'<div class="selblk"><div class="selhead">in <b>{tag}</b> '
+            f'({html.escape(own["builder"])}), not in <b>{ltag}</b> '
+            f'({html.escape(lack["builder"])}) &middot; <b>{len(units):,}</b> '
+            f'orders ({nb_:,} bundles, {len(group):,} signatures)'
+            + _rw_total(group, verdict) + "</div>")
+        if not units:
+            out.append('<div class="dmeta">nothing &mdash; every order of '
+                       f"{tag} is also in {ltag}</div></div>")
+            continue
+        out.append(_kind_mix(group, verdict, f"{tag} only"))
+        if mine:
+            out.append(_pair_verdicts(units))
+        else:
+            out.append(f'<div class="selcnt dim">{html.escape(lack["builder"])}'
+                       " is not ours: the why-columns show only what our "
+                       "builders saw of these orders</div>")
+        out.append(_pair_table(units, lack, mine) + "</div>")
+    out.append("</div>")
+    return "".join(out)
+
+
 # -------------------------------------------- declared CU / reward profile
 #
 # Every transaction each side OFFERED in a round, not only the diff: what
@@ -4658,7 +5004,7 @@ def race_data(tl):
     return out
 
 
-def race_html(tl):
+def race_html(tl, pick=False):
     """The legend, the data blob and the mount point. The drawing is done
     by OFFERS_JS, which the page loads once and re-invokes after each
     expansion."""
@@ -4677,7 +5023,8 @@ def race_html(tl):
         + ('<b class="ousp">ours</b>' if _is_ours(b) else "")
         + "</span>" for b in builders)
     blob = json.dumps({"rounds": list(data.values()), "style": style,
-                       "ours": ours}, separators=(",", ":"))
+                       "ours": ours, "slot": tl["slot"], "pick": pick},
+                      separators=(",", ":"))
     n = sum(len(r["bids"]) for r in data.values())
     return (
         '<div class="racewrap"><div class="dtlhead">the race'
@@ -4746,8 +5093,12 @@ def _validator_cell(pubkey, name=""):
     return lab + copy_val(pubkey, pubkey[:8] + "\u2026")
 
 
-def timeline_html(d, names=None):
-    """The race first, then the same offers as numbers underneath."""
+def timeline_html(d, names=None, pick=False, region="all"):
+    """The race first, then the same offers as numbers underneath.
+
+    `pick`: the offer diff page -- every bullet and every row picks an
+    offer instead of copying it, and the pair's diff loads under the race
+    (OFFDIFF_JS)."""
     if not d["rounds"]:
         return ('<div class="dmeta">the relay recorded no offer for this '
                 "slot in the window</div>")
@@ -4763,7 +5114,9 @@ def timeline_html(d, names=None):
                "scored this slot's Jito tips at, net of its 600 bps Jito "
                f'fee">Jito weight {w:,} bps</span>' if w is not None else "")
             + "</div>")
-    out.append(race_html(d))
+    out.append(race_html(d, pick))
+    if pick:
+        out.append(pair_bar_html(d["slot"], region))
     for rnd in d["rounds"]:
         n = len(rnd["offers"])
         head = (f'<div class="rhead">round {rnd["idx"]} &middot; '
@@ -4791,7 +5144,7 @@ def timeline_html(d, names=None):
         rowsh = []
         for o in _tl_window(rnd["offers"]):
             if o is None:                       # the elided middle
-                rowsh.append('<tr class="tlgap"><td colspan=8>'
+                rowsh.append(f'<tr class="tlgap"><td colspan={9 if pick else 8}>'
                              "&middot;&middot;&middot;</td></tr>")
                 continue
             pct = max(0.0, min(100.0, 100.0 * (o["t_ms"] or 0) / span))
@@ -4805,8 +5158,17 @@ def timeline_html(d, names=None):
                     else "")
             rec = json.dumps(offer_record(d["slot"], rnd, o),
                              separators=(",", ":"))
+            pk = ""
+            if pick:
+                lab = (f'{o["builder"]} r{rnd["idx"]} {tms.replace("&mdash;", "")} ms'
+                       f' \u00b7 {o["bid"]:,}')
+                pk = (f'<td><span class="opk" role="button" tabindex="0" '
+                      f'data-ou="{html.escape(o["uuid"], quote=True)}" '
+                      f'data-slot="{d["slot"]}" '
+                      f'data-l="{html.escape(lab, quote=True)}" '
+                      'title="pick this offer for the diff">pick</span></td>')
             rowsh.append(
-                f'<tr{" class=\"tlwin\"" if o["chosen"] else ""}>'
+                f'<tr{" class=\"tlwin\"" if o["chosen"] else ""}>{pk}'
                 f'<td class="n"><span class="cpv" data-c="{html.escape(rec, quote=True)}" '
                 'role="button" tabindex="0" title="click to copy this offer '
                 f'(uuid, rewards, slot, round, ...) as JSON">{tms}</span></td>'
@@ -4817,7 +5179,8 @@ def timeline_html(d, names=None):
                 f'<td class="n">{o["cost"]:,}</td><td class="n">{o["n"]:,}</td>'
                 f'<td>{html.escape(o["reason"])}</td>'
                 f'<td class="tlbar"><i style="width:{pct:.1f}%"></i></td></tr>')
-        out.append('<table class="otab tltab"><tr><th>t +ms</th>'
+        out.append('<table class="otab tltab"><tr>'
+                   + ("<th></th>" if pick else "") + '<th>t +ms</th>'
                    '<th>builder</th><th title="what the relay ranks on: '
                    "protocol fees + Jito tips x the connector's Jito weight "
                    '/ 10000 + builder payment">relay score</th>'
@@ -4839,7 +5202,7 @@ def _copy_raw(text, label):
 
 
 def timeline_table_html(r, slots, shown, total, ours_re, slot_ref=None,
-                        names=None):
+                        names=None, frag="/tech/offer-timelines/slot"):
     """The slot list for the timeline metric: who OFFERED, not who won."""
     if r["err"]:
         return (f'<div class="herr" style="margin:20px 28px">'
@@ -4880,7 +5243,7 @@ def timeline_table_html(r, slots, shown, total, ours_re, slot_ref=None,
            '<th class="n">offers</th><th>builders</th>'
            '<th class="n" title="the highest relay score offered: protocol fees + Jito tips x the connector\'s Jito weight / 10000 + builder payment">best score</th></tr>'
            '<tbody id="aqbody" data-metric="timeline" '
-           'data-frag="/tech/offer-timelines/slot" '
+           f'data-frag="{html.escape(frag, quote=True)}" '
            f'data-region="{html.escape(r["region"])}">']
     for srow in slots:
         sl, rs = srow["slot"], srow["rounds"]
@@ -5243,6 +5606,33 @@ def export_file(jid):
 # ------------------------------------------------------------------ render
 
 CSS = """
+
+/* offer diff: the picker bar and the two picks */
+.odbar{position:sticky;bottom:0;z-index:5;display:flex;flex-wrap:wrap;gap:8px;
+  align-items:center;background:var(--bg2,var(--bg));border:1px solid var(--line);
+  border-radius:6px;padding:7px 10px;margin:8px 0;font-size:12px}
+.odlab{font-size:10.5px;text-transform:uppercase;letter-spacing:.05em;color:var(--text3)}
+.odpick{padding:2px 8px;border-radius:4px;border:1px dashed var(--line2)}
+.odpick i{color:var(--text3);font-style:normal}
+.odpick.set{border-style:solid}
+.odA.set{border-color:var(--accent)}
+.odB.set{border-color:var(--orange-main,#d97706)}
+.odres:empty{display:none}
+.odres{margin:6px 0 14px}
+.odcard{margin:4px 0;font-size:12px}
+.odtag{display:inline-block;min-width:16px;text-align:center;border-radius:3px;
+  padding:0 4px;color:var(--bg);background:var(--accent)}
+.odcard + .odcard .odtag{background:var(--orange-main,#d97706)}
+.opk{cursor:pointer;font-size:10px;padding:1px 6px;border:1px solid var(--line2);
+  border-radius:3px;color:var(--text3)}
+.opk:hover,.opk:focus{color:var(--accent);border-color:var(--accent);outline:none}
+.opk.opka{background:var(--accent);color:var(--bg);border-color:var(--accent)}
+.opk.opkb{background:var(--orange-main,#d97706);color:var(--bg);
+  border-color:var(--orange-main,#d97706)}
+.opk.opka::after{content:" A"}
+.opk.opkb::after{content:" B"}
+svg .om.opka{stroke:var(--accent);stroke-width:3.2}
+svg .om.opkb{stroke:var(--orange-main,#d97706);stroke-width:3.2}
 .cpcsv{margin-left:10px;padding:1px 8px;border:1px solid var(--line2);
   border-radius:5px;font-size:10px;color:var(--text3);cursor:pointer;
   text-transform:uppercase;letter-spacing:.04em;white-space:nowrap}
@@ -5434,6 +5824,104 @@ td.trc{min-width:120px}
 .more .cpsm{font-style:normal;margin-left:8px}
 .bxo{margin-left:6px;font-size:10px;color:var(--text2)}
 """
+
+# The offer diff page: pick two offers (a bullet in the race, or a row's
+# "pick"), and the diff of the pair loads under the race. OFFERS_JS calls
+# window.__offerPick on a bullet click when its data says pick mode, and
+# window.__offerPaint after every redraw so the picks survive a zoom.
+OFFDIFF_JS = r'''
+(function(){
+  var sel = [];                       // [{u, slot, label}], A then B
+  function bar(slot){
+    return document.querySelector('.odbar[data-slot="' + slot + '"]');
+  }
+  function paint(){
+    document.querySelectorAll('[data-ou]').forEach(function(e){
+      var u = e.getAttribute('data-ou'), i = -1;
+      sel.forEach(function(s, k){ if (s.u === u) i = k; });
+      e.classList.toggle('opka', i === 0);
+      e.classList.toggle('opkb', i === 1);
+    });
+    document.querySelectorAll('.odbar').forEach(function(b){
+      var mine = sel.length && sel[0].slot === b.getAttribute('data-slot');
+      [['.odA', 0, 'click an offer in the race or a row’s pick'],
+       ['.odB', 1, 'then a second one']].forEach(function(z){
+        var el = b.querySelector(z[0]), s = mine ? sel[z[1]] : null;
+        el.classList.toggle('set', !!s);
+        el.innerHTML = '<b>' + (z[1] ? 'B' : 'A') + '</b> ';
+        var t = document.createElement(s ? 'span' : 'i');
+        t.textContent = s ? s.label : z[2];
+        el.appendChild(t);
+      });
+    });
+  }
+  function load(){
+    if (sel.length !== 2) return;
+    var slot = sel[0].slot, b = bar(slot);
+    var out = document.getElementById('odres' + slot);
+    if (!b || !out) return;
+    var st = b.querySelector('.odst');
+    st.textContent = 'diffing…';
+    out.innerHTML = '<div class="dmeta">reading both offers, the block, '
+      + 'the scheduler events and the order traces…</div>';
+    var want = sel[0].u + '|' + sel[1].u;
+    fetch('/tech/offer-diff/pair?slot=' + encodeURIComponent(slot)
+          + '&a=' + encodeURIComponent(sel[0].u)
+          + '&b=' + encodeURIComponent(sel[1].u)
+          + '&region=' + encodeURIComponent(b.getAttribute('data-region') || 'all'))
+      .then(function(r){ return r.text(); })
+      .then(function(t){
+        // a newer pick may have landed while this one was in flight
+        if (sel.length !== 2 || sel[0].u + '|' + sel[1].u !== want) return;
+        out.innerHTML = t;
+        st.textContent = '';
+        out.scrollIntoView({behavior: 'smooth', block: 'start'});
+      })
+      .catch(function(e){
+        st.textContent = '';
+        out.innerHTML = '<div class="dmeta">could not load: ' + e + '</div>';
+      });
+  }
+  window.__offerPaint = paint;
+  window.__offerPick = function(u, slot, label){
+    slot = String(slot);
+    if (sel.length && sel[0].slot !== slot) sel = [];
+    var i = -1;
+    sel.forEach(function(s, k){ if (s.u === u) i = k; });
+    if (i >= 0) sel.splice(i, 1);
+    else {
+      sel.push({u: u, slot: slot, label: label});
+      if (sel.length > 2) sel.shift();
+    }
+    paint();
+    if (sel.length === 2) load();
+  };
+  document.addEventListener('click', function(ev){
+    var p = ev.target.closest && ev.target.closest('.opk');
+    if (p) {
+      ev.preventDefault(); ev.stopPropagation();
+      window.__offerPick(p.getAttribute('data-ou'), p.getAttribute('data-slot'),
+                         p.getAttribute('data-l'));
+      return;
+    }
+    var sw = ev.target.closest && ev.target.closest('.odswap');
+    if (sw && sel.length === 2) { sel.reverse(); paint(); load(); return; }
+    var cl = ev.target.closest && ev.target.closest('.odclr');
+    if (cl) {
+      var b = cl.closest('.odbar'), out = b &&
+        document.getElementById('odres' + b.getAttribute('data-slot'));
+      sel = []; paint();
+      if (out) out.innerHTML = '';
+    }
+  });
+  document.addEventListener('keydown', function(ev){
+    if (ev.key !== 'Enter' && ev.key !== ' ') return;
+    var p = ev.target.closest && ev.target.closest('.opk');
+    if (p) { ev.preventDefault(); p.click(); }
+  });
+})();
+'''
+
 
 ACCURACY_JS = r'''
 (function(){
