@@ -430,8 +430,10 @@ def block_rewards(rpc_url, slot):
     return out
 
 
-def block_tx_bytes(rpc_url, slot):
+def block_tx_bytes(rpc_url, slot, consumed=None):
     """-> {signature: raw transaction bytes} for every tx in the block.
+    `consumed`, a dict, also receives {signature: meta.computeUnitsConsumed}
+    -- the CU each landed transaction actually burned.
 
     The same block fetched with base64 bodies, for what block_rewards'
     accounts view cannot give: the transaction's own compute-unit limit.
@@ -455,7 +457,11 @@ def block_tx_bytes(rpc_url, slot):
     for tx in (d.get("result") or {}).get("transactions") or []:
         try:
             raw = base64.b64decode((tx.get("transaction") or [""])[0])
-            out[txprice.parse(raw)["sig"]] = raw
+            sig = txprice.parse(raw)["sig"]
+            out[sig] = raw
+            cu = (tx.get("meta") or {}).get("computeUnitsConsumed")
+            if consumed is not None and cu is not None:
+                consumed[sig] = int(cu)
         except Exception:
             continue
     return out
@@ -4134,15 +4140,25 @@ def offer_pair(relay_q, ch, rpc_url, slot, ua, ub, region="all",
 
 
 def pair_bar_html(slot, region="all"):
-    """The picker under a slot's race: which two offers are picked, and
-    where their diff lands. Sticky, so it stays in view down the race."""
+    """The picker under a slot's race, sticky so it stays in view down the
+    race. Two modes (OFFDIFF_JS): "offer diff" picks A and B and lists the
+    orders each has that the other lacks; "winner progression" picks up to
+    8 offers of a round's winning builder and draws them over CU bins."""
     return (f'<div class="odbar" data-slot="{int(slot)}" '
             f'data-region="{html.escape(region, quote=True)}">'
-            '<span class="odlab">offer diff</span>'
-            '<span class="odpick odA"><b>A</b> <i>click an offer in the race '
-            "or a row's pick</i></span>"
-            '<span class="odpick odB"><b>B</b> <i>then a second one</i></span>'
-            '<button type="button" class="cpsm odswap">swap</button>'
+            '<select class="odmode" aria-label="mode">'
+            '<option value="diff">offer diff</option>'
+            '<option value="prog">winner progression</option></select>'
+            '<span class="odm-diff odpick odA"><b>A</b> <i>click an offer in '
+            "the race or a row's pick</i></span>"
+            '<span class="odm-diff odpick odB"><b>B</b> <i>then a second one</i></span>'
+            '<button type="button" class="cpsm odm-diff odswap">swap</button>'
+            '<span class="odm-prog odchips" hidden></span>'
+            '<span class="odm-prog odauto" hidden>pick '
+            '<input class="odpn" type="number" min="1" max="8" value="5" '
+            'aria-label="how many"> evenly from '
+            '<select class="odpr" aria-label="round"></select>'
+            '<button type="button" class="cpsm odeven">pick</button></span>'
             '<button type="button" class="cpsm odclr">clear</button>'
             '<span class="odst dim"></span></div>'
             f'<div class="odres" id="odres{int(slot)}"></div>')
@@ -4328,6 +4344,99 @@ def pair_html(d):
         out.append(_pair_table(units, lack, mine) + "</div>")
     out.append("</div>")
     return "".join(out)
+
+
+# ------------------------------------------------------ winner progression
+#
+# The offer diff page's second mode: several offers from one round's
+# winning builder, side by side as distributions over compute units --
+# how its offers grew from the first rung to the chosen one. Per
+# transaction of each offer (bundles expanded): its declared CU (the
+# compute-budget limit, or Agave's default when it sets none -- read off
+# its bytes), the CU it actually consumed (meta.computeUnitsConsumed,
+# only for transactions that landed in this slot), and its reward as the
+# relay scores it (the block's figures when it landed here, else its
+# bytes from our relayer's packet log). The page bins and draws them.
+
+PROG_MAX = 8
+
+
+def offer_progression(relay_q, ch, rpc_url, slot, uuids, region="all",
+                      relayer_q=None):
+    uuids = list(dict.fromkeys(u for u in uuids if u))[:PROG_MAX]
+    if not uuids:
+        raise ValueError("pick at least one offer")
+    tl, win, offs = find_offers(relay_q, ch, slot, uuids, region)
+    miss = [u for u in uuids if u not in offs]
+    if miss:
+        raise ValueError("offer not found in slot %d: %s"
+                         % (slot, ", ".join(u[:8] for u in miss)))
+    if not (win and win[0]):
+        win = _chunk_window([offs[u] for u in uuids])
+    consumed, rew = {}, {}
+    try:
+        blk = block_tx_bytes(rpc_url, slot, consumed)
+    except Exception:
+        blk = {}
+    try:
+        rew = block_rewards(rpc_url, slot)
+    except Exception:
+        rew = {}
+    pmap = block_prefixes(set(blk) | set(rew)) if (blk or rew) else {}
+    contents, src = order_contents(relay_q, ch, uuids, win, pmap)
+    sigs = {o["sig"] for u in uuids for o in contents.get(u, []) if o.get("sig")}
+    bodies = {}
+    if relayer_q is not None:
+        try:
+            bodies = packet_bodies(relayer_q, sigs - set(blk), win)
+        except Exception:
+            bodies = {}
+    winners = {r["idx"]: r.get("won_by") or "" for r in tl.get("rounds") or []}
+    out = []
+    for u in uuids:
+        o = offs[u]
+        bps = o.get("jito_w")
+        bps = DEFAULT_JITO_WEIGHT if bps is None else bps
+        items = contents.get(u, [])
+        txs, unpriced = [], 0
+        for sig in dict.fromkeys(i["sig"] for i in items if i.get("sig")):
+            raw = blk.get(sig) or bodies.get(sig)
+            if not raw:
+                unpriced += 1
+                continue
+            try:
+                pr = txprice.price(raw, TIP_ACCOUNTS, JITO_TIP_SET)
+            except Exception:
+                unpriced += 1
+                continue
+            got = rew.get(sig)
+            if got:
+                fee, jito, builder = got["fee"], got["jito"], got["tip"] - got["jito"]
+            else:
+                fee, jito, builder = pr["fee"], pr["jito"], pr["builder"]
+            # the relay's own formula: protocol fees are the fee less the
+            # burned half of the base fee (2,500 per signature), Jito at
+            # the connector's weight, builder tips at face value
+            try:
+                nsig = txprice.parse(raw)["n_sigs"]
+            except Exception:
+                nsig = 1
+            _tip, reward = weigh(max(0, int(fee) - 2500 * nsig), jito, builder, bps)
+            txs.append([int(pr["cu"]), consumed.get(sig), int(reward),
+                        1 if got else 0])
+        out.append({
+            "uuid": u, "builder": o["builder"], "round": o["round"],
+            "round_winner": winners.get(o["round"], ""),
+            "t_ms": None if o.get("t_ms") is None else round(o["t_ms"], 1),
+            "score": o["bid"], "orders": o["n"], "cost": o["cost"],
+            "graded": o.get("reason") or "", "chosen": bool(o.get("chosen")),
+            "sigs": len(dict.fromkeys(i["sig"] for i in items if i.get("sig"))),
+            "unresolved": sum(1 for i in items if not i.get("sig")),
+            "unpriced": unpriced,
+            "consumed_n": sum(1 for t in txs if t[1] is not None),
+            "txs": txs})
+    return {"slot": slot, "bin": 50_000, "src": src, "offers": out,
+            "block": bool(blk)}
 
 
 # -------------------------------------------- declared CU / reward profile
@@ -5607,6 +5716,48 @@ def export_file(jid):
 
 CSS = """
 
+
+/* offer diff: winner progression */
+.odbar select.odmode{font-weight:600}
+.odbar [hidden]{display:none!important}
+.odchips{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+.odchip{display:inline-flex;align-items:center;gap:6px;padding:3px 4px 3px 9px;
+  border:1px solid var(--line2);border-radius:999px;background:var(--surface);font-size:12px}
+.odchip i{width:9px;height:9px;border-radius:50%;flex:none}
+.odx{border:0;background:none;color:var(--text3);cursor:pointer;font-size:14px;
+  line-height:1;padding:0 4px}
+.odx:hover{color:var(--text)}
+.odauto{display:inline-flex;align-items:center;gap:6px;color:var(--text2);font-size:12.5px}
+.odauto input.odpn{width:52px;padding:4px 6px}
+.odauto select{padding:4px 6px}
+.opk.opkp::after{content:" ✓"}
+.odprog{margin:6px 0 18px;color:var(--text)}
+.odprog .dim,.odctl .dim{color:var(--text3)}
+.odbar{color:var(--text)}
+.odchip{color:var(--text)}
+.odbar .cpsm{background:var(--surface);color:var(--text);border:1px solid var(--line2);
+  border-radius:999px;padding:4px 12px;font:inherit;font-size:12.5px;cursor:pointer}
+.odbar .cpsm:hover{border-color:var(--text3)}
+.odbar .odeven{background:var(--text);color:var(--bg);border-color:var(--text)}
+.odph b{font-weight:600}
+.odph{margin:4px 0 8px;font-size:13px}
+.odpt tr[data-u]{cursor:pointer}
+.odpt tr.off td{opacity:.4}
+.odsw{display:inline-block;width:12px;height:12px;border-radius:3px}
+.odctl{display:flex;flex-wrap:wrap;gap:8px 12px;align-items:center;margin:14px 0 10px;
+  font-size:12.5px}
+.odtg{display:inline-flex;border:1px solid var(--line2);border-radius:999px;overflow:hidden}
+.odtg button{border:0;background:transparent;color:var(--text2);padding:5px 12px;
+  font:inherit;font-size:12.5px;cursor:pointer}
+.odtg button[aria-pressed=true]{background:var(--text);color:var(--bg)}
+.odcharts{display:grid;gap:14px;grid-template-columns:repeat(auto-fit,minmax(420px,1fr))}
+.odcard{background:var(--surface);border:1px solid var(--line);border-radius:10px;
+  padding:14px 16px 6px}
+.odcard.odwide{grid-column:1/-1}
+.odch{font-size:12.5px;font-weight:600;color:var(--text2);text-transform:uppercase;
+  letter-spacing:.06em;margin-bottom:4px}
+.odch .dim{text-transform:none;letter-spacing:0;font-weight:400;margin-left:6px}
+@media (max-width:600px){.odcharts{grid-template-columns:minmax(0,1fr)}}
 /* offer diff: the picker bar and the two picks */
 .odbar{position:sticky;bottom:0;z-index:5;display:flex;flex-wrap:wrap;gap:8px;
   align-items:center;background:var(--bg2,var(--bg));border:1px solid var(--line);
@@ -5831,19 +5982,74 @@ td.trc{min-width:120px}
 # window.__offerPaint after every redraw so the picks survive a zoom.
 OFFDIFF_JS = r'''
 (function(){
-  var sel = [];                       // [{u, slot, label}], A then B
-  function bar(slot){
-    return document.querySelector('.odbar[data-slot="' + slot + '"]');
+  // Two modes, one picker. "diff": A then B, the order diff of the pair
+  // (/tech/offer-diff/pair). "prog": up to 8 offers of a round's WINNING
+  // builder, drawn as CU distributions (/tech/offer-diff/progression).
+  // OFFERS_JS calls __offerPick on a bullet click when the race is in pick
+  // mode, and __offerPaint after every redraw so the picks survive a zoom.
+  var KEY = 'offdiff_mode_v1', MAX = 8, BIN = 50000;
+  var COLORS = ['--c0', '--c6', '--c4', '--c8', '--c2', '--c7', '--c1', '--c5'];
+  var mode = 'diff';
+  try { if (localStorage.getItem(KEY) === 'prog') mode = 'prog'; } catch (e) {}
+  var sel = [];                 // diff: [{u, slot, label}], A then B
+  var prog = [];                // prog: [{u, slot, label, c}]
+  var hidden = {}, view = {rw: 'sum', basis: 'decl'}, lastData = null, timer = null;
+
+  function col(tok){
+    var v = getComputedStyle(document.documentElement).getPropertyValue(tok).trim();
+    return v || '#888';
   }
+  function esc(s){ var d = document.createElement('div'); d.textContent = s == null ? '' : String(s); return d.innerHTML; }
+  function bar(slot){ return document.querySelector('.odbar[data-slot="' + slot + '"]'); }
+  function out(slot){ return document.getElementById('odres' + slot); }
+  // every offer in the slot's race: builder, round, time, and the round's winner
+  function index(slot){
+    var idx = {};
+    document.querySelectorAll('script[id="offdata"]').forEach(function(s){
+      var D; try { D = JSON.parse(s.textContent); } catch (e) { return; }
+      if (String(D.slot) !== String(slot)) return;
+      D.rounds.forEach(function(rd){
+        var w = rd.chosen ? rd.chosen.b : '';
+        rd.bids.forEach(function(b){
+          idx[b.u] = {b: b.b, round: rd.round, winner: w, t: b.t, r: b.r,
+                      chosen: !!(rd.chosen && rd.chosen.u === b.u),
+                      base: rd.opened || (rd.bids[0] || {}).t || b.t};
+        });
+      });
+    });
+    return idx;
+  }
+  function label(info, fallback){
+    if (!info) return fallback || '';
+    return info.b + ' r' + info.round + ' +' + Math.round(info.t - info.base)
+      + ' ms · ' + info.r.toLocaleString() + (info.chosen ? ' · chosen' : '');
+  }
+
   function paint(){
+    var pc = {};
+    prog.forEach(function(p){ pc[p.u] = col(p.c); });
     document.querySelectorAll('[data-ou]').forEach(function(e){
       var u = e.getAttribute('data-ou'), i = -1;
-      sel.forEach(function(s, k){ if (s.u === u) i = k; });
+      if (mode === 'diff') sel.forEach(function(s, k){ if (s.u === u) i = k; });
       e.classList.toggle('opka', i === 0);
       e.classList.toggle('opkb', i === 1);
+      var on = mode === 'prog' && pc[u];
+      e.classList.toggle('opkp', !!on);
+      if (e.tagName.toLowerCase() === 'span') {
+        e.style.background = on ? pc[u] : '';
+        e.style.borderColor = on ? pc[u] : '';
+        e.style.color = on ? '#fff' : '';
+      } else {
+        e.style.stroke = on ? pc[u] : '';
+        e.style.strokeWidth = on ? '3.4px' : '';
+      }
     });
     document.querySelectorAll('.odbar').forEach(function(b){
-      var mine = sel.length && sel[0].slot === b.getAttribute('data-slot');
+      var slot = b.getAttribute('data-slot');
+      b.querySelector('.odmode').value = mode;
+      b.querySelectorAll('.odm-diff').forEach(function(x){ x.hidden = mode !== 'diff'; });
+      b.querySelectorAll('.odm-prog').forEach(function(x){ x.hidden = mode !== 'prog'; });
+      var mine = sel.length && sel[0].slot === slot;
       [['.odA', 0, 'click an offer in the race or a row’s pick'],
        ['.odB', 1, 'then a second one']].forEach(function(z){
         var el = b.querySelector(z[0]), s = mine ? sel[z[1]] : null;
@@ -5853,66 +6059,310 @@ OFFDIFF_JS = r'''
         t.textContent = s ? s.label : z[2];
         el.appendChild(t);
       });
+      var chips = b.querySelector('.odchips');
+      var here = prog.filter(function(p){ return p.slot === slot; });
+      chips.innerHTML = here.length ? here.map(function(p){
+        return '<span class="odchip" data-u="' + esc(p.u) + '"><i style="background:'
+          + col(p.c) + '"></i>' + esc(p.label)
+          + '<button type="button" class="odx" title="remove">×</button></span>';
+      }).join('') : '<i class="dim">click up to 8 offers of a round’s winner, '
+        + 'or pick them evenly →</i>';
+      // the round list for "pick evenly": rounds that have a winner
+      var rs = b.querySelector('.odpr');
+      if (rs && !rs.options.length) {
+        var idx = index(slot), seen = {};
+        Object.keys(idx).forEach(function(u){
+          var x = idx[u];
+          if (x.winner && !seen[x.round]) seen[x.round] = x.winner;
+        });
+        Object.keys(seen).sort(function(a, c){ return a - c; }).forEach(function(r){
+          var o = document.createElement('option');
+          o.value = r; o.textContent = 'r' + r + ' · ' + seen[r];
+          rs.appendChild(o);
+        });
+      }
     });
   }
-  function load(){
+  window.__offerPaint = paint;
+
+  function status(slot, text){
+    var b = bar(slot); if (b) b.querySelector('.odst').textContent = text || '';
+  }
+
+  // ---------------------------------------------------------------- diff
+  function loadDiff(){
     if (sel.length !== 2) return;
-    var slot = sel[0].slot, b = bar(slot);
-    var out = document.getElementById('odres' + slot);
-    if (!b || !out) return;
-    var st = b.querySelector('.odst');
-    st.textContent = 'diffing…';
-    out.innerHTML = '<div class="dmeta">reading both offers, the block, '
+    var slot = sel[0].slot, b = bar(slot), o = out(slot);
+    if (!b || !o) return;
+    status(slot, 'diffing…');
+    o.innerHTML = '<div class="dmeta">reading both offers, the block, '
       + 'the scheduler events and the order traces…</div>';
     var want = sel[0].u + '|' + sel[1].u;
     fetch('/tech/offer-diff/pair?slot=' + encodeURIComponent(slot)
-          + '&a=' + encodeURIComponent(sel[0].u)
-          + '&b=' + encodeURIComponent(sel[1].u)
+          + '&a=' + encodeURIComponent(sel[0].u) + '&b=' + encodeURIComponent(sel[1].u)
           + '&region=' + encodeURIComponent(b.getAttribute('data-region') || 'all'))
       .then(function(r){ return r.text(); })
       .then(function(t){
-        // a newer pick may have landed while this one was in flight
-        if (sel.length !== 2 || sel[0].u + '|' + sel[1].u !== want) return;
-        out.innerHTML = t;
-        st.textContent = '';
-        out.scrollIntoView({behavior: 'smooth', block: 'start'});
+        if (mode !== 'diff' || sel.length !== 2 || sel[0].u + '|' + sel[1].u !== want) return;
+        o.innerHTML = t; status(slot, '');
+        o.scrollIntoView({behavior: 'smooth', block: 'start'});
       })
-      .catch(function(e){
-        st.textContent = '';
-        out.innerHTML = '<div class="dmeta">could not load: ' + e + '</div>';
-      });
+      .catch(function(e){ status(slot, ''); o.innerHTML = '<div class="dmeta">could not load: ' + esc(e) + '</div>'; });
   }
-  window.__offerPaint = paint;
-  window.__offerPick = function(u, slot, label){
-    slot = String(slot);
-    if (sel.length && sel[0].slot !== slot) sel = [];
-    var i = -1;
-    sel.forEach(function(s, k){ if (s.u === u) i = k; });
-    if (i >= 0) sel.splice(i, 1);
-    else {
-      sel.push({u: u, slot: slot, label: label});
-      if (sel.length > 2) sel.shift();
-    }
-    paint();
-    if (sel.length === 2) load();
-  };
-  document.addEventListener('click', function(ev){
-    var p = ev.target.closest && ev.target.closest('.opk');
-    if (p) {
-      ev.preventDefault(); ev.stopPropagation();
-      window.__offerPick(p.getAttribute('data-ou'), p.getAttribute('data-slot'),
-                         p.getAttribute('data-l'));
+
+  // ---------------------------------------------------------------- progression
+  function nextColor(){
+    var used = prog.map(function(p){ return p.c; });
+    for (var i = 0; i < COLORS.length; i++) if (used.indexOf(COLORS[i]) < 0) return COLORS[i];
+    return COLORS[0];
+  }
+  function loadProg(){
+    clearTimeout(timer);
+    timer = setTimeout(function(){
+      if (!prog.length) return;
+      var slot = prog[0].slot, b = bar(slot), o = out(slot);
+      if (!b || !o) return;
+      status(slot, 'reading ' + prog.length + ' offer' + (prog.length > 1 ? 's' : '') + '…');
+      var want = prog.map(function(p){ return p.u; }).join(',');
+      fetch('/tech/offer-diff/progression?slot=' + encodeURIComponent(slot)
+            + '&u=' + encodeURIComponent(want)
+            + '&region=' + encodeURIComponent(b.getAttribute('data-region') || 'all'))
+        .then(function(r){ return r.json(); })
+        .then(function(d){
+          if (mode !== 'prog' || prog.map(function(p){ return p.u; }).join(',') !== want) return;
+          status(slot, '');
+          if (d.error || d.state === 'error') {
+            o.innerHTML = '<div class="dmeta aqcap">' + esc(d.error) + '</div>'; return;
+          }
+          lastData = d; renderProg(o);
+        })
+        .catch(function(e){ status(slot, ''); o.innerHTML = '<div class="dmeta">could not load: ' + esc(e) + '</div>'; });
+    }, 250);
+  }
+  function seg(name, opts, cur){
+    return '<span class="odtg" data-k="' + name + '">' + opts.map(function(o){
+      return '<button type="button" data-v="' + o[0] + '" aria-pressed="'
+        + (o[0] === cur) + '">' + o[1] + '</button>';
+    }).join('') + '</span>';
+  }
+  function money(v){
+    if (v == null) return '—';
+    return v >= 1e6 ? (v / 1e6).toFixed(2) + 'M' : v >= 1e3 ? (v / 1e3).toFixed(1) + 'k' : String(v);
+  }
+  function renderProg(o){
+    var d = lastData, byU = {};
+    d.offers.forEach(function(x){ byU[x.uuid] = x; });
+    var rows = prog.map(function(p){
+      var x = byU[p.u]; if (!x) return '';
+      var cov = x.sigs ? Math.round(100 * x.txs.length / x.sigs) : 0;
+      var lost = x.round_winner && x.builder !== x.round_winner;
+      return '<tr class="' + (hidden[p.u] ? 'off' : '') + '" data-u="' + esc(p.u) + '">'
+        + '<td><span class="odsw" style="background:' + col(p.c) + '"></span></td>'
+        + '<td>' + esc(x.builder) + (x.chosen ? ' <span class="tlstar">chosen</span>' : '')
+        + (lost ? ' <span class="dim">(not r' + x.round + '’s winner)</span>' : '') + '</td>'
+        + '<td class="n">r' + x.round + '</td>'
+        + '<td class="n">' + (x.t_ms == null ? '—' : '+' + x.t_ms.toFixed(1)) + '</td>'
+        + '<td class="n">' + x.score.toLocaleString() + '</td>'
+        + '<td class="n">' + x.orders.toLocaleString() + '</td>'
+        + '<td class="n">' + x.txs.length.toLocaleString() + ' / ' + x.sigs.toLocaleString()
+        + ' <span class="dim">(' + cov + '%)</span></td>'
+        + '<td class="n">' + x.consumed_n.toLocaleString() + '</td></tr>';
+    }).join('');
+    o.innerHTML = '<div class="odprog">'
+      + '<div class="odph"><b>winner progression</b> <span class="dim">slot ' + d.slot
+      + ' · 50k CU bins · reward as the relay scores it: fee less the burned 2,500 per signature, + Titan/Bifrost tips, + Jito at the connector’s weight'
+      + ' · click a row to hide or show its lines</span></div>'
+      + '<table class="otab odpt"><tr><th></th><th>builder</th><th class="n">round</th>'
+      + '<th class="n">ms after open</th><th class="n">relay score</th><th class="n">orders</th>'
+      + '<th class="n" title="transactions with bytes (the block or our relayer’s packet log), of all its signatures">priced txs</th>'
+      + '<th class="n" title="transactions that landed in this slot, so their consumed CU is known">consumed known</th></tr>'
+      + rows + '</table>'
+      + '<div class="odctl"><span class="dim">reward per bin</span>'
+      + seg('rw', [['sum', 'total'], ['mean', 'per tx']], view.rw)
+      + '<span class="dim">count by</span>'
+      + seg('basis', [['decl', 'declared CU'], ['used', 'consumed CU']], view.basis) + '</div>'
+      + '<div class="odcharts">'
+      + '<div class="odcard"><div class="odch">reward by declared CU</div><div class="odplot" data-c="decl"></div></div>'
+      + '<div class="odcard"><div class="odch">reward by consumed CU <span class="dim">landed in this slot only</span></div><div class="odplot" data-c="used"></div></div>'
+      + '<div class="odcard odwide"><div class="odch">transactions by CU <span class="dim odcb"></span></div><div class="odplot" data-c="count"></div></div>'
+      + '</div></div>';
+    draw(o);
+    o.scrollIntoView({behavior: 'smooth', block: 'start'});
+  }
+  function bins(txs, which){
+    // which: 0 = declared CU, 1 = consumed CU
+    var sum = {}, n = {}, max = 0;
+    txs.forEach(function(t){
+      var cu = t[which]; if (cu == null) return;
+      var i = Math.floor(cu / BIN);
+      sum[i] = (sum[i] || 0) + t[2]; n[i] = (n[i] || 0) + 1;
+      if (i > max) max = i;
+    });
+    return {sum: sum, n: n, max: max};
+  }
+  function draw(o){
+    if (!window.Plotly) {
+      if (!window.__odPlotly) {
+        window.__odPlotly = true;
+        var sc = document.createElement('script');
+        sc.src = '__PLOTLY_CDN__'; sc.charset = 'utf-8';
+        sc.onload = function(){ draw(o); };
+        document.head.appendChild(sc);
+      }
       return;
     }
-    var sw = ev.target.closest && ev.target.closest('.odswap');
-    if (sw && sel.length === 2) { sel.reverse(); paint(); load(); return; }
-    var cl = ev.target.closest && ev.target.closest('.odclr');
-    if (cl) {
-      var b = cl.closest('.odbar'), out = b &&
-        document.getElementById('odres' + b.getAttribute('data-slot'));
-      sel = []; paint();
-      if (out) out.innerHTML = '';
+    var d = lastData, byU = {};
+    d.offers.forEach(function(x){ byU[x.uuid] = x; });
+    var shown = prog.filter(function(p){ return byU[p.u] && !hidden[p.u]; });
+    var top = {decl: 0, used: 0};
+    shown.forEach(function(p){
+      top.decl = Math.max(top.decl, bins(byU[p.u].txs, 0).max);
+      top.used = Math.max(top.used, bins(byU[p.u].txs, 1).max);
+    });
+    var cb = o.querySelector('.odcb');
+    if (cb) cb.textContent = view.basis === 'decl' ? 'declared CU' : 'consumed CU, landed in this slot only';
+    o.querySelectorAll('.odplot').forEach(function(el){
+      var c = el.getAttribute('data-c');
+      var which = c === 'decl' ? 0 : c === 'used' ? 1 : (view.basis === 'decl' ? 0 : 1);
+      var nb = (which ? top.used : top.decl) + 1;
+      var traces = shown.map(function(p){
+        var x = byU[p.u], b = bins(x.txs, which), xs = [], ys = [], cd = [];
+        for (var i = 0; i < nb; i++) {
+          var cnt = b.n[i] || 0, s = b.sum[i] || 0;
+          xs.push(i * BIN + BIN / 2);
+          cd.push([i * BIN / 1000, (i + 1) * BIN / 1000, cnt]);
+          if (c === 'count') ys.push(cnt);
+          else if (view.rw === 'mean') ys.push(cnt ? s / cnt : null);
+          else ys.push(s);
+        }
+        var unit = c === 'count' ? ' txs' : ' lamports \u00b7 %{customdata[2]} txs';
+        return {x: xs, y: ys, customdata: cd, type: 'scatter', mode: 'lines+markers',
+                name: p.label, connectgaps: true,
+                line: {color: 'var(' + p.c + ')', width: 2, shape: 'linear'},
+                marker: {size: 5, color: 'var(' + p.c + ')'},
+                hovertemplate: '%{y:,.0f}' + unit + '<extra>' + esc(p.label.split(' · ')[0]) + '</extra>'};
+      });
+      var layout = {
+        height: 300, margin: {l: 58, r: 14, t: 8, b: 46},
+        paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)',
+        font: {size: 11, color: 'var(--text2)'}, showlegend: false,
+        hovermode: 'x unified',
+        hoverlabel: {bgcolor: 'var(--surface)', bordercolor: 'var(--line2)',
+                     font: {color: 'var(--text)', size: 11}},
+        xaxis: {title: {text: (which ? 'consumed' : 'declared') + ' CU, 50k bins',
+                        font: {size: 11, color: 'var(--text3)'}, standoff: 8},
+                range: [0, nb * BIN], tickformat: '~s', showgrid: false,
+                zeroline: false, showline: true, linecolor: 'var(--line2)',
+                ticks: 'outside', tickcolor: 'var(--line2)', ticklen: 4,
+                hoverformat: '~s'},
+        yaxis: {title: {text: c === 'count' ? 'transactions'
+                         : (view.rw === 'mean' ? 'reward per tx (lamports)' : 'reward (lamports)'),
+                        font: {size: 11, color: 'var(--text3)'}, standoff: 6},
+                tickformat: '~s', gridcolor: 'var(--line)', zeroline: false,
+                rangemode: 'tozero', fixedrange: false}};
+      bbTheme.plot(el, traces, layout, {displayModeBar: false, responsive: true});
+    });
+  }
+
+  // ---------------------------------------------------------------- picking
+  window.__offerPick = function(u, slot, lab){
+    slot = String(slot);
+    if (mode === 'diff') {
+      if (sel.length && sel[0].slot !== slot) sel = [];
+      var i = -1;
+      sel.forEach(function(s, k){ if (s.u === u) i = k; });
+      if (i >= 0) sel.splice(i, 1);
+      else { sel.push({u: u, slot: slot, label: lab}); if (sel.length > 2) sel.shift(); }
+      paint();
+      if (sel.length === 2) loadDiff();
+      return;
     }
+    if (prog.length && prog[0].slot !== slot) prog = [];
+    var j = -1;
+    prog.forEach(function(p, k){ if (p.u === u) j = k; });
+    if (j >= 0) { prog.splice(j, 1); paint(); if (prog.length) loadProg(); else { var o = out(slot); if (o) o.innerHTML = ''; } return; }
+    var info = index(slot)[u];
+    if (info && !info.winner) { status(slot, 'r' + info.round + ' has no winner: progression follows a round’s winning builder'); return; }
+    if (info && info.b !== info.winner) {
+      status(slot, 'not the winner’s offer: r' + info.round + ' was won by ' + info.winner); return;
+    }
+    if (prog.length >= MAX) { status(slot, 'at most ' + MAX + ' offers: remove one first'); return; }
+    status(slot, '');
+    prog.push({u: u, slot: slot, label: label(info, lab), c: nextColor()});
+    paint(); loadProg();
+  };
+  function pickEvenly(b){
+    var slot = b.getAttribute('data-slot'), r = b.querySelector('.odpr').value;
+    var n = Math.max(1, Math.min(MAX, parseInt(b.querySelector('.odpn').value, 10) || 5));
+    var idx = index(slot), all = [];
+    Object.keys(idx).forEach(function(u){
+      var x = idx[u];
+      if (String(x.round) === String(r) && x.winner && x.b === x.winner) all.push([u, x]);
+    });
+    all.sort(function(a, c){ return a[1].t - c[1].t; });
+    // up to and including the chosen offer: rungs after it did not count
+    var ch = all.findIndex(function(z){ return z[1].chosen; });
+    if (ch >= 0) all = all.slice(0, ch + 1);
+    if (!all.length) { status(slot, 'no offers from that round’s winner'); return; }
+    var picks = [];
+    for (var k = 0; k < n && k < all.length; k++) {
+      var at = all.length === 1 || n === 1 ? all.length - 1
+        : Math.round(k * (all.length - 1) / (Math.min(n, all.length) - 1));
+      if (picks.indexOf(at) < 0) picks.push(at);
+    }
+    prog = [];
+    picks.forEach(function(at){
+      prog.push({u: all[at][0], slot: slot, label: label(all[at][1]), c: nextColor()});
+    });
+    status(slot, ''); paint(); loadProg();
+  }
+
+  document.addEventListener('click', function(ev){
+    var t = ev.target;
+    var p = t.closest && t.closest('.opk');
+    if (p) {
+      ev.preventDefault(); ev.stopPropagation();
+      window.__offerPick(p.getAttribute('data-ou'), p.getAttribute('data-slot'), p.getAttribute('data-l'));
+      return;
+    }
+    var b = t.closest && t.closest('.odbar');
+    if (b && t.closest('.odswap') && sel.length === 2) { sel.reverse(); paint(); loadDiff(); return; }
+    if (b && t.closest('.odclr')) {
+      var o = out(b.getAttribute('data-slot'));
+      if (mode === 'diff') sel = []; else { prog = []; hidden = {}; }
+      paint(); if (o) o.innerHTML = ''; return;
+    }
+    if (b && t.closest('.odeven')) { pickEvenly(b); return; }
+    var x = t.closest && t.closest('.odx');
+    if (x) {
+      var u = x.closest('.odchip').getAttribute('data-u'), it = prog.find(function(q){ return q.u === u; });
+      if (it) window.__offerPick(u, it.slot, it.label);
+      return;
+    }
+    var tg = t.closest && t.closest('.odtg button');
+    if (tg) {
+      view[tg.parentNode.getAttribute('data-k')] = tg.getAttribute('data-v');
+      tg.parentNode.querySelectorAll('button').forEach(function(z){
+        z.setAttribute('aria-pressed', String(z === tg)); });
+      var o2 = tg.closest('.odres'); if (o2 && lastData) draw(o2);
+      return;
+    }
+    var tr = t.closest && t.closest('.odpt tr[data-u]');
+    if (tr) {
+      var uu = tr.getAttribute('data-u');
+      hidden[uu] = !hidden[uu]; tr.classList.toggle('off', !!hidden[uu]);
+      var o3 = tr.closest('.odres'); if (o3 && lastData) draw(o3);
+    }
+  });
+  document.addEventListener('change', function(ev){
+    var m = ev.target.closest && ev.target.closest('.odmode');
+    if (!m) return;
+    mode = m.value === 'prog' ? 'prog' : 'diff';
+    try { localStorage.setItem(KEY, mode); } catch (e) {}
+    document.querySelectorAll('.odres').forEach(function(o){ o.innerHTML = ''; });
+    paint();
+    if (mode === 'diff' && sel.length === 2) loadDiff();
+    if (mode === 'prog' && prog.length) loadProg();
   });
   document.addEventListener('keydown', function(ev){
     if (ev.key !== 'Enter' && ev.key !== ' ') return;
@@ -5920,6 +6370,7 @@ OFFDIFF_JS = r'''
     if (p) { ev.preventDefault(); p.click(); }
   });
 })();
+
 '''
 
 

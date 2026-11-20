@@ -3166,7 +3166,7 @@ DEP_FREE_PATHS = {HEALTH_PATH, ACCURACY_PATH, ACCURACY_PATH + '/slot',
                   ACCURACY_PATH + '/export.csv',
                   '/tech/offer-timelines', '/tech/offer-timelines/slot',
                   '/tech/offer-diff', '/tech/offer-diff/slot',
-                  '/tech/offer-diff/pair',
+                  '/tech/offer-diff/pair', '/tech/offer-diff/progression',
                   '/api/accuracy/export', '/api/accuracy/status',
                   SNAPSHOT_PATH,
                   REWARDS_PATH,
@@ -9531,6 +9531,7 @@ OFFERTL_PATH_SLOT = OFFERTL_PATH + "/slot"
 OFFERDIFF_PATH = "/tech/offer-diff"
 OFFERDIFF_PATH_SLOT = OFFERDIFF_PATH + "/slot"
 OFFERDIFF_PATH_PAIR = OFFERDIFF_PATH + "/pair"
+OFFERDIFF_PATH_PROG = OFFERDIFF_PATH + "/progression"
 # Our own builders, for highlighting a win in a table full of Titan's.
 OURS_RE = re.compile(r"^ASTRALANE", re.I)
 
@@ -9816,7 +9817,7 @@ def offer_timeline_page(qs, diff=False):
                  subtitle="offer diff" if diff else "offer timelines",
                  extra_css=accuracy.CSS,
                  scripts=(f"<script>{accuracy.ACCURACY_JS}</script>"
-                          + (f"<script>{accuracy.OFFDIFF_JS}</script>"
+                          + (f"<script>{accuracy.OFFDIFF_JS.replace('__PLOTLY_CDN__', rewards.PLOTLY_CDN)}</script>"
                              if diff else "")
                           + f"<script>{OFFERS_JS}</script>"
                           f'<script>{TICK_JS.replace("__SERVER_NOW__", f"{time.time():.3f}")}</script>'))
@@ -9846,6 +9847,25 @@ def offer_timeline_slot_html(qs, diff=False):
                     "in the relay's store or in ours</div>")
     return accuracy.timeline_html(d, names=_validator_names(), pick=diff,
                                   region=reg)
+
+
+def offer_diff_progression(qs):
+    """JSON for the offer diff page's winner-progression mode: each picked
+    offer's transactions as (declared CU, consumed CU, reward)."""
+    one = lambda k: (qs.get(k, [""])[0] or "").strip()
+    try:
+        slot = int(one("slot") or "0")
+    except ValueError:
+        slot = 0
+    if slot <= 0:
+        return {"error": "not a slot"}
+    try:
+        return accuracy.offer_progression(
+            relay, clickhouse_main, SOLANA_RPC, slot,
+            [u for u in one("u").split(",") if u], one("region") or "all",
+            relayer_q=relayer)
+    except ValueError as exc:
+        return {"error": str(exc)[:300]}
 
 
 def offer_diff_pair_html(qs):
@@ -10273,6 +10293,7 @@ class Handler(BaseHTTPRequestHandler):
             OFFERDIFF_PATH: (self._page_offerdiff, False),
             OFFERDIFF_PATH_SLOT: (self._frag_offerdiff_slot, True),
             OFFERDIFF_PATH_PAIR: (self._frag_offerdiff_pair, True),
+            OFFERDIFF_PATH_PROG: (offer_diff_progression, "json"),
             DEPLOYHIST_PATH: (self._page_deployments, False),
             lookup.LOOKUP_PATH: (lambda q: lookup_page(q), False),
             SLOTS_PATH: (self._page_slots, False),
