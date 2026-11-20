@@ -10364,6 +10364,8 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(blob)
             return
+        if not is_fragment:
+            body = ui.finish(body)
         self._send(body)
 
     # ------------------------------------------------------------ write

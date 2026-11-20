@@ -1,4 +1,6 @@
-"""Colours: the BI dashboard's Streamlit theme, light and dark.
+"""Colours, light and dark. Since 2026-11-20 the palette is val-gbx-comp's
+(warm neutrals, blue + Gravity orange); the token names below were laid
+down for the BI dashboard's Streamlit theme and kept, so no page changed.
 
 Every colour on every page is a CSS custom property defined here; no page
 carries a literal colour. The values are Streamlit 1.52's own (read off its
@@ -25,65 +27,66 @@ Plotly cannot read CSS variables, so figures keep `var(--x)` strings and
 redraws every figure when the theme changes.
 """
 
-_LIGHT_TEXT = "49,51,63"       # #31333F
-_DARK_TEXT = "250,250,250"     # #fafafa
-
+# The palette of val-gbx-comp (the validator-vs-Gravity site on the same
+# box): warm neutrals, one blue for focus and links, Gravity's orange as the
+# second accent. `surface` is the card colour, a step off the page.
 LIGHT = {
-    "bg": "#ffffff", "bg1": "#f8f9fb", "bg2": "#f0f2f6", "bg3": "#e6eaf1",
-    "line": f"rgba({_LIGHT_TEXT},.1)", "line2": f"rgba({_LIGHT_TEXT},.2)",
-    "line3": f"rgba({_LIGHT_TEXT},.3)",
-    "text": "#31333f", "text2": f"rgba({_LIGHT_TEXT},.6)",
-    "text3": f"rgba({_LIGHT_TEXT},.4)",
-    "on-color": "#ffffff", "primary": "#ff4b4b",
-    "hover": "rgba(151,166,195,.15)", "shadow": "rgba(0,0,0,.16)",
-    "good": "#158237", "good-main": "#21c354",
-    "good-bg": "rgba(33,195,84,.1)", "good-line": "rgba(33,195,84,.4)",
-    "bad": "#bd4043", "bad-main": "#ff4b4b",
-    "bad-bg": "rgba(255,43,43,.09)", "bad-line": "rgba(255,43,43,.35)",
-    "warn": "#926c05", "warn-main": "#faca2b",
-    "warn-bg": "rgba(255,255,18,.1)", "warn-line": "rgba(250,202,43,.55)",
-    "orange": "#e2660c", "orange-main": "#ffa421",
-    "orange-bg": "rgba(255,164,33,.1)", "orange-line": "rgba(255,164,33,.45)",
-    "accent": "#0054a3", "accent-main": "#1c83e1",
-    "accent-bg": "rgba(28,131,255,.1)", "accent-line": "rgba(28,131,225,.4)",
-    "violet": "#583f84", "violet-main": "#803df5",
-    "violet-bg": "rgba(154,93,255,.1)", "violet-line": "rgba(128,61,245,.4)",
-    # chartCategoricalColors, light order
-    "c0": "#0068c9", "c1": "#83c9ff", "c2": "#ff2b2b", "c3": "#ffabab",
-    "c4": "#29b09d", "c5": "#7defa1", "c6": "#ff8700", "c7": "#ffd16a",
-    "c8": "#6d3fc0", "c9": "#d5dae5",
-    "c0-a": "rgba(0,104,201,.3)", "c2-a": "rgba(255,43,43,.38)",
-    "c4-a": "rgba(41,176,157,.38)", "c6-a": "rgba(255,135,0,.38)",
-    "c6-b": "rgba(255,135,0,.6)", "c8-a": "rgba(109,63,192,.5)",
+    "bg": "#f6f6f4", "bg1": "#f1f1ee", "bg2": "#eeeeea", "bg3": "#e4e4df",
+    "surface": "#ffffff",
+    # lines stay translucent (text at 8 / 13 / 24 %): opaque values here
+    # made every Plotly label render washed out
+    "line": "rgba(20,20,19,.08)", "line2": "rgba(20,20,19,.13)",
+    "line3": "rgba(20,20,19,.24)",
+    "text": "#141413", "text2": "#52514e", "text3": "#85847e",
+    "on-color": "#ffffff", "primary": "#2a78d6",
+    "hover": "rgba(20,20,19,.05)", "shadow": "rgba(0,0,0,.12)",
+    "good": "#1e7a3c", "good-main": "#2f9e55",
+    "good-bg": "rgba(47,158,85,.10)", "good-line": "rgba(47,158,85,.35)",
+    "bad": "#c0392b", "bad-main": "#e0533f",
+    "bad-bg": "rgba(224,83,63,.09)", "bad-line": "rgba(224,83,63,.35)",
+    "warn": "#8a6508", "warn-main": "#e0a91b",
+    "warn-bg": "rgba(224,169,27,.12)", "warn-line": "rgba(224,169,27,.5)",
+    "orange": "#c4501d", "orange-main": "#eb6834",
+    "orange-bg": "rgba(235,104,52,.10)", "orange-line": "rgba(235,104,52,.4)",
+    "accent": "#1f63b8", "accent-main": "#2a78d6",
+    "accent-bg": "rgba(42,120,214,.09)", "accent-line": "rgba(42,120,214,.38)",
+    "violet": "#5b3f8c", "violet-main": "#7c4fd6",
+    "violet-bg": "rgba(124,79,214,.1)", "violet-line": "rgba(124,79,214,.4)",
+    # chart series: blue first, Gravity orange in the slot Titan's lines use
+    "c0": "#2a78d6", "c1": "#8cbcf0", "c2": "#d6453d", "c3": "#f0a8a2",
+    "c4": "#1f9a85", "c5": "#86d9b0", "c6": "#eb6834", "c7": "#f2c46b",
+    "c8": "#6d4fc0", "c9": "#cfcdc6",
+    "c0-a": "rgba(42,120,214,.3)", "c2-a": "rgba(214,69,61,.35)",
+    "c4-a": "rgba(31,154,133,.35)", "c6-a": "rgba(235,104,52,.35)",
+    "c6-b": "rgba(235,104,52,.6)", "c8-a": "rgba(109,79,192,.45)",
 }
 
 DARK = {
-    "bg": "#0e1117", "bg1": "#1a1c24", "bg2": "#262730", "bg3": "#31333f",
-    "line": f"rgba({_DARK_TEXT},.1)", "line2": f"rgba({_DARK_TEXT},.2)",
-    "line3": f"rgba({_DARK_TEXT},.3)",
-    "text": "#fafafa", "text2": f"rgba({_DARK_TEXT},.6)",
-    "text3": f"rgba({_DARK_TEXT},.4)",
-    "on-color": "#0e1117", "primary": "#ff4b4b",
-    "hover": "rgba(172,177,195,.15)", "shadow": "rgba(0,0,0,.6)",
-    "good": "#5ce488", "good-main": "#09ab3b",
-    "good-bg": "rgba(61,213,109,.2)", "good-line": "rgba(61,213,109,.45)",
-    "bad": "#ff6c6c", "bad-main": "#ff2b2b",
-    "bad-bg": "rgba(255,108,108,.2)", "bad-line": "rgba(255,108,108,.45)",
-    "warn": "#ffffc2", "warn-main": "#ffe312",
-    "warn-bg": "rgba(255,255,18,.2)", "warn-line": "rgba(255,227,18,.45)",
-    "orange": "#ffbd45", "orange-main": "#ff8700",
-    "orange-bg": "rgba(255,135,0,.2)", "orange-line": "rgba(255,135,0,.45)",
-    "accent": "#3d9df3", "accent-main": "#0068c9",
-    "accent-bg": "rgba(61,157,243,.2)", "accent-line": "rgba(61,157,243,.45)",
-    "violet": "#b27eff", "violet-main": "#803df5",
-    "violet-bg": "rgba(154,93,255,.2)", "violet-line": "rgba(154,93,255,.45)",
-    # chartCategoricalColors, dark order
-    "c0": "#83c9ff", "c1": "#0068c9", "c2": "#ffabab", "c3": "#ff2b2b",
-    "c4": "#7defa1", "c5": "#29b09d", "c6": "#ffd16a", "c7": "#ff8700",
-    "c8": "#6d3fc0", "c9": "#d5dae5",
-    "c0-a": "rgba(131,201,255,.3)", "c2-a": "rgba(255,171,171,.38)",
-    "c4-a": "rgba(125,239,161,.38)", "c6-a": "rgba(255,209,106,.38)",
-    "c6-b": "rgba(255,209,106,.6)", "c8-a": "rgba(154,93,255,.5)",
+    "bg": "#141413", "bg1": "#181817", "bg2": "#272725", "bg3": "#30302d",
+    "surface": "#1d1d1b",
+    "line": "rgba(243,242,238,.09)", "line2": "rgba(243,242,238,.14)",
+    "line3": "rgba(243,242,238,.26)",
+    "text": "#f3f2ee", "text2": "#c3c2b7", "text3": "#8d8c84",
+    "on-color": "#141413", "primary": "#3987e5",
+    "hover": "rgba(243,242,238,.06)", "shadow": "rgba(0,0,0,.55)",
+    "good": "#6fd08f", "good-main": "#2f9e55",
+    "good-bg": "rgba(111,208,143,.14)", "good-line": "rgba(111,208,143,.4)",
+    "bad": "#ff8a7a", "bad-main": "#e0533f",
+    "bad-bg": "rgba(255,138,122,.14)", "bad-line": "rgba(255,138,122,.4)",
+    "warn": "#f2d27a", "warn-main": "#e0a91b",
+    "warn-bg": "rgba(242,210,122,.14)", "warn-line": "rgba(242,210,122,.4)",
+    "orange": "#f29a6e", "orange-main": "#d95926",
+    "orange-bg": "rgba(217,89,38,.16)", "orange-line": "rgba(217,89,38,.45)",
+    "accent": "#6aa8f0", "accent-main": "#3987e5",
+    "accent-bg": "rgba(57,135,229,.15)", "accent-line": "rgba(57,135,229,.45)",
+    "violet": "#b79cf5", "violet-main": "#8b63e6",
+    "violet-bg": "rgba(139,99,230,.18)", "violet-line": "rgba(139,99,230,.45)",
+    "c0": "#5b9df0", "c1": "#2a6bc0", "c2": "#f08a80", "c3": "#c0443a",
+    "c4": "#5fd0b4", "c5": "#1f9a85", "c6": "#f08a5d", "c7": "#f2c46b",
+    "c8": "#9b7fe6", "c9": "#cfcdc6",
+    "c0-a": "rgba(91,157,240,.3)", "c2-a": "rgba(240,138,128,.35)",
+    "c4-a": "rgba(95,208,180,.35)", "c6-a": "rgba(240,138,93,.35)",
+    "c6-b": "rgba(240,138,93,.6)", "c8-a": "rgba(155,127,230,.45)",
 }
 
 assert LIGHT.keys() == DARK.keys()
@@ -154,6 +157,9 @@ HEAD_JS = r"""
   window.bbTheme = {
     current: current, resolve: resolve, label: label,
     plot: function(el, data, layout, config){
+      layout = Object.assign({}, layout);
+      layout.font = Object.assign({family: 'IBM Plex Sans, system-ui, sans-serif'},
+                                  layout.font || {});
       el._bbSrc = [data, layout, config];
       if (plots.indexOf(el) < 0) plots.push(el);
       return Plotly.newPlot(el, resolve(data), resolve(layout), config);

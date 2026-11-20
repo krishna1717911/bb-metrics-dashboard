@@ -53,8 +53,14 @@ TITAN = "(builder_id LIKE 'TITAN%')"
 F = "%Y-%m-%d %H:%M:%S"
 SLOTS_PER_EPOCH = 432_000         # getEpochSchedule: no warmup on mainnet
 
-KINDS = [("builder", "builder health"), ("connector", "connector health"),
-         ("relay", "relay health")]
+KINDS = [("builder", "builder health"), ("compare", "builder before / after"),
+         ("connector", "connector health"), ("relay", "relay health")]
+# the before / after view: window lengths around a pivot time, in minutes
+SPANS = [(15, "15 min"), (30, "30 min"), (60, "1 h"), (120, "2 h"),
+         (180, "3 h"), (360, "6 h"), (720, "12 h"), (1440, "24 h"),
+         (4320, "3 days"), (10080, "7 days")]
+CMP_BUCKETS = [1, 2, 5, 10, 15, 30, 60, 120, 360]
+CMP_POINTS = 40            # auto bucket: at most this many per chart
 WINDOWS = [(0, "today (since 00:00 UTC)"), (1, "last 1 hour"), (6, "last 6 hours"), (24, "last 24 hours"),
            (72, "last 3 days"), (168, "last 7 days")]
 VS = [("prev", "the window before it"), ("day", "the same hours a day earlier"),
@@ -137,18 +143,68 @@ def parse(qs):
     if cur[1] <= cur[0]:                       # just after midnight
         cur = (cur[0], cur[0] + dt.timedelta(minutes=bm))
     base = (cur[0] - dt.timedelta(hours=shift), cur[1] - dt.timedelta(hours=shift))
-    return {"kind": kind, "id": one("id"), "win": win, "vs": vs,
-            "end_in": one("end"), "cur": cur, "base": base, "shift": shift,
-            "bucket": bm, "bucket_auto": auto, "err": err}
+    out = {"kind": kind, "id": one("id"), "win": win, "vs": vs,
+           "end_in": one("end"), "cur": cur, "base": base, "shift": shift,
+           "bucket": bm, "bucket_auto": auto, "err": err}
+    if kind == "compare":
+        out.update(_parse_cmp(one, now))
+    return out
+
+
+def _parse_cmp(one, now):
+    """The before / after view: a pivot time, how far back the 'before'
+    window reaches and how far forward the 'after' one does (default: to
+    now, and the same length before), and whether to cut both to the same
+    number of rounds."""
+    err, at = "", None
+    if one("at"):
+        try:
+            at = dt.datetime.strptime(one("at")[:16].replace("T", " "),
+                                      "%Y-%m-%d %H:%M")
+        except ValueError:
+            err = "the pivot time must look like 2026-11-20 12:30 (UTC)"
+    at = at or now - dt.timedelta(minutes=30)
+    spans = dict(SPANS)
+    aft = one("after") or "now"
+    if aft != "now" and not (aft.isdigit() and int(aft) in spans):
+        aft = "now"
+    bef = one("before") or "same"
+    if bef != "same" and not (bef.isdigit() and int(bef) in spans):
+        bef = "same"
+    if at >= now:
+        err = err or "the pivot time is in the future: pick a time before now"
+    a_hi = now if aft == "now" else min(now, at + dt.timedelta(minutes=int(aft)))
+    a_len = a_hi - at
+    b_lo = at - (a_len if bef == "same" else dt.timedelta(minutes=int(bef)))
+    try:
+        cb = int(one("cbucket") or 0)
+    except ValueError:
+        cb = 0
+    cauto = cb not in CMP_BUCKETS
+    if cauto:
+        total = (a_hi - b_lo).total_seconds() / 60
+        cb = next((m for m in CMP_BUCKETS if total / m <= CMP_POINTS),
+                  CMP_BUCKETS[-1])
+    return {"at": at, "at_in": one("at"), "after": aft, "before": bef,
+            "match": one("match") == "rounds", "before_w": (b_lo, at),
+            "after_w": (at, a_hi), "cbucket": cb, "cbucket_auto": cauto,
+            "err": err}
+
+
+def _t(t):
+    """A bound as SQL text: whole seconds, or microseconds when the bound
+    has them (the before / after view cuts windows on a round's own
+    timestamp, and rounds come in bursts inside one second)."""
+    return f"{t:{F}}" + (f".{t.microsecond:06d}" if t.microsecond else "")
 
 
 def _w(col, win):
-    return f"{col} >= '{win[0]:{F}}' AND {col} < '{win[1]:{F}}'"
+    return f"{col} >= '{_t(win[0])}' AND {col} < '{_t(win[1])}'"
 
 
 def _pad(col, win, minutes=5):
-    return (f"{col} >= '{win[0] - dt.timedelta(minutes=minutes):{F}}' "
-            f"AND {col} < '{win[1] + dt.timedelta(minutes=minutes):{F}}'")
+    return (f"{col} >= '{_t(win[0] - dt.timedelta(minutes=minutes))}' "
+            f"AND {col} < '{_t(win[1] + dt.timedelta(minutes=minutes))}'")
 
 
 # ================================================================ entities
@@ -202,8 +258,19 @@ def _ratio(buckets, num, den, scale=1.0):
     return scale * _sum(buckets, num) / d if d else None
 
 
-def _bucket(col, minutes):
-    return f"toStartOfInterval({col}, INTERVAL {int(minutes)} MINUTE) AS b"
+def _epoch(t):
+    return int(t.replace(tzinfo=dt.UTC).timestamp())
+
+
+def _bucket(col, minutes, origin=None):
+    """Bucket start. With `origin` the grid is laid from that instant (the
+    before / after pivot) instead of from midnight, so no bucket straddles
+    it; `col` must then be a DateTime64."""
+    if origin is None:
+        return f"toStartOfInterval({col}, INTERVAL {int(minutes)} MINUTE) AS b"
+    P, S = _epoch(origin), int(minutes) * 60
+    return (f"toDateTime({P} + toInt64(floor((toUnixTimestamp64Milli({col}) "
+            f"/ 1000 - {P}) / {S})) * {S}, 'UTC') AS b")
 
 
 # ---------------------------------------------------- relay, round level
@@ -213,14 +280,15 @@ def _chosen(win):
             "AND event = 'round_chosen'")
 
 
-def builder_relay(rq, score, b, win, bm):
+def builder_relay(rq, score, b, win, bm, origin=None):
     """One row per round the builder offered in: its offers, rejections,
     best accepted score, whether it won (chosen or tail), the winner's
     score, and how long after the round opened its first offer came."""
     B = _q(b)
     me = f"event = 'submitted' AND builder_id = '{B}'"
     sql = (
-        f"SELECT {_bucket('r.first', bm)}, count() AS rounds, "
+        f"SELECT {_bucket('r.first', bm, origin)}, count() AS rounds, "
+        " uniqExact(r.c, r.s) AS slots, "
         " sum(r.offers) AS offers, sum(r.rejected) AS rejected, "
         " sum(r.timing) AS timing, sum(greatest(r.won, r.tail)) AS wins, "
         " countIf(r.best > 0) AS best_n, sumIf(r.best, r.best > 0) AS best_sum, "
@@ -325,7 +393,8 @@ SIM = [("replay", "sim-commit", '"winner" = 2',
 
 
 def _ix_time(t):
-    return t.strftime("%Y-%m-%dT%H:%M:%SZ")
+    return (t.strftime("%Y-%m-%dT%H:%M:%S")
+            + (f".{t.microsecond:06d}" if t.microsecond else "") + "Z")
 
 
 def sim(ixs, host, win, bm):
@@ -336,7 +405,20 @@ def sim(ixs, host, win, bm):
         return dict(zip([spec[0] for spec in SIM], got))
 
 
-def _sim_one(ixs, host, win, bm, spec):
+def _sim_kpi(ixs, host, win, spec):
+    """count, sum, p50, p99 of body_us over one window, no buckets."""
+    _name, meas, cond, _ = spec
+    where = (f"\"host_id\" = '{_q(host)}' AND time >= '{_ix_time(win[0])}' "
+             f"AND time < '{_ix_time(win[1])}'" + (f" AND {cond}" if cond else ""))
+    sel = ('count("body_us") AS n, sum("body_us") AS s, '
+           'percentile("body_us", 50) AS p50, percentile("body_us", 99) AS p99')
+    for ser in ixs(f'SELECT {sel} FROM "{meas}" WHERE {where}'):
+        for row in ser["values"]:
+            return dict(zip(ser["columns"], row))
+    return {}
+
+
+def _sim_one(ixs, host, win, bm, spec, offset_s=0):
     _name, meas, cond, _ = spec
     where = (f"\"host_id\" = '{_q(host)}' AND time >= '{_ix_time(win[0])}' "
              f"AND time < '{_ix_time(win[1])}'" + (f" AND {cond}" if cond else ""))
@@ -344,7 +426,8 @@ def _sim_one(ixs, host, win, bm, spec):
            'percentile("body_us", 50) AS p50, percentile("body_us", 99) AS p99')
     bk = {}
     for ser in ixs(f'SELECT {sel} FROM "{meas}" WHERE {where} '
-                   f"GROUP BY time({int(bm)}m)"):
+                   f"GROUP BY time({int(bm)}m"
+                   + (f", {int(offset_s)}s)" if offset_s else ")")):
         for row in ser["values"]:
             d = dict(zip(ser["columns"], row))
             if not d.get("n"):
@@ -1183,6 +1266,242 @@ def view_relay(p, rq, score, relay_id, live_html):
     return "".join(out)
 
 
+# ---------------------------------------------------------------- before / after
+#
+# One builder either side of a pivot time: the window before it against the
+# window after it, on ONE time axis (the pivot drawn across every chart),
+# instead of a baseline shifted onto the window's clock. Buckets are laid
+# from the pivot, so none straddles it. With "same rounds", both windows are
+# cut to the same number of rounds offered in: the last N before the pivot
+# and the first N after it, N = the smaller side's count.
+
+def _round_times(rq, b, before, after):
+    """(before count, after count) of rounds the builder offered in, and
+    the start of each window cut to the same number of rounds."""
+    B, at = _q(b), before[1]
+    inner = (f"SELECT min(timestamp) AS t FROM {T} "
+             f"WHERE timestamp >= '{before[0]:{F}}' AND timestamp < '{after[1]:{F}}' "
+             f"AND event = 'submitted' AND builder_id = '{B}' "
+             "GROUP BY connector_identity, slot, index_in_slot")
+    _, rows = rq(f"SELECT countIf(t < '{at:{F}}'), countIf(t >= '{at:{F}}') "
+                 f"FROM ({inner})")
+    nb, na = (_i(rows[0][0]), _i(rows[0][1])) if rows else (0, 0)
+    n = min(nb, na)
+    if not n:
+        return nb, na, n, None
+    _, lo = rq(f"SELECT toString(t) FROM ({inner}) WHERE t < '{at:{F}}' "
+               f"ORDER BY t DESC LIMIT 1 OFFSET {n - 1}")
+    _, hi = rq(f"SELECT toString(t) FROM ({inner}) WHERE t >= '{at:{F}}' "
+               f"ORDER BY t ASC LIMIT 1 OFFSET {n - 1}")
+    if not lo or not hi:
+        return nb, na, n, None
+    # to the microsecond: the Nth round after the pivot often shares its
+    # second with several more (one burst across connectors)
+    t_lo = dt.datetime.fromisoformat(lo[0][0][:26])
+    t_hi = dt.datetime.fromisoformat(hi[0][0][:26]) + dt.timedelta(microseconds=1)
+    return nb, na, n, ((t_lo, at), (at, t_hi))
+
+
+def _coverage(buckets, bm, lo, hi):
+    """Minutes of each bucket that fall inside [lo, hi): the first and last
+    buckets of a window cut to N rounds are partial, and a per-bucket count
+    has to be a rate or it dips at both ends."""
+    S = dt.timedelta(minutes=bm)
+    for k, v in buckets.items():
+        t = dt.datetime.strptime(k[:19], F)
+        v["_min"] = max(0.0, (min(t + S, hi) - max(t, lo)).total_seconds() / 60)
+    return buckets
+
+
+def _split(buckets, at):
+    a = f"{at:{F}}"
+    return ({k: v for k, v in buckets.items() if k < a},
+            {k: v for k, v in buckets.items() if k >= a})
+
+
+def _cmp_layout(title, at, unit):
+    lay = fig(title, {}, {}, lambda k: 0, 0, unit)["layout"]
+    lay["shapes"] = [{"type": "line", "xref": "x", "yref": "paper",
+                      "x0": f"{at:{F}}", "x1": f"{at:{F}}", "y0": 0, "y1": 1,
+                      "line": {"color": "var(--text2)", "width": 1.2, "dash": "dash"}}]
+    lay["annotations"] = [{"x": f"{at:{F}}", "y": 0.98, "xref": "x", "yref": "paper",
+                           "text": " pivot", "showarrow": False, "yanchor": "top",
+                           "xanchor": "left",
+                           "font": {"size": 10, "color": "var(--text2)"}}]
+    return lay
+
+
+def fig_cmp(title, before_b, after_b, fn, wins, levels=None, unit=""):
+    """Before (grey) and after (accent) on one clock, the pivot marked, and
+    each side's overall level as a flat dotted line across its own window."""
+    (b_lo, at), (_, a_hi) = wins
+    def tr(bk, name, col, width=2, dash="solid"):
+        x, y = _series(bk, fn)
+        return {"x": x, "y": y, "name": name, "type": "scatter",
+                "mode": "lines+markers", "connectgaps": False,
+                "line": {"color": col, "width": width, "dash": dash},
+                "marker": {"size": 4},
+                "hovertemplate": "%{y:,.3f}" + unit + "<extra>" + name + "</extra>"}
+    data = [tr(before_b, "before", "var(--text3)"),
+            tr(after_b, "after", "var(--c0)")]
+    for (lo, hi), v, name, col in (((b_lo, at), (levels or (None, None))[0],
+                                    "before, whole window", "var(--text3)"),
+                                   ((at, a_hi), (levels or (None, None))[1],
+                                    "after, whole window", "var(--c0)")):
+        if v is not None:
+            data.append({"x": [f"{lo:{F}}", f"{hi:{F}}"], "y": [v, v],
+                         "name": name, "type": "scatter", "mode": "lines",
+                         "line": {"color": col, "width": 1, "dash": "dot"},
+                         "showlegend": False,
+                         "hovertemplate": "%{y:,.3f}" + unit + "<extra>" + name
+                         + "</extra>"})
+    return {"data": data, "layout": _cmp_layout(title, at, unit)}
+
+
+def view_compare(p, ch, ixs, rq, score, b):
+    at, cb = p["at"], p["cbucket"]
+    before, after = p["before_w"], p["after_w"]
+    note = ""
+    if p["match"]:
+        try:
+            nb, na, n, cut = _round_times(rq, b, before, after)
+        except Exception as exc:
+            return _err("the round counts", exc)
+        if cut is None:
+            return ui.info(f"<b>{html.escape(b)}</b> offered in {nb:,} rounds "
+                           f"before the pivot and {na:,} after it: nothing to "
+                           "match. Widen a window or untick <i>same rounds</i>.",
+                           "warn")
+        before, after = cut
+        note = (f"Cut to the same number of rounds: of {nb:,} rounds before "
+                f"the pivot and {na:,} after it in the chosen spans, the last "
+                f"<b>{n:,}</b> before and the first <b>{n:,}</b> after "
+                f"({before[0]:%m-%d %H:%M:%S} &rarr; {after[1]:%m-%d %H:%M:%S}). "
+                "Both windows are cut on the rounds' own relay timestamps.")
+    wins = (before, after)
+    union = (before[0], after[1])
+    off = (_epoch(at) % (cb * 60))
+    host = health.INSTANCE_SIM_HOST.get(b)
+    jobs = {"r": lambda: builder_relay(rq, score, b, union, cb, origin=at)}
+    if host:
+        for name, *_ in SIM:
+            spec = next(x for x in SIM if x[0] == name)
+            jobs["sx_" + name] = (lambda sp=spec: _sim_one(ixs, host, union, cb,
+                                                           sp, off)["buckets"])
+            jobs["sb_" + name] = lambda sp=spec: _sim_kpi(ixs, host, before, sp)
+            jobs["sa_" + name] = lambda sp=spec: _sim_kpi(ixs, host, after, sp)
+    r = _run(jobs)
+    out = [ui.info(
+        f"<b>{html.escape(b)}</b> &middot; <b>before</b> "
+        f"{before[0]:%Y-%m-%d %H:%M:%S} &rarr; {before[1]:%H:%M:%S} "
+        f"({(before[1] - before[0]).total_seconds() / 60:,.1f} min) vs "
+        f"<b>after</b> {after[0]:%H:%M:%S} &rarr; {after[1]:%Y-%m-%d %H:%M:%S} "
+        f"({(after[1] - after[0]).total_seconds() / 60:,.1f} min) UTC. Every "
+        "tile shows the after value and how far it moved from before "
+        "(<span class='udelta good'>green</span> better, "
+        "<span class='udelta bad'>red</span> worse). Charts share one clock: "
+        f"grey before, colour after, the pivot dashed, {cb} min buckets laid "
+        "from the pivot; a dotted flat line is that side's whole-window value."
+        + (f"<br>{note}" if note else ""))]
+
+    out.append(ui.section("auction", "the relay's round log, this builder's offers"))
+    rb_all = r["r"]
+    if isinstance(rb_all, Exception):
+        out.append(_err("the relay", rb_all))
+    else:
+        rb_all = _coverage(rb_all, cb, union[0], union[1])
+        bb, ab = _split(rb_all, at)
+        mins = lambda w: (w[1] - w[0]).total_seconds() / 60
+        g = lambda bk, w: {
+            "rounds": _sum(bk, "rounds"), "wins": _sum(bk, "wins"),
+            "win": _ratio(bk, "wins", "rounds", 100),
+            "rpm": _div(_sum(bk, "rounds"), mins(w)),
+            "offers": _sum(bk, "offers"), "slots": _sum(bk, "slots"),
+            "ops": _ratio(bk, "offers", "slots"),
+            "best": _ratio(bk, "best_sum", "best_n"),
+            "winr": _ratio(bk, "win_sum", "win_n"),
+            "gap": _ratio(bk, "gap_sum", "lost_n"),
+            "tim": _ratio(bk, "timing", "offers", 100),
+            "lat": _ratio(bk, "lat_sum", "lat_n")}
+        c, o = g(ab, after), g(bb, before)
+        t = lambda *a, **k: tile(*a, **k)
+        out.append(ui.kpi_row([
+            t("win rate", c["win"], o["win"], _pct, "up",
+              "rounds won (chosen or a tail it owned) / rounds it offered in"),
+            t("rounds competed in", c["rounds"], o["rounds"], _n, None,
+              "rounds this builder offered in"),
+            t("rounds competed / min", c["rpm"], o["rpm"],
+              lambda v: "&mdash;" if v is None else f"{v:,.2f}", "up"),
+            t("avg reward / round (SOL)", c["best"], o["best"], _sol, "up",
+              "its best accepted offer per round, scored as the relay scores it"),
+            t("avg winning reward / round (SOL)", c["winr"], o["winr"], _sol, None,
+              "what won the rounds it offered in, whoever won them"),
+            t("avg gap to winner, lost (SOL)", c["gap"], o["gap"], _sol, "down"),
+            t("offers / slot", c["ops"], o["ops"],
+              lambda v: "&mdash;" if v is None else f"{v:,.1f}", None,
+              "offers it sent / slots it offered in"),
+            t("slots offered in", c["slots"], o["slots"], _n, None),
+            t("timing rejections", c["tim"], o["tim"], _pct, "down"),
+            t("first offer after round open", c["lat"], o["lat"], _ms, "down"),
+        ]))
+        out.append(ui.chart_grid([
+            fig_cmp("avg reward per round (SOL)", bb, ab,
+                    lambda k: _div(k["best_sum"], k["best_n"], 1e-9), wins,
+                    (o["best"] and o["best"] / 1e9, c["best"] and c["best"] / 1e9)),
+            fig_cmp("win rate", bb, ab, lambda k: _div(k["wins"], k["rounds"], 100),
+                    wins, (o["win"], c["win"]), "%"),
+            fig_cmp("rounds competed per minute", bb, ab,
+                    lambda k: _div(k["rounds"], k["_min"]), wins,
+                    (o["rpm"], c["rpm"])),
+            fig_cmp("offers per slot", bb, ab,
+                    lambda k: _div(k["offers"], k["slots"]), wins,
+                    (o["ops"], c["ops"])),
+            fig_cmp("avg winning reward per round (SOL)", bb, ab,
+                    lambda k: _div(k["win_sum"], k["win_n"], 1e-9), wins,
+                    (o["winr"] and o["winr"] / 1e9, c["winr"] and c["winr"] / 1e9)),
+            fig_cmp("first offer after round open (ms)", bb, ab,
+                    lambda k: _div(k["lat_sum"], k["lat_n"]), wins,
+                    (o["lat"], c["lat"]), " ms"),
+        ]))
+
+    out.append(ui.section("simulator", "body_us from Influx, the builder's own "
+                          "simulator host"))
+    if not host:
+        out.append(ui.info(f"No simulator host is mapped for {html.escape(b)} "
+                           "(health.INSTANCE_SIM_HOST).", "warn"))
+        return "".join(out)
+    tiles, figs = [], []
+    for name, _meas, _c, what in SIM:
+        bx, kb, ka = r["sx_" + name], r["sb_" + name], r["sa_" + name]
+        if any(isinstance(x, Exception) for x in (bx, kb, ka)):
+            out.append(_err(f"Influx ({name})", next(
+                x for x in (bx, kb, ka) if isinstance(x, Exception))))
+            continue
+        ms = lambda k, f: (_f(k.get(f)) / 1e3) if _f(k.get(f)) is not None else None
+        mean = lambda k: _div(_f(k.get("s")) or 0, _f(k.get("n")) or 0, 1e-3)
+        tiles += [
+            tile(f"{name} p50", ms(ka, "p50"), ms(kb, "p50"), _ms, "down", what,
+                 sub=f"{_n(_f(ka.get('n')))} runs &middot; was {_ms(ms(kb, 'p50'))}"
+                     f" over {_n(_f(kb.get('n')))}"),
+            tile(f"{name} p99", ms(ka, "p99"), ms(kb, "p99"), _ms, "down", what),
+            tile(f"{name} mean", mean(ka), mean(kb), _ms, "down", what)]
+        bb_, ab_ = _split(bx, at)
+        f50 = fig_cmp(f"{name} p50, p99 dashed (ms)", bb_, ab_,
+                      lambda k: (k["p50"] or 0) / 1e3, wins,
+                      (ms(kb, "p50"), ms(ka, "p50")), " ms")
+        for bk, nm, col in ((bb_, "before p99", "var(--text3)"),
+                            (ab_, "after p99", "var(--c6)")):
+            x, y = _series(bk, lambda k: (k["p99"] or 0) / 1e3)
+            f50["data"].append({"x": x, "y": y, "name": nm, "type": "scatter",
+                                "mode": "lines", "showlegend": False,
+                                "line": {"color": col, "width": 1.2, "dash": "dash"},
+                                "hovertemplate": "%{y:,.2f} ms<extra>" + nm + "</extra>"})
+        figs.append(f50)
+    out.append(ui.kpi_row(tiles))
+    out.append(ui.chart_grid(figs))
+    return "".join(out)
+
+
 # ================================================================ freshness
 #
 # The BI dashboard's Freshness tab, scoped to what this view reads: how old
@@ -1193,7 +1512,7 @@ def freshness(kind, ent, ch, ixs, rq, gq):
     E = _q(ent)
     day = "now() - INTERVAL 1 DAY"
     jobs = {}
-    if kind == "builder":
+    if kind in ("builder", "compare"):
         jobs["relay round log (its offers)"] = lambda: rq(
             f"SELECT toString(max(timestamp)) FROM {T} WHERE timestamp > {day} "
             f"AND builder_id = '{E}'")[1][0][0]
@@ -1264,6 +1583,33 @@ def form(p, entities, names):
     bks = ('<option value="">auto</option>' + "".join(
         f'<option value="{m}"{" selected" if not p["bucket_auto"] and m == p["bucket"] else ""}>'
         f'{m if m < 60 else m // 60} {"min" if m < 60 else "h"}</option>' for m in BUCKETS))
+    if p["kind"] == "compare":
+        spans = lambda cur, first: first + "".join(
+            f'<option value="{m}"{" selected" if str(m) == cur else ""}>{e(lab)}</option>'
+            for m, lab in SPANS)
+        aft = spans(p["after"], '<option value="now">until now</option>')
+        bef = spans(p["before"], '<option value="same">same length as after</option>')
+        cbks = ('<option value="">auto</option>' + "".join(
+            f'<option value="{m}"{" selected" if not p["cbucket_auto"] and m == p["cbucket"] else ""}>'
+            f'{m if m < 60 else m // 60} {"min" if m < 60 else "h"}</option>'
+            for m in CMP_BUCKETS))
+        return (
+            '<form class="aqform bbform" method="get" action="' + e(PATH) + '">'
+            f'<label>view<select name="kind" onchange="this.form.submit()">{kinds}</select></label>'
+            f'<label>builder<select name="id" onchange="this.form.submit()">'
+            f'{"".join(opts)}</select></label>'
+            '<label>pivot (UTC)<input name="at" size="16" '
+            f'value="{e(p["at_in"] or format(p["at"], "%Y-%m-%d %H:%M"))}" '
+            'placeholder="2026-11-20 12:30"></label>'
+            f'<label>before the pivot<select name="before">{bef}</select></label>'
+            f'<label>after the pivot<select name="after">{aft}</select></label>'
+            f'<label>bucket<select name="cbucket">{cbks}</select></label>'
+            '<label class="bbchk" title="cut both windows to the same number '
+            'of rounds offered in: the last N before the pivot and the first '
+            'N after it, N = the smaller count"><span>same rounds</span>'
+            f'<input type="checkbox" name="match" value="rounds"'
+            f'{" checked" if p["match"] else ""}></label>'
+            "<button type=submit>run</button></form>")
     return (
         '<form class="aqform bbform" method="get" action="' + e(PATH) + '">'
         f'<label>view<select name="kind" onchange="this.form.id.value=\'\';'
@@ -1283,6 +1629,9 @@ PATH = "/tech/health"
 CSS = """
 .bbform{margin:14px 28px 4px}
 .bbform select{max-width:340px}
+.bbform .bbchk{flex-direction:row;align-items:center;gap:8px;align-self:center;
+  margin-top:16px}
+.bbform .bbchk input{width:16px;height:16px;margin:0;accent-color:var(--accent-main)}
 .ks.m{font:11px ui-monospace,Menlo,monospace;color:var(--text2);word-break:break-all}
 """
 
@@ -1294,7 +1643,7 @@ def page(qs, ch, ixs, panic_src, rq, gq, rpc_url, names):
     only path to the solana db), `names` identity -> validator name."""
     p = parse(qs)
     try:
-        if p["kind"] == "builder":
+        if p["kind"] in ("builder", "compare"):
             ents = builders(ch)
         elif p["kind"] == "connector":
             ents = [c for c, _ in connectors(rq)]
@@ -1302,7 +1651,7 @@ def page(qs, ch, ixs, panic_src, rq, gq, rpc_url, names):
             ents = relays(rq)
     except Exception as exc:
         return form(p, [], names) + _err("the entity list", exc)
-    if p["kind"] == "builder" and not p["id"]:
+    if p["kind"] in ("builder", "compare") and not p["id"]:
         p["id"] = health.DEFAULT_INSTANCE if health.DEFAULT_INSTANCE in ents else (
             ents[0] if ents else "")
     if not p["id"] and ents:
@@ -1317,6 +1666,22 @@ def page(qs, ch, ixs, panic_src, rq, gq, rpc_url, names):
                                 "active in the last 7 days.", "warn")
     cur, base = p["cur"], p["base"]
     label = dict(VS)[p["vs"]]
+    if p["kind"] == "compare":
+        out.append(ui.section("data freshness", "newest row in each store this "
+                              "view reads"))
+        try:
+            out.append(freshness("compare", p["id"], ch, ixs, rq, gq))
+        except Exception as exc:
+            out.append(_err("freshness", exc))
+        try:
+            score = _cached("score", lambda: accuracy.score_sql(rq), ttl=900)
+        except Exception:
+            score = ("(protocol_fees + intDiv(jito_tips * "
+                     f"{accuracy.DEFAULT_JITO_WEIGHT}, 10000) + builder_payment)")
+        out.append(view_compare(p, ch, ixs, rq, score, p["id"]))
+        out.append("<script>" + ui.CHART_JS.replace("__PLOTLY_CDN__", PLOTLY_CDN)
+                   + "</script>")
+        return "".join(out)
     out.append(ui.info(
         f"<b>{html.escape(p['id'])}</b>"
         + (f" ({html.escape(names[p['id']])})" if names.get(p["id"]) else "")

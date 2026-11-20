@@ -291,3 +291,120 @@ def sidebar(pages, sections, here, href):
                 'aria-label="favourite">&#9734;</button></div>')
     out.append("</nav>")
     return "".join(out)
+
+
+# ---- the skin ---------------------------------------------------------------
+#
+# val-gbx-comp's look (the validator-vs-Gravity site on the same box): IBM
+# Plex, warm neutral surfaces, 10 px radii, quiet labels, one accent. It is
+# the LAST stylesheet on every page (finish() puts it before </head>), so it
+# only restyles: no markup, class or behaviour changes, and a page's own
+# rules still apply wherever this says nothing.
+
+FONTS = ('<link rel="preconnect" href="https://fonts.googleapis.com">'
+         '<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>'
+         '<link rel="stylesheet" href="https://fonts.googleapis.com/css2?'
+         'family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@'
+         '400;500;600;700&display=swap">')
+
+SKIN = """
+body{font-family:"IBM Plex Sans",system-ui,-apple-system,"Segoe UI",sans-serif;
+  font-size:14px;line-height:1.5;-webkit-font-smoothing:antialiased;
+  text-rendering:optimizeLegibility}
+code,pre,kbd,samp{font-family:"IBM Plex Mono",ui-monospace,Menlo,monospace}
+
+/* shell */
+.snav{background:var(--surface);border-right:1px solid var(--line);padding:18px 12px 28px}
+.snav .sbrand{font-size:17px;font-weight:600;letter-spacing:-.01em;padding:2px 10px 16px}
+.snav .sbrand span{color:var(--accent-main)}
+.snav .sgrp{font-size:10.5px;font-weight:600;letter-spacing:.08em;margin:18px 0 6px}
+.snav .slink{border-radius:8px;color:var(--text2);font-size:13.5px;padding:6px 30px 6px 10px}
+.snav .slink:hover{background:var(--bg2);color:var(--text)}
+.snav .slink.on{background:var(--bg2);color:var(--text);font-weight:600;box-shadow:none}
+.snav .sstar{opacity:.55}
+.snav .srow:hover .sstar,.snav .sstar.on{opacity:1}
+.sthemebtn{border-radius:999px;border:1px solid var(--line2);background:transparent;
+  color:var(--text2);font-size:12.5px;padding:6px 10px}
+.sthemebtn:hover{border-color:var(--text3);color:var(--text)}
+.smain>header{border-bottom:0;padding:28px 28px 4px;flex-wrap:wrap;row-gap:10px}
+.smain>header .sub{font-size:22px;font-weight:600;color:var(--text);letter-spacing:-.01em;
+  line-height:1.25;flex:0 0 auto;max-width:100%}
+.crumb{border-bottom:0;padding:2px 28px 16px;font-size:12.5px;color:var(--text3)}
+.crumb a{color:var(--text2)}
+.crumb a:hover{color:var(--text);text-decoration:none}
+.crumb b{color:var(--text);font-weight:500}
+form.jump input{border-radius:999px}
+
+/* forms: labels in sentence case, sans controls, one pill button */
+.aqform,.bbform{gap:12px 16px}
+.aqform label,.hsel label{font-size:12.5px;font-weight:500;color:var(--text2);
+  text-transform:none;letter-spacing:0;gap:6px}
+.smain select,.smain textarea,.smain input:not([type]),.smain input[type=text],
+.smain input[type=search],.smain input[type=number],.smain input[type=date],
+.smain input[type=datetime-local],.smain input[type=time]{
+  font-family:inherit;font-size:13.5px;color:var(--text);background:var(--surface);
+  border:1px solid var(--line2);border-radius:8px;padding:7px 10px;
+  text-transform:none;letter-spacing:0;line-height:1.3}
+.smain select:focus,.smain textarea:focus,.smain input:not([type]):focus,
+.smain input[type=text]:focus,.smain input[type=search]:focus,
+.smain input[type=number]:focus,.smain input[type=date]:focus,
+.smain input[type=datetime-local]:focus{outline:2px solid var(--accent-main);
+  outline-offset:1px;border-color:var(--line2)}
+.smain .ts-control input,.smain .ts-control input:focus{border:0;padding:0;
+  background:none;outline:none}
+.smain .ts-wrapper .ts-control{border-radius:8px;background:var(--surface)!important;
+  border-color:var(--line2);font-family:inherit;font-size:13.5px}
+.smain button[type=submit],.aqform button:not([type=button]){font-family:inherit;
+  font-size:13.5px;font-weight:500;background:var(--text);color:var(--bg);
+  border:1px solid var(--text);border-radius:999px;padding:7px 18px;cursor:pointer;
+  text-transform:none;letter-spacing:0}
+.smain button[type=submit]:hover,.aqform button:not([type=button]):hover{filter:none;
+  opacity:.86}
+.aqform button[type=button]{font-family:inherit;font-size:13px;font-weight:500;
+  background:var(--surface);color:var(--text);border:1px solid var(--line2);
+  border-radius:999px;padding:6px 14px;text-transform:none;letter-spacing:0}
+.aqform button[type=button]:hover{border-color:var(--text3);filter:none}
+.smain .ts-control,.smain .ts-control input,.smain .ts-control .item{color:var(--text)}
+
+/* cards, tiles, boxes */
+.kpi,.ucard,.exp,.card,.scaffold,.hcard,.panel{background:var(--surface)}
+.kpi{border-color:var(--line);border-radius:10px;padding:13px 16px 12px}
+.kpi .kl{font-size:12px;font-weight:500;color:var(--text2)}
+.kpi .kv{font-size:23px;font-weight:600;letter-spacing:-.02em}
+.kpi .ks{color:var(--text3)}
+.usec{margin-top:32px;font-size:12.5px;font-weight:600;color:var(--text2);
+  text-transform:uppercase;letter-spacing:.07em}
+.usec .usub{font-size:12.5px;text-transform:none;letter-spacing:0;font-weight:400;
+  color:var(--text3)}
+.ubox{background:var(--surface);border:1px solid var(--line);
+  border-left:3px solid var(--accent-main);border-radius:10px;color:var(--text2);
+  font-size:13px;line-height:1.6;padding:12px 16px}
+.ubox-warn{border-left-color:var(--orange-main)}
+.ubox-err{border-left-color:var(--bad-main);color:var(--text)}
+.ubox b{color:var(--text)}
+.exp{border-color:var(--line);border-radius:10px}
+.exp>summary{color:var(--text2);font-weight:500}
+.exp>summary:hover{color:var(--text)}
+.ucard{border-color:var(--line);border-radius:10px;padding:10px 10px 4px}
+.ucsv{border-radius:999px;background:var(--surface)}
+.utab th{text-transform:none;letter-spacing:0;font-size:12px;font-weight:500;
+  color:var(--text2)}
+.card{border-color:var(--line)}
+.card:hover{border-color:var(--text3);background:var(--surface)}
+.cardh{color:var(--text)}
+.hrow span:last-child{color:var(--text)}
+::selection{background:var(--accent-bg)}
+"""
+
+
+def finish(doc):
+    """Put the skin on a whole page: the font link and SKIN as the last
+    stylesheet, and Plex for every font stack the pages name. Fragments
+    (no </head>) inherit it from the page they land in."""
+    if not isinstance(doc, str) or "</head>" not in doc:
+        return doc
+    # unquoted on purpose: valid CSS, and the same stacks also sit inside
+    # JSON and JS strings (Plotly font settings), where a quote would break
+    doc = (doc.replace("ui-monospace,", "IBM Plex Mono,ui-monospace,")
+              .replace("ui-sans-serif,", "IBM Plex Sans,ui-sans-serif,"))
+    return doc.replace("</head>", FONTS + "<style>" + SKIN + "</style></head>", 1)
