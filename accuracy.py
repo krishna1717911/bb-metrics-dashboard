@@ -6111,12 +6111,24 @@ OFFDIFF_JS = r'''
     if (m) { var p = m[1].split(',').map(parseFloat); return [p[0], p[1], p[2]]; }
     return [128, 128, 128];
   }
-  // sequential: the first offer palest, the last full accent -- it IS an order
-  function ramp(n){
-    var a = rgb(tok('--accent-main')), s = rgb(tok('--surface')), out = [];
+  // one distinct colour per offer: the site's categorical chart tokens, in
+  // the order that keeps neighbours furthest apart, then generated hues
+  var CAT = ['--c0', '--c6', '--c4', '--c8', '--c2', '--c7', '--c1', '--c5', '--c3', '--c9'];
+  function ink(col){
+    // dark or light label text for a segment of this colour
+    var m = col.match(/hsl\((\d+),\s*\d+%,\s*(\d+)%/);
+    if (m) return +m[2] > 55 ? '#141413' : '#ffffff';
+    var c = rgb(col), l = (0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2]) / 255;
+    return l > 0.62 ? '#141413' : '#ffffff';
+  }
+  function palette(n){
+    var out = [];
     for (var k = 0; k < n; k++) {
-      var w = n === 1 ? 1 : 0.3 + 0.7 * k / (n - 1);
-      out.push('rgb(' + [0, 1, 2].map(function(i){ return Math.round(s[i] * (1 - w) + a[i] * w); }).join(',') + ')');
+      if (k < CAT.length) { out.push('rgb(' + rgb(tok(CAT[k])).join(',') + ')'); continue; }
+      var h = Math.round((k - CAT.length) * 137.5 + 20) % 360;
+      out.push('hsl(' + h + ',62%,' + (document.documentElement.getAttribute('data-theme') === 'dark'
+        || (!document.documentElement.getAttribute('data-theme') && matchMedia('(prefers-color-scheme: dark)').matches)
+        ? '64%' : '46%') + ')');
     }
     return out;
   }
@@ -6144,7 +6156,7 @@ OFFDIFF_JS = r'''
       + ' ms · ' + info.r.toLocaleString() + (info.chosen ? ' · chosen' : '');
   }
   function colors(){
-    var c = ramp(prog.picks.length), m = {};
+    var c = palette(prog.picks.length), m = {};
     prog.picks.forEach(function(p, k){ m[p.u] = c[k]; });
     return m;
   }
@@ -6211,8 +6223,8 @@ OFFDIFF_JS = r'''
         e.style.borderColor = on ? pc[u] : '';
         e.style.color = on ? 'var(--text)' : '';
       } else {
-        e.style.stroke = on ? 'var(--text)' : '';
-        e.style.strokeWidth = on ? '2.6px' : '';
+        e.style.stroke = on ? pc[u] : '';
+        e.style.strokeWidth = on ? '3.4px' : '';
       }
     });
   }
@@ -6443,6 +6455,10 @@ OFFDIFF_JS = r'''
             var mk = {color: col, line: {color: surf, width: 0.8}};
             if (part[3] < 0) { mk.opacity = 0.55; mk.pattern = {shape: '.', fillmode: 'replace', fgcolor: col, bgcolor: surf, size: 5, solidity: 0.5}; }
             traces.push({type: 'bar', x: xs, y: ys, customdata: cd, width: BIN * 0.86, marker: mk,
+                         text: ys.map(function(v){ return v == null ? '' : '#' + (k + 1); }),
+                         textposition: 'inside', insidetextanchor: 'middle',
+                         textfont: {size: 10, color: part[3] < 0 ? 'var(--text2)' : ink(col)},
+                         textangle: 0, cliponaxis: false,
                          name: nm + ' ' + part[1],
                          hovertemplate: '%{y:,.0f}' + unit + (c === 'count' ? '' : ' · %{customdata} txs')
                            + '<extra>' + esc(nm + ' ' + part[1]) + '</extra>'});
@@ -6468,6 +6484,7 @@ OFFDIFF_JS = r'''
         paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)',
         font: {size: 11, color: 'var(--text2)'}, showlegend: false,
         barmode: 'relative', bargap: 0.1, hovermode: 'x unified',
+        uniformtext: {minsize: 9, mode: 'hide'},
         hoverlabel: {bgcolor: 'var(--surface)', bordercolor: 'var(--line2)', font: {color: 'var(--text)', size: 11}},
         xaxis: {title: {text: (which === 2 ? 'consumed' : 'declared') + ' CU, 50k bins',
                         font: {size: 11, color: 'var(--text3)'}, standoff: 8},
