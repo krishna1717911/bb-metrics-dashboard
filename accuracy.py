@@ -6142,8 +6142,14 @@ OFFDIFF_JS = r'''
       if (String(D.slot) !== String(slot)) return;
       D.rounds.forEach(function(rd){
         var w = rd.chosen ? rd.chosen.b : '';
+        // each winner offer's fixed number: its place, by time, among all
+        // of that builder's offers in the round -- never its pick order
+        var mine = rd.bids.filter(function(b){ return b.b === w; })
+          .sort(function(a, c){ return a.t - c.t; });
         rd.bids.forEach(function(b){
+          var n = mine.indexOf(b);
           idx[b.u] = {b: b.b, round: rd.round, winner: w, t: b.t, r: b.r,
+                      n: n >= 0 ? n + 1 : 0, of: mine.length,
                       chosen: !!(rd.chosen && rd.chosen.u === b.u),
                       base: rd.opened || (rd.bids[0] || {}).t || b.t};
         });
@@ -6155,10 +6161,17 @@ OFFDIFF_JS = r'''
     return info.b + ' r' + info.round + ' +' + Math.round(info.t - info.base)
       + ' ms · ' + info.r.toLocaleString() + (info.chosen ? ' · chosen' : '');
   }
+  // colour and number both follow the offer's fixed number, so removing a
+  // pick never renumbers or recolours the others
   function colors(){
-    var c = palette(prog.picks.length), m = {};
-    prog.picks.forEach(function(p, k){ m[p.u] = c[k]; });
+    var top = prog.picks.reduce(function(a, p){ return Math.max(a, p.n || 0); }, 0);
+    var c = palette(Math.max(top, prog.picks.length)), m = {};
+    prog.picks.forEach(function(p, k){ m[p.u] = c[(p.n || k + 1) - 1]; });
     return m;
+  }
+  function numOf(u){
+    var p = prog.picks.find(function(q){ return q.u === u; });
+    return p && p.n ? p.n : 0;
   }
 
   function paint(){
@@ -6182,7 +6195,7 @@ OFFDIFF_JS = r'''
       var here = prog.slot === slot ? prog.picks : [];
       chips.innerHTML = here.length ? here.map(function(p, k){
         return '<span class="odchip" data-u="' + esc(p.u) + '"><i style="background:'
-          + pc[p.u] + '"></i>#' + (k + 1) + ' ' + esc(p.label)
+          + pc[p.u] + '"></i>#' + (p.n || k + 1) + ' ' + esc(p.label)
           + '<button type="button" class="odx" title="remove">×</button></span>';
       }).join('') : '<i class="dim">click the winning builder’s offers in one round '
         + '(the others are greyed out), or pick them evenly →</i>';
@@ -6356,7 +6369,7 @@ OFFDIFF_JS = r'''
       var dscore = s.prevScore == null ? '' : (x.score - s.prevScore);
       return '<tr class="' + (hidden[x.uuid] ? 'off' : '') + '" data-u="' + esc(x.uuid) + '">'
         + '<td><span class="odsw" style="background:' + cols[x.uuid] + '"></span></td>'
-        + '<td class="n">#' + (k + 1) + '</td>'
+        + '<td class="n">#' + (numOf(x.uuid) || k + 1) + '</td>'
         + '<td class="n">' + (x.t_ms == null ? '—' : '+' + x.t_ms.toFixed(1)) + '</td>'
         + '<td class="n">' + x.score.toLocaleString() + (x.chosen ? ' <span class="tlstar">chosen</span>' : '') + '</td>'
         + '<td class="n">' + (dscore === '' ? '' : (dscore >= 0 ? '+' : '') + dscore.toLocaleString()) + '</td>'
@@ -6371,13 +6384,14 @@ OFFDIFF_JS = r'''
     var first = d.offers[0], last = d.offers[d.offers.length - 1], gone = {};
     d.offers.forEach(function(x){ x.txs.forEach(function(t){ if (t[4] === 0) gone[t[0]] = 1; }); });
     var nl = Object.keys(gone).length;
+    var ofN = ((index(prog.slot)[first.uuid] || {}).of) || d.offers.length;
     o.innerHTML = '<div class="odprog">'
       + '<div class="odph"><b>' + esc(d.builder) + '</b> · r' + d.round + ' of slot ' + d.slot
       + ' · ' + d.offers.length + ' offer' + (d.offers.length > 1 ? 's' : '')
       + (first.t_ms != null ? ', +' + first.t_ms + ' → +' + last.t_ms + ' ms after the round opened' : '')
       + ' <span class="dim">· reward as the relay scores it: fee less the burned 2,500 per signature, + Titan/Bifrost tips, + Jito at the connector’s weight</span></div>'
       + missingHtml(d)
-      + '<table class="otab odpt"><tr><th></th><th class="n">step</th><th class="n">ms after open</th>'
+      + '<table class="otab odpt"><tr><th></th><th class="n" title="each offer\u2019s fixed number: its place by time among all of the winner\u2019s ' + ofN + ' offers in this round, so removing a pick never renumbers the rest">offer # <span class="dim">of ' + ofN + '</span></th><th class="n">ms after open</th>'
       + '<th class="n">relay score</th><th class="n">Δ score</th><th class="n">orders</th><th class="n">txs</th>'
       + '<th class="n" title="transactions in this offer that the previous one did not carry: count, reward">added</th>'
       + '<th class="n" title="transactions the previous offer carried that this one dropped: count, reward">dropped</th>'
@@ -6442,7 +6456,7 @@ OFFDIFF_JS = r'''
       if (view.v === 'steps') {
         st.forEach(function(s, k){
           if (hidden[s.o.uuid]) return;
-          var col = cols[s.o.uuid], nm = '#' + (k + 1) + ' +' + s.o.t_ms + ' ms';
+          var num = numOf(s.o.uuid) || k + 1, col = cols[s.o.uuid], nm = '#' + num + ' +' + s.o.t_ms + ' ms';
           [[landed(s.add), 'added', false, 1],
            [landed(s.drop), 'dropped', false, -1]].forEach(function(part){
             if (!part[0].length) return;
@@ -6455,7 +6469,7 @@ OFFDIFF_JS = r'''
             var mk = {color: col, line: {color: surf, width: 0.8}};
             if (part[3] < 0) { mk.opacity = 0.55; mk.pattern = {shape: '.', fillmode: 'replace', fgcolor: col, bgcolor: surf, size: 5, solidity: 0.5}; }
             traces.push({type: 'bar', x: xs, y: ys, customdata: cd, width: BIN * 0.86, marker: mk,
-                         text: ys.map(function(v){ return v == null ? '' : '#' + (k + 1); }),
+                         text: ys.map(function(v){ return v == null ? '' : '#' + num; }),
                          textposition: 'inside', insidetextanchor: 'middle',
                          textfont: {size: 10, color: part[3] < 0 ? 'var(--text2)' : ink(col)},
                          textangle: 0, cliponaxis: false,
@@ -6474,9 +6488,9 @@ OFFDIFF_JS = r'''
           }
           traces.push({type: 'scatter', mode: 'lines+markers', x: xs, y: ys, customdata: cd,
                        connectgaps: true, line: {color: col, width: 2}, marker: {size: 5, color: col},
-                       name: '#' + (st.indexOf(s) + 1),
+                       name: '#' + (numOf(s.o.uuid) || st.indexOf(s) + 1),
                        hovertemplate: '%{y:,.0f}' + unit + (c === 'count' ? '' : ' · %{customdata} txs')
-                         + '<extra>#' + (st.indexOf(s) + 1) + ' +' + s.o.t_ms + ' ms</extra>'});
+                         + '<extra>#' + (numOf(s.o.uuid) || st.indexOf(s) + 1) + ' +' + s.o.t_ms + ' ms</extra>'});
         });
       }
       var layout = {
@@ -6534,7 +6548,7 @@ OFFDIFF_JS = r'''
         setPicks(slot, info.round, info.b, []);
       } else status(slot, '');
       if (prog.picks.length >= MAX) { status(slot, 'at most ' + MAX + ' offers'); return; }
-      prog.picks.push({u: u, t: info.t, label: label(info)});
+      prog.picks.push({u: u, t: info.t, n: info.n, label: label(info)});
       prog.picks.sort(function(a, c){ return a.t - c.t; });
     }
     paint(); loadProg();
@@ -6558,7 +6572,7 @@ OFFDIFF_JS = r'''
       if (at.indexOf(p) < 0) at.push(p);
     }
     setPicks(slot, all[0][1].round, all[0][1].b, at.map(function(p){
-      return {u: all[p][0], t: all[p][1].t, label: label(all[p][1])}; }));
+      return {u: all[p][0], t: all[p][1].t, n: all[p][1].n, label: label(all[p][1])}; }));
     status(slot, all.length > MAX && nv === 'all' ? 'the first ' + MAX + ' of ' + all.length + ' offers' : '');
     paint(); loadProg();
   }
