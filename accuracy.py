@@ -4142,8 +4142,9 @@ def offer_pair(relay_q, ch, rpc_url, slot, ua, ub, region="all",
 def pair_bar_html(slot, region="all"):
     """The picker under a slot's race, sticky so it stays in view down the
     race. Two modes (OFFDIFF_JS): "offer diff" picks A and B and lists the
-    orders each has that the other lacks; "winner progression" picks up to
-    8 offers of a round's winning builder and draws them over CU bins."""
+    orders each has that the other lacks; "winner progression" picks the
+    offers of ONE round's winning builder (the others are greyed out) and
+    shows what each added to the one before it, over CU bins."""
     return (f'<div class="odbar" data-slot="{int(slot)}" '
             f'data-region="{html.escape(region, quote=True)}">'
             '<select class="odmode" aria-label="mode">'
@@ -4155,8 +4156,9 @@ def pair_bar_html(slot, region="all"):
             '<button type="button" class="cpsm odm-diff odswap">swap</button>'
             '<span class="odm-prog odchips" hidden></span>'
             '<span class="odm-prog odauto" hidden>pick '
-            '<input class="odpn" type="number" min="1" max="8" value="5" '
-            'aria-label="how many"> evenly from '
+            '<select class="odpn" aria-label="how many"><option>3</option>'
+            '<option selected>5</option><option>8</option>'
+            '<option value="all">all</option></select> evenly from '
             '<select class="odpr" aria-label="round"></select>'
             '<button type="button" class="cpsm odeven">pick</button></span>'
             '<button type="button" class="cpsm odclr">clear</button>'
@@ -4358,11 +4360,35 @@ def pair_html(d):
 # relay scores it (the block's figures when it landed here, else its
 # bytes from our relayer's packet log). The page bins and draws them.
 
-PROG_MAX = 8
+PROG_MAX = 16
+
+
+def _tx_price(raw, got, bps):
+    """(declared CU, reward) for one transaction's bytes, reward by the
+    relay's formula: the fee less the burned 2,500 per signature, builder
+    tips at face value, Jito at the connector's weight. `got` is the
+    block's own figures when it landed in this slot."""
+    pr = txprice.price(raw, TIP_ACCOUNTS, JITO_TIP_SET)
+    if got:
+        fee, jito, builder = got["fee"], got["jito"], got["tip"] - got["jito"]
+    else:
+        fee, jito, builder = pr["fee"], pr["jito"], pr["builder"]
+    try:
+        nsig = txprice.parse(raw)["n_sigs"]
+    except Exception:
+        nsig = 1
+    _tip, reward = weigh(max(0, int(fee) - 2500 * nsig), jito, builder, bps)
+    return int(pr["cu"]), int(reward)
 
 
 def offer_progression(relay_q, ch, rpc_url, slot, uuids, region="all",
                       relayer_q=None):
+    """One round's winning builder, offer after offer: every transaction
+    of each picked offer (bundles expanded) with its declared CU, the CU
+    it consumed if it landed in this slot, its reward, and whether it
+    landed -- and, for the round's CHOSEN offer whether picked or not,
+    every order that did not land in the slot, with where it landed
+    instead and what the validator said."""
     uuids = list(dict.fromkeys(u for u in uuids if u))[:PROG_MAX]
     if not uuids:
         raise ValueError("pick at least one offer")
@@ -4371,9 +4397,22 @@ def offer_progression(relay_q, ch, rpc_url, slot, uuids, region="all",
     if miss:
         raise ValueError("offer not found in slot %d: %s"
                          % (slot, ", ".join(u[:8] for u in miss)))
+    rounds_ = {offs[u]["round"] for u in uuids}
+    builders = {offs[u]["builder"] for u in uuids}
+    if len(rounds_) > 1 or len(builders) > 1:
+        raise ValueError("a progression is one builder in one round: these "
+                         "offers span rounds %s and builders %s" % (
+                             sorted(rounds_), sorted(builders)))
+    rnd = next(r for r in tl["rounds"] if r["idx"] in rounds_)
+    chosen = next((o["uuid"] for o in rnd["offers"] if o.get("chosen")), "")
+    if chosen and chosen not in offs:
+        co = next(o for o in rnd["offers"] if o["uuid"] == chosen)
+        offs[chosen] = dict(co, round=rnd["idx"], won_by=rnd.get("won_by") or "",
+                            anchor=rnd.get("anchor") or "",
+                            connector=co.get("connector") or tl.get("connector") or "")
     if not (win and win[0]):
         win = _chunk_window([offs[u] for u in uuids])
-    consumed, rew = {}, {}
+    consumed, rew, blk = {}, {}, {}
     try:
         blk = block_tx_bytes(rpc_url, slot, consumed)
     except Exception:
@@ -4382,61 +4421,101 @@ def offer_progression(relay_q, ch, rpc_url, slot, uuids, region="all",
         rew = block_rewards(rpc_url, slot)
     except Exception:
         rew = {}
-    pmap = block_prefixes(set(blk) | set(rew)) if (blk or rew) else {}
-    contents, src = order_contents(relay_q, ch, uuids, win, pmap)
-    sigs = {o["sig"] for u in uuids for o in contents.get(u, []) if o.get("sig")}
+    in_block = (set(blk) | set(rew)) if (blk or rew) else None
+    pmap = block_prefixes(in_block) if in_block else {}
+    want = uuids + ([chosen] if chosen and chosen not in uuids else [])
+    contents, src = order_contents(relay_q, ch, want, win, pmap)
+    sigs = {o["sig"] for u in want for o in contents.get(u, []) if o.get("sig")}
     bodies = {}
     if relayer_q is not None:
         try:
             bodies = packet_bodies(relayer_q, sigs - set(blk), win)
         except Exception:
             bodies = {}
-    winners = {r["idx"]: r.get("won_by") or "" for r in tl.get("rounds") or []}
-    out = []
-    for u in uuids:
+    memo = {}
+
+    def tx_rec(item, bps):
+        sig = item["sig"]
+        key = item.get("prefix") or (sigprefix(sig) if sig else "")
+        landed = (None if in_block is None or not sig else
+                  (1 if sig in in_block else 0))
+        cu = reward = None
+        raw = (blk.get(sig) or bodies.get(sig)) if sig else None
+        if raw:
+            if (sig, bps) not in memo:
+                try:
+                    memo[(sig, bps)] = _tx_price(raw, rew.get(sig), bps)
+                except Exception:
+                    memo[(sig, bps)] = (None, None)
+            cu, reward = memo[(sig, bps)]
+        return [key or ("bundle:" + (item.get("bundle_id") or "")), cu,
+                consumed.get(sig) if landed else None, reward, landed,
+                item.get("bundle_id") or ""]
+
+    def recs(u):
         o = offs[u]
-        bps = o.get("jito_w")
-        bps = DEFAULT_JITO_WEIGHT if bps is None else bps
-        items = contents.get(u, [])
-        txs, unpriced = [], 0
-        for sig in dict.fromkeys(i["sig"] for i in items if i.get("sig")):
-            raw = blk.get(sig) or bodies.get(sig)
-            if not raw:
-                unpriced += 1
+        bps = DEFAULT_JITO_WEIGHT if o.get("jito_w") is None else o["jito_w"]
+        seen, out = set(), []
+        for it in contents.get(u, []):
+            k = it.get("sig") or ("bundle:" + (it.get("bundle_id") or ""))
+            if k in seen:
                 continue
-            try:
-                pr = txprice.price(raw, TIP_ACCOUNTS, JITO_TIP_SET)
-            except Exception:
-                unpriced += 1
-                continue
-            got = rew.get(sig)
-            if got:
-                fee, jito, builder = got["fee"], got["jito"], got["tip"] - got["jito"]
-            else:
-                fee, jito, builder = pr["fee"], pr["jito"], pr["builder"]
-            # the relay's own formula: protocol fees are the fee less the
-            # burned half of the base fee (2,500 per signature), Jito at
-            # the connector's weight, builder tips at face value
-            try:
-                nsig = txprice.parse(raw)["n_sigs"]
-            except Exception:
-                nsig = 1
-            _tip, reward = weigh(max(0, int(fee) - 2500 * nsig), jito, builder, bps)
-            txs.append([int(pr["cu"]), consumed.get(sig), int(reward),
-                        1 if got else 0])
-        out.append({
+            seen.add(k)
+            out.append(tx_rec(it, bps))
+        return out
+
+    offers = []
+    for u in sorted(uuids, key=lambda u: offs[u]["at"]):
+        o = offs[u]
+        offers.append({
             "uuid": u, "builder": o["builder"], "round": o["round"],
-            "round_winner": winners.get(o["round"], ""),
             "t_ms": None if o.get("t_ms") is None else round(o["t_ms"], 1),
-            "score": o["bid"], "orders": o["n"], "cost": o["cost"],
-            "graded": o.get("reason") or "", "chosen": bool(o.get("chosen")),
-            "sigs": len(dict.fromkeys(i["sig"] for i in items if i.get("sig"))),
-            "unresolved": sum(1 for i in items if not i.get("sig")),
-            "unpriced": unpriced,
-            "consumed_n": sum(1 for t in txs if t[1] is not None),
-            "txs": txs})
-    return {"slot": slot, "bin": 50_000, "src": src, "offers": out,
-            "block": bool(blk)}
+            "score": o["bid"], "fees": o.get("fees"), "jito": o.get("jito"),
+            "pay": o.get("pay"), "orders": o["n"], "cost": o["cost"],
+            "graded": o.get("reason") or "", "chosen": u == chosen,
+            "txs": recs(u)})
+
+    # the chosen offer: everything it carried that is not in this block
+    missing = None
+    if chosen:
+        rows, items = [], contents.get(chosen, [])
+        gone = [it for it in items if not it.get("sig")
+                or (in_block is not None and it["sig"] not in in_block)]
+        try:
+            where = landed_elsewhere(rpc_url, [it["sig"] for it in gone
+                                               if it.get("sig")])
+        except Exception:
+            where = {}
+        lo, hi = win
+        try:
+            said = validator_results(ch, {_vkey(it) for it in gone}, lo, hi)
+        except Exception:
+            said = {}
+        co = offs[chosen]
+        bps = DEFAULT_JITO_WEIGHT if co.get("jito_w") is None else co["jito_w"]
+        for it in gone:
+            r = tx_rec(it, bps)
+            w = where.get(it.get("sig")) if it.get("sig") else None
+            v = said.get(_vkey(it)) or []
+            rows.append({
+                "sig": it.get("sig") or "", "prefix": it.get("prefix") or "",
+                "bundle": it.get("bundle_id") or "", "type": it.get("type") or "",
+                "cu": r[1], "reward": r[3],
+                "elsewhere": ("?" if it.get("sig") not in where else
+                              (None if w is None else w["slot"])),
+                "failed": bool(w and w.get("err")),
+                "reason": "; ".join(sorted({x["reason"] for x in v
+                                            if x["reason"] and x["reason"] != "?"}))})
+        missing = {"uuid": chosen, "picked": chosen in uuids,
+                   "builder": co["builder"], "round": co["round"],
+                   "t_ms": None if co.get("t_ms") is None else round(co["t_ms"], 1),
+                   "score": co["bid"], "orders": co["n"],
+                   "txs": sum(1 for it in items if it.get("sig")),
+                   "block_known": in_block is not None, "rows": rows}
+    return {"slot": slot, "bin": 50_000, "src": src, "block": in_block is not None,
+            "builder": next(iter(builders)), "round": next(iter(rounds_)),
+            "winner": rnd.get("won_by") or "", "chosen": chosen,
+            "offers": offers, "missing": missing}
 
 
 # -------------------------------------------- declared CU / reward profile
@@ -5717,6 +5796,32 @@ def export_file(jid):
 CSS = """
 
 
+
+/* winner progression: only the winner can be picked; the chosen offer's
+   misses; the hatch key */
+svg .om.opkdim{opacity:.16}
+.opk.opkdim{visibility:hidden}
+.odmiss{margin:10px 0 14px;padding:12px 16px;border-radius:10px;border:1px solid var(--line);
+  border-left:3px solid var(--line3);background:var(--surface);font-size:13px}
+.odmiss.bad{border-left-color:var(--bad-main);background:var(--bad-bg)}
+.odmiss.good{border-left-color:var(--good-main)}
+.odmiss.warn{border-left-color:var(--orange-main)}
+.odmiss .odmh{margin-bottom:6px;color:var(--text)}
+.odmiss .odmh b{color:var(--bad)}
+.odmiss table{margin-top:4px}
+.odmiss .odms{color:var(--text2);font-size:12.5px;margin:2px 0}
+.odmiss .odms b{color:var(--text)}
+.odmiss .odmall{margin-top:8px;background:var(--surface);color:var(--text);
+  border:1px solid var(--line2);border-radius:999px;padding:4px 12px;font:inherit;font-size:12.5px;cursor:pointer}
+.odpt td.odadd{color:var(--text)}
+.odpt td.oddrop{color:var(--text2)}
+.odpt td.odnl{color:var(--bad);font-weight:600}
+.odkey{display:inline-flex;align-items:center;gap:6px;margin-left:auto;color:var(--text3);
+  font-size:12px}
+.odkey b{color:var(--bad)}
+.odkey i{display:inline-block;width:14px;height:10px;border-radius:2px;margin-left:8px;
+  border:1px solid var(--line3)}
+.odkey i.below{background:radial-gradient(var(--accent-main) 1px,transparent 1.3px) 0 0/4px 4px;opacity:.7}
 /* offer diff: winner progression */
 .odbar select.odmode{font-weight:600}
 .odbar [hidden]{display:none!important}
@@ -5982,27 +6087,42 @@ td.trc{min-width:120px}
 # window.__offerPaint after every redraw so the picks survive a zoom.
 OFFDIFF_JS = r'''
 (function(){
-  // Two modes, one picker. "diff": A then B, the order diff of the pair
-  // (/tech/offer-diff/pair). "prog": up to 8 offers of a round's WINNING
-  // builder, drawn as CU distributions (/tech/offer-diff/progression).
+  // Two modes, one picker.
+  //   diff: A then B -- the order diff of the pair (/tech/offer-diff/pair).
+  //   prog: one round's WINNING builder, offer after offer
+  //         (/tech/offer-diff/progression): what each offer added to the
+  //         one before it, stacked over 50k-CU bins, and whatever the
+  //         chosen offer carried that never landed.
   // OFFERS_JS calls __offerPick on a bullet click when the race is in pick
   // mode, and __offerPaint after every redraw so the picks survive a zoom.
-  var KEY = 'offdiff_mode_v1', MAX = 8, BIN = 50000;
-  var COLORS = ['--c0', '--c6', '--c4', '--c8', '--c2', '--c7', '--c1', '--c5'];
+  var KEY = 'offdiff_mode_v1', MAX = 16, BIN = 50000;
   var mode = 'diff';
   try { if (localStorage.getItem(KEY) === 'prog') mode = 'prog'; } catch (e) {}
-  var sel = [];                 // diff: [{u, slot, label}], A then B
-  var prog = [];                // prog: [{u, slot, label, c}]
-  var hidden = {}, view = {rw: 'sum', basis: 'decl'}, lastData = null, timer = null;
+  var sel = [];                                   // diff: [{u, slot, label}]
+  var prog = {slot: '', round: null, builder: '', picks: []};   // picks: [{u, t, label}]
+  var hidden = {}, view = {v: 'steps', rw: 'sum', basis: 'decl'}, lastData = null, timer = null;
 
-  function col(tok){
-    var v = getComputedStyle(document.documentElement).getPropertyValue(tok).trim();
-    return v || '#888';
+  function tok(n){ return getComputedStyle(document.documentElement).getPropertyValue(n).trim(); }
+  function rgb(c){
+    c = (c || '').trim();
+    var m = c.match(/^#([0-9a-f]{6})$/i);
+    if (m) { var v = parseInt(m[1], 16); return [v >> 16 & 255, v >> 8 & 255, v & 255]; }
+    m = c.match(/rgba?\(([^)]+)\)/);
+    if (m) { var p = m[1].split(',').map(parseFloat); return [p[0], p[1], p[2]]; }
+    return [128, 128, 128];
+  }
+  // sequential: the first offer palest, the last full accent -- it IS an order
+  function ramp(n){
+    var a = rgb(tok('--accent-main')), s = rgb(tok('--surface')), out = [];
+    for (var k = 0; k < n; k++) {
+      var w = n === 1 ? 1 : 0.3 + 0.7 * k / (n - 1);
+      out.push('rgb(' + [0, 1, 2].map(function(i){ return Math.round(s[i] * (1 - w) + a[i] * w); }).join(',') + ')');
+    }
+    return out;
   }
   function esc(s){ var d = document.createElement('div'); d.textContent = s == null ? '' : String(s); return d.innerHTML; }
   function bar(slot){ return document.querySelector('.odbar[data-slot="' + slot + '"]'); }
   function out(slot){ return document.getElementById('odres' + slot); }
-  // every offer in the slot's race: builder, round, time, and the round's winner
   function index(slot){
     var idx = {};
     document.querySelectorAll('script[id="offdata"]').forEach(function(s){
@@ -6019,33 +6139,20 @@ OFFDIFF_JS = r'''
     });
     return idx;
   }
-  function label(info, fallback){
-    if (!info) return fallback || '';
+  function label(info){
     return info.b + ' r' + info.round + ' +' + Math.round(info.t - info.base)
       + ' ms · ' + info.r.toLocaleString() + (info.chosen ? ' · chosen' : '');
   }
+  function colors(){
+    var c = ramp(prog.picks.length), m = {};
+    prog.picks.forEach(function(p, k){ m[p.u] = c[k]; });
+    return m;
+  }
 
   function paint(){
-    var pc = {};
-    prog.forEach(function(p){ pc[p.u] = col(p.c); });
-    document.querySelectorAll('[data-ou]').forEach(function(e){
-      var u = e.getAttribute('data-ou'), i = -1;
-      if (mode === 'diff') sel.forEach(function(s, k){ if (s.u === u) i = k; });
-      e.classList.toggle('opka', i === 0);
-      e.classList.toggle('opkb', i === 1);
-      var on = mode === 'prog' && pc[u];
-      e.classList.toggle('opkp', !!on);
-      if (e.tagName.toLowerCase() === 'span') {
-        e.style.background = on ? pc[u] : '';
-        e.style.borderColor = on ? pc[u] : '';
-        e.style.color = on ? '#fff' : '';
-      } else {
-        e.style.stroke = on ? pc[u] : '';
-        e.style.strokeWidth = on ? '3.4px' : '';
-      }
-    });
+    var pc = mode === 'prog' ? colors() : {};
     document.querySelectorAll('.odbar').forEach(function(b){
-      var slot = b.getAttribute('data-slot');
+      var slot = b.getAttribute('data-slot'), idx = mode === 'prog' ? index(slot) : {};
       b.querySelector('.odmode').value = mode;
       b.querySelectorAll('.odm-diff').forEach(function(x){ x.hidden = mode !== 'diff'; });
       b.querySelectorAll('.odm-prog').forEach(function(x){ x.hidden = mode !== 'prog'; });
@@ -6060,34 +6167,57 @@ OFFDIFF_JS = r'''
         el.appendChild(t);
       });
       var chips = b.querySelector('.odchips');
-      var here = prog.filter(function(p){ return p.slot === slot; });
-      chips.innerHTML = here.length ? here.map(function(p){
+      var here = prog.slot === slot ? prog.picks : [];
+      chips.innerHTML = here.length ? here.map(function(p, k){
         return '<span class="odchip" data-u="' + esc(p.u) + '"><i style="background:'
-          + col(p.c) + '"></i>' + esc(p.label)
+          + pc[p.u] + '"></i>#' + (k + 1) + ' ' + esc(p.label)
           + '<button type="button" class="odx" title="remove">×</button></span>';
-      }).join('') : '<i class="dim">click up to 8 offers of a round’s winner, '
-        + 'or pick them evenly →</i>';
-      // the round list for "pick evenly": rounds that have a winner
+      }).join('') : '<i class="dim">click the winning builder’s offers in one round '
+        + '(the others are greyed out), or pick them evenly →</i>';
       var rs = b.querySelector('.odpr');
       if (rs && !rs.options.length) {
-        var idx = index(slot), seen = {};
-        Object.keys(idx).forEach(function(u){
-          var x = idx[u];
-          if (x.winner && !seen[x.round]) seen[x.round] = x.winner;
+        var all = index(slot), seen = {};
+        Object.keys(all).forEach(function(u){
+          var x = all[u];
+          if (x.winner && x.b === x.winner) seen[x.round] = (seen[x.round] || 0) + 1;
         });
         Object.keys(seen).sort(function(a, c){ return a - c; }).forEach(function(r){
+          var any = Object.keys(all).find(function(u){ return String(all[u].round) === r; });
           var o = document.createElement('option');
-          o.value = r; o.textContent = 'r' + r + ' · ' + seen[r];
+          o.value = r; o.textContent = 'r' + r + ' · ' + all[any].winner + ' (' + seen[r] + ' offers)';
           rs.appendChild(o);
         });
+      }
+      // in progression mode only the winner's offers can be picked: in the
+      // picked round once one is picked, else any round's winner
+      document.querySelectorAll('[data-ou]').forEach(function(e){
+        var u = e.getAttribute('data-ou'), x = idx[u];
+        if (!x && mode === 'prog') return;
+        var ok = mode !== 'prog' || (x.winner && x.b === x.winner
+          && (prog.round === null || prog.slot !== slot || x.round === prog.round));
+        e.classList.toggle('opkdim', !ok);
+      });
+    });
+    document.querySelectorAll('[data-ou]').forEach(function(e){
+      var u = e.getAttribute('data-ou'), i = -1;
+      if (mode === 'diff') sel.forEach(function(s, k){ if (s.u === u) i = k; });
+      e.classList.toggle('opka', i === 0);
+      e.classList.toggle('opkb', i === 1);
+      var on = mode === 'prog' && pc[u];
+      if (mode !== 'prog') e.classList.remove('opkdim');
+      e.classList.toggle('opkp', !!on);
+      if (e.tagName.toLowerCase() === 'span') {
+        e.style.background = on ? pc[u] : '';
+        e.style.borderColor = on ? pc[u] : '';
+        e.style.color = on ? 'var(--text)' : '';
+      } else {
+        e.style.stroke = on ? 'var(--text)' : '';
+        e.style.strokeWidth = on ? '2.6px' : '';
       }
     });
   }
   window.__offerPaint = paint;
-
-  function status(slot, text){
-    var b = bar(slot); if (b) b.querySelector('.odst').textContent = text || '';
-  }
+  function status(slot, text){ var b = bar(slot); if (b) b.querySelector('.odst').textContent = text || ''; }
 
   // ---------------------------------------------------------------- diff
   function loadDiff(){
@@ -6111,25 +6241,20 @@ OFFDIFF_JS = r'''
   }
 
   // ---------------------------------------------------------------- progression
-  function nextColor(){
-    var used = prog.map(function(p){ return p.c; });
-    for (var i = 0; i < COLORS.length; i++) if (used.indexOf(COLORS[i]) < 0) return COLORS[i];
-    return COLORS[0];
-  }
   function loadProg(){
     clearTimeout(timer);
     timer = setTimeout(function(){
-      if (!prog.length) return;
-      var slot = prog[0].slot, b = bar(slot), o = out(slot);
+      var slot = prog.slot, b = bar(slot), o = out(slot);
       if (!b || !o) return;
-      status(slot, 'reading ' + prog.length + ' offer' + (prog.length > 1 ? 's' : '') + '…');
-      var want = prog.map(function(p){ return p.u; }).join(',');
+      if (!prog.picks.length) { o.innerHTML = ''; return; }
+      status(slot, 'reading ' + prog.picks.length + ' offer' + (prog.picks.length > 1 ? 's' : '') + '…');
+      var want = prog.picks.map(function(p){ return p.u; }).join(',');
       fetch('/tech/offer-diff/progression?slot=' + encodeURIComponent(slot)
             + '&u=' + encodeURIComponent(want)
             + '&region=' + encodeURIComponent(b.getAttribute('data-region') || 'all'))
         .then(function(r){ return r.json(); })
         .then(function(d){
-          if (mode !== 'prog' || prog.map(function(p){ return p.u; }).join(',') !== want) return;
+          if (mode !== 'prog' || prog.picks.map(function(p){ return p.u; }).join(',') !== want) return;
           status(slot, '');
           if (d.error || d.state === 'error') {
             o.innerHTML = '<div class="dmeta aqcap">' + esc(d.error) + '</div>'; return;
@@ -6141,64 +6266,141 @@ OFFDIFF_JS = r'''
   }
   function seg(name, opts, cur){
     return '<span class="odtg" data-k="' + name + '">' + opts.map(function(o){
-      return '<button type="button" data-v="' + o[0] + '" aria-pressed="'
-        + (o[0] === cur) + '">' + o[1] + '</button>';
+      return '<button type="button" data-v="' + o[0] + '" aria-pressed="' + (o[0] === cur) + '">' + o[1] + '</button>';
     }).join('') + '</span>';
   }
-  function money(v){
-    if (v == null) return '—';
-    return v >= 1e6 ? (v / 1e6).toFixed(2) + 'M' : v >= 1e3 ? (v / 1e3).toFixed(1) + 'k' : String(v);
+  function n0(v){ return v == null ? '—' : Math.round(v).toLocaleString(); }
+  function steps(d){
+    // per offer, in time order: what it added to the previous one and what it dropped
+    var prev = null;
+    return d.offers.map(function(o){
+      var m = {};
+      o.txs.forEach(function(t){ m[t[0]] = t; });
+      var add = [], drop = [];
+      o.txs.forEach(function(t){ if (!prev || !prev.m[t[0]]) add.push(t); });
+      if (prev) prev.o.txs.forEach(function(t){ if (!m[t[0]]) drop.push(t); });
+      var st = {o: o, m: m, add: add, drop: drop, prevScore: prev ? prev.o.score : null};
+      prev = st;
+      return st;
+    });
+  }
+  function sum(ts, f){ return ts.reduce(function(a, t){ return a + (f(t) || 0); }, 0); }
+  function missingHtml(d){
+    var m = d.missing;
+    if (!m) return '<div class="odmiss dim">this round has no chosen offer</div>';
+    var who = esc(m.builder) + '’s chosen offer (r' + m.round + ' +' + (m.t_ms == null ? '?' : m.t_ms)
+      + ' ms, score ' + m.score.toLocaleString() + (m.picked ? '' : ', not among your picks') + ')';
+    if (!m.block_known) return '<div class="odmiss warn">The block for slot ' + d.slot
+      + ' could not be read, so whether ' + who + ' landed is unknown.</div>';
+    if (!m.rows.length) return '<div class="odmiss good">Every transaction of ' + who
+      + ' landed in slot ' + d.slot + ' (' + m.txs + ' of ' + m.txs + ').</div>';
+    var where = {earlier: 0, later: 0, nowhere: 0, unknown: 0, failed: 0}, why = {};
+    m.rows.forEach(function(r){
+      if (r.elsewhere === '?') where.unknown++;
+      else if (r.elsewhere == null) where.nowhere++;
+      else if (r.elsewhere < d.slot) where.earlier++;
+      else where.later++;
+      if (r.failed) where.failed++;
+      (r.reason || 'no reason logged').split('; ').forEach(function(x){
+        if (x !== 'included') why[x] = (why[x] || 0) + 1; });
+    });
+    var bits = [['landed in an earlier slot', where.earlier], ['landed in a later slot', where.later],
+                ['nowhere on chain', where.nowhere], ['unknown', where.unknown],
+                ['of those landed, failed', where.failed]]
+      .filter(function(z){ return z[1]; })
+      .map(function(z){ return z[0] + ' <b>' + z[1] + '</b>'; }).join(' \u00b7 ');
+    var reasons = Object.keys(why).sort(function(a, c){ return why[c] - why[a]; })
+      .map(function(k){ return esc(k) + ' <b>' + why[k] + '</b>'; }).join(' \u00b7 ');
+    var SHOW = 8;
+    var rows = m.rows.map(function(r, k){
+      var w = r.elsewhere === '?' ? '<span class="dim">unknown</span>'
+        : r.elsewhere == null ? '<b>nowhere on chain</b>'
+        : 'slot ' + r.elsewhere + (r.failed ? ' (failed)' : '');
+      return '<tr' + (k >= SHOW ? ' class="odmx" hidden' : '') + '><td>' + (r.bundle ? 'bundle member' : 'txn') + '</td>'
+        + '<td class="m">' + (r.sig ? '<span class="cpv" data-c="' + esc(r.sig) + '" role="button" tabindex="0">'
+                              + esc(r.sig.slice(0, 28)) + '…</span>' : '<span class="dim">no signature</span>') + '</td>'
+        + '<td class="m">' + esc(r.prefix) + '</td>'
+        + '<td class="m">' + (r.bundle ? '<span class="cpv" data-c="' + esc(r.bundle) + '" role="button" tabindex="0">'
+                              + esc(r.bundle.slice(0, 12)) + '…</span>' : '—') + '</td>'
+        + '<td class="n">' + n0(r.cu) + '</td><td class="n">' + n0(r.reward) + '</td>'
+        + '<td>' + w + '</td><td>' + (r.reason ? esc(r.reason) : '<span class="dim">—</span>') + '</td></tr>';
+    }).join('');
+    return '<div class="odmiss bad"><div class="odmh"><b>' + m.rows.length + ' of ' + m.txs
+      + ' transactions</b> of ' + who + ' did not land in slot ' + d.slot + '</div>'
+      + '<div class="odms">' + bits + '</div>'
+      + (reasons ? '<div class="odms">validator said: ' + reasons + '</div>' : '')
+      + '<table class="otab"><tr><th>type</th><th>signature</th><th>sigprefix</th><th>bundle</th>'
+      + '<th class="n">declared CU</th><th class="n">reward</th><th>landed instead</th><th>validator said</th></tr>'
+      + rows + '</table>'
+      + (m.rows.length > SHOW ? '<button type="button" class="cpsm odmall">show all ' + m.rows.length + '</button>' : '')
+      + '</div>';
   }
   function renderProg(o){
-    var d = lastData, byU = {};
-    d.offers.forEach(function(x){ byU[x.uuid] = x; });
-    var rows = prog.map(function(p){
-      var x = byU[p.u]; if (!x) return '';
-      var cov = x.sigs ? Math.round(100 * x.txs.length / x.sigs) : 0;
-      var lost = x.round_winner && x.builder !== x.round_winner;
-      return '<tr class="' + (hidden[p.u] ? 'off' : '') + '" data-u="' + esc(p.u) + '">'
-        + '<td><span class="odsw" style="background:' + col(p.c) + '"></span></td>'
-        + '<td>' + esc(x.builder) + (x.chosen ? ' <span class="tlstar">chosen</span>' : '')
-        + (lost ? ' <span class="dim">(not r' + x.round + '’s winner)</span>' : '') + '</td>'
-        + '<td class="n">r' + x.round + '</td>'
+    var d = lastData, st = steps(d), cols = colors();
+    var rows = st.map(function(s, k){
+      var x = s.o, notl = s.o.txs.filter(function(t){ return t[4] === 0; }).length;
+      var cons = s.o.txs.filter(function(t){ return t[2] != null; }).length;
+      var priced = s.o.txs.filter(function(t){ return t[3] != null; }).length;
+      var dscore = s.prevScore == null ? '' : (x.score - s.prevScore);
+      return '<tr class="' + (hidden[x.uuid] ? 'off' : '') + '" data-u="' + esc(x.uuid) + '">'
+        + '<td><span class="odsw" style="background:' + cols[x.uuid] + '"></span></td>'
+        + '<td class="n">#' + (k + 1) + '</td>'
         + '<td class="n">' + (x.t_ms == null ? '—' : '+' + x.t_ms.toFixed(1)) + '</td>'
-        + '<td class="n">' + x.score.toLocaleString() + '</td>'
+        + '<td class="n">' + x.score.toLocaleString() + (x.chosen ? ' <span class="tlstar">chosen</span>' : '') + '</td>'
+        + '<td class="n">' + (dscore === '' ? '' : (dscore >= 0 ? '+' : '') + dscore.toLocaleString()) + '</td>'
         + '<td class="n">' + x.orders.toLocaleString() + '</td>'
-        + '<td class="n">' + x.txs.length.toLocaleString() + ' / ' + x.sigs.toLocaleString()
-        + ' <span class="dim">(' + cov + '%)</span></td>'
-        + '<td class="n">' + x.consumed_n.toLocaleString() + '</td></tr>';
+        + '<td class="n">' + s.o.txs.length.toLocaleString() + '</td>'
+        + '<td class="n odadd">+' + s.add.length + ' <span class="dim">' + n0(sum(s.add, function(t){ return t[3]; })) + '</span></td>'
+        + '<td class="n oddrop">' + (s.drop.length ? '−' + s.drop.length + ' <span class="dim">' + n0(sum(s.drop, function(t){ return t[3]; })) + '</span>' : '<span class="dim">—</span>') + '</td>'
+        + '<td class="n' + (notl ? ' odnl' : '') + '">' + (notl ? notl : '<span class="dim">0</span>') + '</td>'
+        + '<td class="n">' + cons + ' <span class="dim">/ ' + s.o.txs.length + '</span></td>'
+        + '<td class="n">' + priced + ' <span class="dim">/ ' + s.o.txs.length + '</span></td></tr>';
     }).join('');
+    var first = d.offers[0], last = d.offers[d.offers.length - 1], gone = {};
+    d.offers.forEach(function(x){ x.txs.forEach(function(t){ if (t[4] === 0) gone[t[0]] = 1; }); });
+    var nl = Object.keys(gone).length;
     o.innerHTML = '<div class="odprog">'
-      + '<div class="odph"><b>winner progression</b> <span class="dim">slot ' + d.slot
-      + ' · 50k CU bins · reward as the relay scores it: fee less the burned 2,500 per signature, + Titan/Bifrost tips, + Jito at the connector’s weight'
-      + ' · click a row to hide or show its lines</span></div>'
-      + '<table class="otab odpt"><tr><th></th><th>builder</th><th class="n">round</th>'
-      + '<th class="n">ms after open</th><th class="n">relay score</th><th class="n">orders</th>'
-      + '<th class="n" title="transactions with bytes (the block or our relayer’s packet log), of all its signatures">priced txs</th>'
-      + '<th class="n" title="transactions that landed in this slot, so their consumed CU is known">consumed known</th></tr>'
+      + '<div class="odph"><b>' + esc(d.builder) + '</b> · r' + d.round + ' of slot ' + d.slot
+      + ' · ' + d.offers.length + ' offer' + (d.offers.length > 1 ? 's' : '')
+      + (first.t_ms != null ? ', +' + first.t_ms + ' → +' + last.t_ms + ' ms after the round opened' : '')
+      + ' <span class="dim">· reward as the relay scores it: fee less the burned 2,500 per signature, + Titan/Bifrost tips, + Jito at the connector’s weight</span></div>'
+      + missingHtml(d)
+      + '<table class="otab odpt"><tr><th></th><th class="n">step</th><th class="n">ms after open</th>'
+      + '<th class="n">relay score</th><th class="n">Δ score</th><th class="n">orders</th><th class="n">txs</th>'
+      + '<th class="n" title="transactions in this offer that the previous one did not carry: count, reward">added</th>'
+      + '<th class="n" title="transactions the previous offer carried that this one dropped: count, reward">dropped</th>'
+      + '<th class="n" title="transactions of this offer that are not in the slot’s block">not landed</th>'
+      + '<th class="n" title="landed in this slot, so the CU it burned is known">consumed CU known</th>'
+      + '<th class="n" title="bytes found in the block or our relayer’s packet log, so declared CU and reward are known">priced</th></tr>'
       + rows + '</table>'
-      + '<div class="odctl"><span class="dim">reward per bin</span>'
-      + seg('rw', [['sum', 'total'], ['mean', 'per tx']], view.rw)
-      + '<span class="dim">count by</span>'
-      + seg('basis', [['decl', 'declared CU'], ['used', 'consumed CU']], view.basis) + '</div>'
+      + '<div class="odctl">' + seg('v', [['steps', 'what each offer added'], ['whole', 'each offer whole']], view.v)
+      + '<span class="odm-whole"' + (view.v === 'whole' ? '' : ' hidden') + '><span class="dim">reward per bin</span> '
+      + seg('rw', [['sum', 'total'], ['mean', 'per tx']], view.rw) + '</span>'
+      + '<span class="dim">count by</span>' + seg('basis', [['decl', 'declared CU'], ['used', 'consumed CU']], view.basis)
+      + '<span class="odkey">' + (nl ? 'charts leave out the <b>' + nl + '</b> transaction' + (nl > 1 ? 's' : '')
+        + ' that did not land in slot ' + d.slot + ' · ' : 'every transaction drawn landed in slot ' + d.slot + ' · ')
+      + '<i class="below"></i>below zero: dropped since the previous offer · click a step row to hide it</span></div>'
       + '<div class="odcharts">'
       + '<div class="odcard"><div class="odch">reward by declared CU</div><div class="odplot" data-c="decl"></div></div>'
-      + '<div class="odcard"><div class="odch">reward by consumed CU <span class="dim">landed in this slot only</span></div><div class="odplot" data-c="used"></div></div>'
+      + '<div class="odcard"><div class="odch">reward by consumed CU</div><div class="odplot" data-c="used"></div></div>'
       + '<div class="odcard odwide"><div class="odch">transactions by CU <span class="dim odcb"></span></div><div class="odplot" data-c="count"></div></div>'
       + '</div></div>';
     draw(o);
     o.scrollIntoView({behavior: 'smooth', block: 'start'});
   }
-  function bins(txs, which){
-    // which: 0 = declared CU, 1 = consumed CU
-    var sum = {}, n = {}, max = 0;
-    txs.forEach(function(t){
+  // the charts draw only transactions that landed in this slot: one that
+  // did not never executed in this block, so its CU and reward describe
+  // nothing that happened (they are listed in the callout instead)
+  function landed(ts){ return ts.filter(function(t){ return t[4] !== 0; }); }
+  function binsOf(ts, which, val){
+    var b = {}, n = {};
+    ts.forEach(function(t){
       var cu = t[which]; if (cu == null) return;
+      var v = val(t); if (v == null) return;
       var i = Math.floor(cu / BIN);
-      sum[i] = (sum[i] || 0) + t[2]; n[i] = (n[i] || 0) + 1;
-      if (i > max) max = i;
+      b[i] = (b[i] || 0) + v; n[i] = (n[i] || 0) + 1;
     });
-    return {sum: sum, n: n, max: max};
+    return {b: b, n: n};
   }
   function draw(o){
     if (!window.Plotly) {
@@ -6211,110 +6413,137 @@ OFFDIFF_JS = r'''
       }
       return;
     }
-    var d = lastData, byU = {};
-    d.offers.forEach(function(x){ byU[x.uuid] = x; });
-    var shown = prog.filter(function(p){ return byU[p.u] && !hidden[p.u]; });
-    var top = {decl: 0, used: 0};
-    shown.forEach(function(p){
-      top.decl = Math.max(top.decl, bins(byU[p.u].txs, 0).max);
-      top.used = Math.max(top.used, bins(byU[p.u].txs, 1).max);
-    });
+    var d = lastData, st = steps(d), cols = colors(), surf = 'rgb(' + rgb(tok('--surface')).join(',') + ')';
     var cb = o.querySelector('.odcb');
-    if (cb) cb.textContent = view.basis === 'decl' ? 'declared CU' : 'consumed CU, landed in this slot only';
+    if (cb) cb.textContent = view.basis === 'decl' ? 'declared CU' : 'consumed CU';
+    o.querySelectorAll('.odm-whole').forEach(function(x){ x.hidden = view.v !== 'whole'; });
     o.querySelectorAll('.odplot').forEach(function(el){
       var c = el.getAttribute('data-c');
-      var which = c === 'decl' ? 0 : c === 'used' ? 1 : (view.basis === 'decl' ? 0 : 1);
-      var nb = (which ? top.used : top.decl) + 1;
-      var traces = shown.map(function(p){
-        var x = byU[p.u], b = bins(x.txs, which), xs = [], ys = [], cd = [];
-        for (var i = 0; i < nb; i++) {
-          var cnt = b.n[i] || 0, s = b.sum[i] || 0;
-          xs.push(i * BIN + BIN / 2);
-          cd.push([i * BIN / 1000, (i + 1) * BIN / 1000, cnt]);
-          if (c === 'count') ys.push(cnt);
-          else if (view.rw === 'mean') ys.push(cnt ? s / cnt : null);
-          else ys.push(s);
-        }
-        var unit = c === 'count' ? ' txs' : ' lamports \u00b7 %{customdata[2]} txs';
-        return {x: xs, y: ys, customdata: cd, type: 'scatter', mode: 'lines+markers',
-                name: p.label, connectgaps: true,
-                line: {color: 'var(' + p.c + ')', width: 2, shape: 'linear'},
-                marker: {size: 5, color: 'var(' + p.c + ')'},
-                hovertemplate: '%{y:,.0f}' + unit + '<extra>' + esc(p.label.split(' · ')[0]) + '</extra>'};
-      });
+      var which = c === 'decl' ? 1 : c === 'used' ? 2 : (view.basis === 'decl' ? 1 : 2);
+      var val = c === 'count' ? function(){ return 1; } : function(t){ return t[3]; };
+      var top = 0, traces = [];
+      function grow(bk){ Object.keys(bk.b).forEach(function(i){ top = Math.max(top, +i); }); }
+      st.forEach(function(s){ grow(binsOf(landed(s.o.txs), which, val)); });
+      var nb = top + 1, xs = [];
+      for (var i = 0; i < nb; i++) xs.push(i * BIN + BIN / 2);
+      var unit = c === 'count' ? ' txs' : ' lamports';
+      if (view.v === 'steps') {
+        st.forEach(function(s, k){
+          if (hidden[s.o.uuid]) return;
+          var col = cols[s.o.uuid], nm = '#' + (k + 1) + ' +' + s.o.t_ms + ' ms';
+          [[landed(s.add), 'added', false, 1],
+           [landed(s.drop), 'dropped', false, -1]].forEach(function(part){
+            if (!part[0].length) return;
+            var bk = binsOf(part[0], which, val), ys = [], cd = [], any = false;
+            for (var i = 0; i < nb; i++) {
+              var v = bk.b[i]; cd.push(bk.n[i] || 0);
+              if (v) { ys.push(part[3] * v); any = true; } else ys.push(null);
+            }
+            if (!any) return;
+            var mk = {color: col, line: {color: surf, width: 0.8}};
+            if (part[3] < 0) { mk.opacity = 0.55; mk.pattern = {shape: '.', fillmode: 'replace', fgcolor: col, bgcolor: surf, size: 5, solidity: 0.5}; }
+            traces.push({type: 'bar', x: xs, y: ys, customdata: cd, width: BIN * 0.86, marker: mk,
+                         name: nm + ' ' + part[1],
+                         hovertemplate: '%{y:,.0f}' + unit + (c === 'count' ? '' : ' · %{customdata} txs')
+                           + '<extra>' + esc(nm + ' ' + part[1]) + '</extra>'});
+          });
+        });
+      } else {
+        st.forEach(function(s){
+          if (hidden[s.o.uuid]) return;
+          var col = cols[s.o.uuid], bk = binsOf(landed(s.o.txs), which, val), ys = [], cd = [];
+          for (var i = 0; i < nb; i++) {
+            var cnt = bk.n[i] || 0, v = bk.b[i] || 0; cd.push(cnt);
+            ys.push(c === 'count' ? cnt : view.rw === 'mean' ? (cnt ? v / cnt : null) : v);
+          }
+          traces.push({type: 'scatter', mode: 'lines+markers', x: xs, y: ys, customdata: cd,
+                       connectgaps: true, line: {color: col, width: 2}, marker: {size: 5, color: col},
+                       name: '#' + (st.indexOf(s) + 1),
+                       hovertemplate: '%{y:,.0f}' + unit + (c === 'count' ? '' : ' · %{customdata} txs')
+                         + '<extra>#' + (st.indexOf(s) + 1) + ' +' + s.o.t_ms + ' ms</extra>'});
+        });
+      }
       var layout = {
-        height: 300, margin: {l: 58, r: 14, t: 8, b: 46},
+        height: c === 'count' ? 320 : 300, margin: {l: 58, r: 14, t: 8, b: 46},
         paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)',
         font: {size: 11, color: 'var(--text2)'}, showlegend: false,
-        hovermode: 'x unified',
-        hoverlabel: {bgcolor: 'var(--surface)', bordercolor: 'var(--line2)',
-                     font: {color: 'var(--text)', size: 11}},
-        xaxis: {title: {text: (which ? 'consumed' : 'declared') + ' CU, 50k bins',
+        barmode: 'relative', bargap: 0.1, hovermode: 'x unified',
+        hoverlabel: {bgcolor: 'var(--surface)', bordercolor: 'var(--line2)', font: {color: 'var(--text)', size: 11}},
+        xaxis: {title: {text: (which === 2 ? 'consumed' : 'declared') + ' CU, 50k bins',
                         font: {size: 11, color: 'var(--text3)'}, standoff: 8},
-                range: [0, nb * BIN], tickformat: '~s', showgrid: false,
-                zeroline: false, showline: true, linecolor: 'var(--line2)',
-                ticks: 'outside', tickcolor: 'var(--line2)', ticklen: 4,
-                hoverformat: '~s'},
+                range: [0, nb * BIN], tickformat: '~s', showgrid: false, zeroline: false,
+                showline: true, linecolor: 'var(--line2)', ticks: 'outside', tickcolor: 'var(--line2)',
+                ticklen: 4, hoverformat: '~s'},
         yaxis: {title: {text: c === 'count' ? 'transactions'
-                         : (view.rw === 'mean' ? 'reward per tx (lamports)' : 'reward (lamports)'),
+                         : (view.v === 'whole' && view.rw === 'mean' ? 'reward per tx (lamports)' : 'reward (lamports)'),
                         font: {size: 11, color: 'var(--text3)'}, standoff: 6},
-                tickformat: '~s', gridcolor: 'var(--line)', zeroline: false,
-                rangemode: 'tozero', fixedrange: false}};
+                tickformat: '~s', gridcolor: 'var(--line)', zeroline: true, zerolinecolor: 'var(--line2)',
+                zerolinewidth: 1}};
       bbTheme.plot(el, traces, layout, {displayModeBar: false, responsive: true});
     });
   }
 
   // ---------------------------------------------------------------- picking
-  window.__offerPick = function(u, slot, lab){
+  function setPicks(slot, round, builder, list){
+    prog = {slot: slot, round: round, builder: builder, picks: list};
+    hidden = {};
+  }
+  window.__offerPick = function(u, slot){
     slot = String(slot);
+    var idx = index(slot), info = idx[u];
     if (mode === 'diff') {
       if (sel.length && sel[0].slot !== slot) sel = [];
       var i = -1;
       sel.forEach(function(s, k){ if (s.u === u) i = k; });
       if (i >= 0) sel.splice(i, 1);
-      else { sel.push({u: u, slot: slot, label: lab}); if (sel.length > 2) sel.shift(); }
+      else { sel.push({u: u, slot: slot, label: info ? label(info) : u.slice(0, 8)}); if (sel.length > 2) sel.shift(); }
       paint();
       if (sel.length === 2) loadDiff();
       return;
     }
-    if (prog.length && prog[0].slot !== slot) prog = [];
-    var j = -1;
-    prog.forEach(function(p, k){ if (p.u === u) j = k; });
-    if (j >= 0) { prog.splice(j, 1); paint(); if (prog.length) loadProg(); else { var o = out(slot); if (o) o.innerHTML = ''; } return; }
-    var info = index(slot)[u];
-    if (info && !info.winner) { status(slot, 'r' + info.round + ' has no winner: progression follows a round’s winning builder'); return; }
-    if (info && info.b !== info.winner) {
-      status(slot, 'not the winner’s offer: r' + info.round + ' was won by ' + info.winner); return;
+    if (!info) return;
+    if (!info.winner) { status(slot, 'r' + info.round + ' has no winner'); return; }
+    if (info.b !== info.winner) {
+      status(slot, 'only the winner’s offers: r' + info.round + ' was won by ' + info.winner); return;
     }
-    if (prog.length >= MAX) { status(slot, 'at most ' + MAX + ' offers: remove one first'); return; }
-    status(slot, '');
-    prog.push({u: u, slot: slot, label: label(info, lab), c: nextColor()});
+    var j = prog.slot === slot ? prog.picks.findIndex(function(p){ return p.u === u; }) : -1;
+    if (j >= 0) {
+      prog.picks.splice(j, 1);
+      if (!prog.picks.length) prog.round = null;
+    } else {
+      if (prog.slot !== slot || prog.round === null || prog.round !== info.round) {
+        if (prog.picks.length && prog.slot === slot) status(slot, 'started over in r' + info.round + ': a progression is one round');
+        else status(slot, '');
+        setPicks(slot, info.round, info.b, []);
+      } else status(slot, '');
+      if (prog.picks.length >= MAX) { status(slot, 'at most ' + MAX + ' offers'); return; }
+      prog.picks.push({u: u, t: info.t, label: label(info)});
+      prog.picks.sort(function(a, c){ return a.t - c.t; });
+    }
     paint(); loadProg();
   };
   function pickEvenly(b){
     var slot = b.getAttribute('data-slot'), r = b.querySelector('.odpr').value;
-    var n = Math.max(1, Math.min(MAX, parseInt(b.querySelector('.odpn').value, 10) || 5));
-    var idx = index(slot), all = [];
+    var nv = b.querySelector('.odpn').value, idx = index(slot), all = [];
     Object.keys(idx).forEach(function(u){
       var x = idx[u];
       if (String(x.round) === String(r) && x.winner && x.b === x.winner) all.push([u, x]);
     });
     all.sort(function(a, c){ return a[1].t - c[1].t; });
-    // up to and including the chosen offer: rungs after it did not count
     var ch = all.findIndex(function(z){ return z[1].chosen; });
-    if (ch >= 0) all = all.slice(0, ch + 1);
+    if (ch >= 0) all = all.slice(0, ch + 1);       // rungs after the chosen one did not count
     if (!all.length) { status(slot, 'no offers from that round’s winner'); return; }
-    var picks = [];
-    for (var k = 0; k < n && k < all.length; k++) {
-      var at = all.length === 1 || n === 1 ? all.length - 1
-        : Math.round(k * (all.length - 1) / (Math.min(n, all.length) - 1));
-      if (picks.indexOf(at) < 0) picks.push(at);
+    var n = nv === 'all' ? Math.min(MAX, all.length) : Math.max(1, Math.min(MAX, parseInt(nv, 10) || 5));
+    n = Math.min(n, all.length);
+    var at = [];
+    for (var k = 0; k < n; k++) {
+      var p = n === 1 ? all.length - 1 : Math.round(k * (all.length - 1) / (n - 1));
+      if (at.indexOf(p) < 0) at.push(p);
     }
-    prog = [];
-    picks.forEach(function(at){
-      prog.push({u: all[at][0], slot: slot, label: label(all[at][1]), c: nextColor()});
-    });
-    status(slot, ''); paint(); loadProg();
+    setPicks(slot, all[0][1].round, all[0][1].b, at.map(function(p){
+      return {u: all[p][0], t: all[p][1].t, label: label(all[p][1])}; }));
+    status(slot, all.length > MAX && nv === 'all' ? 'the first ' + MAX + ' of ' + all.length + ' offers' : '');
+    paint(); loadProg();
   }
 
   document.addEventListener('click', function(ev){
@@ -6322,28 +6551,26 @@ OFFDIFF_JS = r'''
     var p = t.closest && t.closest('.opk');
     if (p) {
       ev.preventDefault(); ev.stopPropagation();
-      window.__offerPick(p.getAttribute('data-ou'), p.getAttribute('data-slot'), p.getAttribute('data-l'));
+      if (p.classList.contains('opkdim')) return;
+      window.__offerPick(p.getAttribute('data-ou'), p.getAttribute('data-slot'));
       return;
     }
     var b = t.closest && t.closest('.odbar');
     if (b && t.closest('.odswap') && sel.length === 2) { sel.reverse(); paint(); loadDiff(); return; }
     if (b && t.closest('.odclr')) {
       var o = out(b.getAttribute('data-slot'));
-      if (mode === 'diff') sel = []; else { prog = []; hidden = {}; }
+      if (mode === 'diff') sel = []; else setPicks('', null, '', []);
       paint(); if (o) o.innerHTML = ''; return;
     }
     if (b && t.closest('.odeven')) { pickEvenly(b); return; }
+    var ma = t.closest && t.closest('.odmall');
+    if (ma) { ma.parentNode.querySelectorAll('tr.odmx').forEach(function(r){ r.hidden = false; }); ma.remove(); return; }
     var x = t.closest && t.closest('.odx');
-    if (x) {
-      var u = x.closest('.odchip').getAttribute('data-u'), it = prog.find(function(q){ return q.u === u; });
-      if (it) window.__offerPick(u, it.slot, it.label);
-      return;
-    }
+    if (x) { window.__offerPick(x.closest('.odchip').getAttribute('data-u'), prog.slot); return; }
     var tg = t.closest && t.closest('.odtg button');
     if (tg) {
       view[tg.parentNode.getAttribute('data-k')] = tg.getAttribute('data-v');
-      tg.parentNode.querySelectorAll('button').forEach(function(z){
-        z.setAttribute('aria-pressed', String(z === tg)); });
+      tg.parentNode.querySelectorAll('button').forEach(function(z){ z.setAttribute('aria-pressed', String(z === tg)); });
       var o2 = tg.closest('.odres'); if (o2 && lastData) draw(o2);
       return;
     }
@@ -6362,7 +6589,7 @@ OFFDIFF_JS = r'''
     document.querySelectorAll('.odres').forEach(function(o){ o.innerHTML = ''; });
     paint();
     if (mode === 'diff' && sel.length === 2) loadDiff();
-    if (mode === 'prog' && prog.length) loadProg();
+    if (mode === 'prog' && prog.picks.length) loadProg();
   });
   document.addEventListener('keydown', function(ev){
     if (ev.key !== 'Enter' && ev.key !== ' ') return;
