@@ -5819,6 +5819,11 @@ svg .om.opkdim{opacity:.16}
 .odkey{display:inline-flex;align-items:center;gap:6px;margin-left:auto;color:var(--text3);
   font-size:12px}
 .odkey b{color:var(--bad)}
+.odsum{margin:0 0 12px;padding:10px 14px;border:1px solid var(--line);border-radius:10px;
+  background:var(--surface);font-size:12.5px;line-height:1.7;color:var(--text2)}
+.odsum b{color:var(--text)}
+.odsum .odup{color:var(--good)}
+.odsum .oddn{color:var(--bad)}
 .odkey i{display:inline-block;width:14px;height:10px;border-radius:2px;margin-left:8px;
   border:1px solid var(--line3)}
 .odkey i.below{background:radial-gradient(var(--accent-main) 1px,transparent 1.3px) 0 0/4px 4px;opacity:.7}
@@ -6100,7 +6105,7 @@ OFFDIFF_JS = r'''
   try { if (localStorage.getItem(KEY) === 'prog') mode = 'prog'; } catch (e) {}
   var sel = [];                                   // diff: [{u, slot, label}]
   var prog = {slot: '', round: null, builder: '', picks: []};   // picks: [{u, t, label}]
-  var hidden = {}, view = {v: 'steps', rw: 'sum', basis: 'decl'}, lastData = null, timer = null;
+  var hidden = {}, view = {v: 'whole', rw: 'sum', basis: 'decl'}, lastData = null, timer = null;
 
   function tok(n){ return getComputedStyle(document.documentElement).getPropertyValue(n).trim(); }
   function rgb(c){
@@ -6360,6 +6365,19 @@ OFFDIFF_JS = r'''
       + (m.rows.length > SHOW ? '<button type="button" class="cpsm odmall">show all ' + m.rows.length + '</button>' : '')
       + '</div>';
   }
+  function changes(st){
+    return st.map(function(s, k){
+      var n = numOf(s.o.uuid) || k + 1, a = landed(s.add), dr = landed(s.drop);
+      var rw = function(ts){ return sum(ts, function(t){ return t[3]; }); };
+      if (!k) return '<div><b>#' + n + '</b> first pick: ' + a.length + ' landed transactions, shown as added</div>';
+      var pn = numOf(st[k - 1].o.uuid) || k, kept = landed(s.o.txs).length - a.length;
+      var ds = s.o.score - st[k - 1].o.score;
+      return '<div><b>#' + n + '</b> vs #' + pn + ': kept ' + kept + ' · added <b>' + a.length + '</b> ('
+        + n0(rw(a)) + ') · dropped <b>' + dr.length + '</b> (' + n0(rw(dr)) + ') · relay score '
+        + st[k - 1].o.score.toLocaleString() + ' \u2192 ' + s.o.score.toLocaleString()
+        + ' <span class="' + (ds >= 0 ? 'odup' : 'oddn') + '">(' + (ds >= 0 ? '+' : '−') + Math.abs(ds).toLocaleString() + ')</span></div>';
+    }).join('');
+  }
   function renderProg(o){
     var d = lastData, st = steps(d), cols = colors();
     var rows = st.map(function(s, k){
@@ -6399,13 +6417,16 @@ OFFDIFF_JS = r'''
       + '<th class="n" title="landed in this slot, so the CU it burned is known">consumed CU known</th>'
       + '<th class="n" title="bytes found in the block or our relayer’s packet log, so declared CU and reward are known">priced</th></tr>'
       + rows + '</table>'
-      + '<div class="odctl">' + seg('v', [['steps', 'what each offer added'], ['whole', 'each offer whole']], view.v)
+      + '<div class="odctl">' + seg('v', [['whole', 'each offer side by side'], ['steps', 'changes vs previous pick']], view.v)
       + '<span class="odm-whole"' + (view.v === 'whole' ? '' : ' hidden') + '><span class="dim">reward per bin</span> '
       + seg('rw', [['sum', 'total'], ['mean', 'per tx']], view.rw) + '</span>'
       + '<span class="dim">count by</span>' + seg('basis', [['decl', 'declared CU'], ['used', 'consumed CU']], view.basis)
       + '<span class="odkey">' + (nl ? 'charts leave out the <b>' + nl + '</b> transaction' + (nl > 1 ? 's' : '')
-        + ' that did not land in slot ' + d.slot + ' · ' : 'every transaction drawn landed in slot ' + d.slot + ' · ')
-      + '<i class="below"></i>below zero: dropped since the previous offer · click a step row to hide it</span></div>'
+        + ' that did not land in slot ' + d.slot : 'every transaction drawn landed in slot ' + d.slot)
+      + ' · click a row to hide that offer</span></div>'
+      + '<div class="odsum odm-steps"' + (view.v === 'steps' ? '' : ' hidden') + '>'
+      + '<div class="dim">each offer against the pick before it, landed transactions only: above zero what it '
+      + 'added, below zero (dotted) what it dropped</div>' + changes(st) + '</div>'
       + '<div class="odcharts">'
       + '<div class="odcard"><div class="odch">reward by declared CU</div><div class="odplot" data-c="decl"></div></div>'
       + '<div class="odcard"><div class="odch">reward by consumed CU</div><div class="odplot" data-c="used"></div></div>'
@@ -6443,6 +6464,7 @@ OFFDIFF_JS = r'''
     var cb = o.querySelector('.odcb');
     if (cb) cb.textContent = view.basis === 'decl' ? 'declared CU' : 'consumed CU';
     o.querySelectorAll('.odm-whole').forEach(function(x){ x.hidden = view.v !== 'whole'; });
+    o.querySelectorAll('.odm-steps').forEach(function(x){ x.hidden = view.v !== 'steps'; });
     o.querySelectorAll('.odplot').forEach(function(el){
       var c = el.getAttribute('data-c');
       var which = c === 'decl' ? 1 : c === 'used' ? 2 : (view.basis === 'decl' ? 1 : 2);
@@ -6457,8 +6479,9 @@ OFFDIFF_JS = r'''
         st.forEach(function(s, k){
           if (hidden[s.o.uuid]) return;
           var num = numOf(s.o.uuid) || k + 1, col = cols[s.o.uuid], nm = '#' + num + ' +' + s.o.t_ms + ' ms';
-          [[landed(s.add), 'added', false, 1],
-           [landed(s.drop), 'dropped', false, -1]].forEach(function(part){
+          var prevN = k ? (numOf(st[k - 1].o.uuid) || k) : 0;
+          [[landed(s.add), k ? 'added (not in #' + prevN + ')' : 'first pick', false, 1],
+           [landed(s.drop), 'dropped (was in #' + prevN + ')', false, -1]].forEach(function(part){
             if (!part[0].length) return;
             var bk = binsOf(part[0], which, val), ys = [], cd = [], any = false;
             for (var i = 0; i < nb; i++) {
@@ -6469,7 +6492,7 @@ OFFDIFF_JS = r'''
             var mk = {color: col, line: {color: surf, width: 0.8}};
             if (part[3] < 0) { mk.opacity = 0.55; mk.pattern = {shape: '.', fillmode: 'replace', fgcolor: col, bgcolor: surf, size: 5, solidity: 0.5}; }
             traces.push({type: 'bar', x: xs, y: ys, customdata: cd, width: BIN * 0.86, marker: mk,
-                         text: ys.map(function(v){ return v == null ? '' : '#' + num; }),
+                         text: ys.map(function(v){ return v == null ? '' : (part[3] < 0 ? '−#' : '+#') + num; }),
                          textposition: 'inside', insidetextanchor: 'middle',
                          textfont: {size: 10, color: part[3] < 0 ? 'var(--text2)' : ink(col)},
                          textangle: 0, cliponaxis: false,
@@ -6486,8 +6509,8 @@ OFFDIFF_JS = r'''
             var cnt = bk.n[i] || 0, v = bk.b[i] || 0; cd.push(cnt);
             ys.push(c === 'count' ? cnt : view.rw === 'mean' ? (cnt ? v / cnt : null) : v);
           }
-          traces.push({type: 'scatter', mode: 'lines+markers', x: xs, y: ys, customdata: cd,
-                       connectgaps: true, line: {color: col, width: 2}, marker: {size: 5, color: col},
+          traces.push({type: 'bar', x: xs, y: ys, customdata: cd,
+                       marker: {color: col, line: {color: surf, width: 0.5}},
                        name: '#' + (numOf(s.o.uuid) || st.indexOf(s) + 1),
                        hovertemplate: '%{y:,.0f}' + unit + (c === 'count' ? '' : ' · %{customdata} txs')
                          + '<extra>#' + (numOf(s.o.uuid) || st.indexOf(s) + 1) + ' +' + s.o.t_ms + ' ms</extra>'});
@@ -6497,7 +6520,8 @@ OFFDIFF_JS = r'''
         height: c === 'count' ? 320 : 300, margin: {l: 58, r: 14, t: 8, b: 46},
         paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)',
         font: {size: 11, color: 'var(--text2)'}, showlegend: false,
-        barmode: 'relative', bargap: 0.1, hovermode: 'x unified',
+        barmode: view.v === 'whole' ? 'group' : 'relative', bargap: 0.12, bargroupgap: 0.04,
+        hovermode: 'x unified',
         uniformtext: {minsize: 9, mode: 'hide'},
         hoverlabel: {bgcolor: 'var(--surface)', bordercolor: 'var(--line2)', font: {color: 'var(--text)', size: 11}},
         xaxis: {title: {text: (which === 2 ? 'consumed' : 'declared') + ' CU, 50k bins',
@@ -6505,8 +6529,10 @@ OFFDIFF_JS = r'''
                 range: [0, nb * BIN], tickformat: '~s', showgrid: false, zeroline: false,
                 showline: true, linecolor: 'var(--line2)', ticks: 'outside', tickcolor: 'var(--line2)',
                 ticklen: 4, hoverformat: '~s'},
-        yaxis: {title: {text: c === 'count' ? 'transactions'
-                         : (view.v === 'whole' && view.rw === 'mean' ? 'reward per tx (lamports)' : 'reward (lamports)'),
+        yaxis: {title: {text: view.v === 'steps'
+                         ? (c === 'count' ? 'transactions: added (+) / dropped (−)' : 'reward: added (+) / dropped (−)')
+                         : c === 'count' ? 'transactions'
+                         : (view.rw === 'mean' ? 'reward per tx (lamports)' : 'reward (lamports)'),
                         font: {size: 11, color: 'var(--text3)'}, standoff: 6},
                 tickformat: '~s', gridcolor: 'var(--line)', zeroline: true, zerolinecolor: 'var(--line2)',
                 zerolinewidth: 1}};
