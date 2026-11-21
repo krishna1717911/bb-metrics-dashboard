@@ -5834,6 +5834,10 @@ svg .om.opkdim{opacity:.16}
 .odchip{display:inline-flex;align-items:center;gap:6px;padding:3px 4px 3px 9px;
   border:1px solid var(--line2);border-radius:999px;background:var(--surface);font-size:12px}
 .odchip i{width:9px;height:9px;border-radius:50%;flex:none}
+.odchip{cursor:pointer;user-select:none;padding:3px 10px 3px 9px}
+.odchip:hover{border-color:var(--text3)}
+.odchip.off{color:var(--text3);text-decoration:line-through;background:transparent}
+.odchip.off i{opacity:.3}
 .odx{border:0;background:none;color:var(--text3);cursor:pointer;font-size:14px;
   line-height:1;padding:0 4px}
 .odx:hover{color:var(--text)}
@@ -6199,9 +6203,11 @@ OFFDIFF_JS = r'''
       var chips = b.querySelector('.odchips');
       var here = prog.slot === slot ? prog.picks : [];
       chips.innerHTML = here.length ? here.map(function(p, k){
-        return '<span class="odchip" data-u="' + esc(p.u) + '"><i style="background:'
-          + pc[p.u] + '"></i>#' + (p.n || k + 1) + ' ' + esc(p.label)
-          + '<button type="button" class="odx" title="remove">×</button></span>';
+        return '<span class="odchip' + (hidden[p.u] ? ' off' : '') + '" data-u="' + esc(p.u)
+          + '" role="button" tabindex="0" aria-pressed="' + !hidden[p.u] + '" title="'
+          + (hidden[p.u] ? 'off: click to show this offer again' : 'on: click to hide this offer')
+          + ' (to drop it from the picks, click it again in the race)"><i style="background:'
+          + pc[p.u] + '"></i>#' + (p.n || k + 1) + ' ' + esc(p.label) + '</span>';
       }).join('') : '<i class="dim">click the winning builder’s offers in one round '
         + '(the others are greyed out), or pick them evenly →</i>';
       var rs = b.querySelector('.odpr');
@@ -6303,7 +6309,7 @@ OFFDIFF_JS = r'''
   function steps(d){
     // per offer, in time order: what it added to the previous one and what it dropped
     var prev = null;
-    return d.offers.map(function(o){
+    return d.offers.filter(function(o){ return !hidden[o.uuid]; }).map(function(o){
       var m = {};
       o.txs.forEach(function(t){ m[t[0]] = t; });
       var add = [], drop = [];
@@ -6369,7 +6375,7 @@ OFFDIFF_JS = r'''
     return st.map(function(s, k){
       var n = numOf(s.o.uuid) || k + 1, a = landed(s.add), dr = landed(s.drop);
       var rw = function(ts){ return sum(ts, function(t){ return t[3]; }); };
-      if (!k) return '<div><b>#' + n + '</b> first pick: ' + a.length + ' landed transactions, shown as added</div>';
+      if (!k) return '<div><b>#' + n + '</b> first shown: ' + a.length + ' landed transactions, shown as added</div>';
       var pn = numOf(st[k - 1].o.uuid) || k, kept = landed(s.o.txs).length - a.length;
       var ds = s.o.score - st[k - 1].o.score;
       return '<div><b>#' + n + '</b> vs #' + pn + ': kept ' + kept + ' · added <b>' + a.length + '</b> ('
@@ -6378,9 +6384,11 @@ OFFDIFF_JS = r'''
         + ' <span class="' + (ds >= 0 ? 'odup' : 'oddn') + '">(' + (ds >= 0 ? '+' : '−') + Math.abs(ds).toLocaleString() + ')</span></div>';
     }).join('');
   }
-  function renderProg(o){
-    var d = lastData, st = steps(d), cols = colors();
-    var rows = st.map(function(s, k){
+  function renderProg(o, stay){
+    var d = lastData, st = steps(d), cols = colors(), byU = {};
+    st.forEach(function(s){ byU[s.o.uuid] = s; });
+    var rows = d.offers.map(function(x0, k){
+      var s = byU[x0.uuid] || {o: x0, add: [], drop: [], prevScore: null, off: true};
       var x = s.o, notl = s.o.txs.filter(function(t){ return t[4] === 0; }).length;
       var cons = s.o.txs.filter(function(t){ return t[2] != null; }).length;
       var priced = s.o.txs.filter(function(t){ return t[3] != null; }).length;
@@ -6393,7 +6401,7 @@ OFFDIFF_JS = r'''
         + '<td class="n">' + (dscore === '' ? '' : (dscore >= 0 ? '+' : '') + dscore.toLocaleString()) + '</td>'
         + '<td class="n">' + x.orders.toLocaleString() + '</td>'
         + '<td class="n">' + s.o.txs.length.toLocaleString() + '</td>'
-        + '<td class="n odadd">+' + s.add.length + ' <span class="dim">' + n0(sum(s.add, function(t){ return t[3]; })) + '</span></td>'
+        + (s.off ? '<td class="n dim">—</td>' : '<td class="n odadd">+' + s.add.length + ' <span class="dim">' + n0(sum(s.add, function(t){ return t[3]; })) + '</span></td>')
         + '<td class="n oddrop">' + (s.drop.length ? '−' + s.drop.length + ' <span class="dim">' + n0(sum(s.drop, function(t){ return t[3]; })) + '</span>' : '<span class="dim">—</span>') + '</td>'
         + '<td class="n' + (notl ? ' odnl' : '') + '">' + (notl ? notl : '<span class="dim">0</span>') + '</td>'
         + '<td class="n">' + cons + ' <span class="dim">/ ' + s.o.txs.length + '</span></td>'
@@ -6423,9 +6431,9 @@ OFFDIFF_JS = r'''
       + '<span class="dim">count by</span>' + seg('basis', [['decl', 'declared CU'], ['used', 'consumed CU']], view.basis)
       + '<span class="odkey">' + (nl ? 'charts leave out the <b>' + nl + '</b> transaction' + (nl > 1 ? 's' : '')
         + ' that did not land in slot ' + d.slot : 'every transaction drawn landed in slot ' + d.slot)
-      + ' · click a row to hide that offer</span></div>'
+      + ' · click a chip or a row to turn an offer off and on</span></div>'
       + '<div class="odsum odm-steps"' + (view.v === 'steps' ? '' : ' hidden') + '>'
-      + '<div class="dim">each offer against the pick before it, landed transactions only: above zero what it '
+      + '<div class="dim">each offer that is on against the previous one that is on, landed transactions only: above zero what it '
       + 'added, below zero (dotted) what it dropped</div>' + changes(st) + '</div>'
       + '<div class="odcharts">'
       + '<div class="odcard"><div class="odch">reward by declared CU</div><div class="odplot" data-c="decl"></div></div>'
@@ -6433,7 +6441,13 @@ OFFDIFF_JS = r'''
       + '<div class="odcard odwide"><div class="odch">transactions by CU <span class="dim odcb"></span></div><div class="odplot" data-c="count"></div></div>'
       + '</div></div>';
     draw(o);
-    o.scrollIntoView({behavior: 'smooth', block: 'start'});
+    if (!stay) o.scrollIntoView({behavior: 'smooth', block: 'start'});
+  }
+  function toggle(u){
+    hidden[u] = !hidden[u];
+    paint();
+    var o = out(prog.slot);
+    if (o && lastData) renderProg(o, true);
   }
   // the charts draw only transactions that landed in this slot: one that
   // did not never executed in this block, so its CU and reward describe
@@ -6622,8 +6636,8 @@ OFFDIFF_JS = r'''
     if (b && t.closest('.odeven')) { pickEvenly(b); return; }
     var ma = t.closest && t.closest('.odmall');
     if (ma) { ma.parentNode.querySelectorAll('tr.odmx').forEach(function(r){ r.hidden = false; }); ma.remove(); return; }
-    var x = t.closest && t.closest('.odx');
-    if (x) { window.__offerPick(x.closest('.odchip').getAttribute('data-u'), prog.slot); return; }
+    var chip = t.closest && t.closest('.odchip');
+    if (chip) { toggle(chip.getAttribute('data-u')); return; }
     var tg = t.closest && t.closest('.odtg button');
     if (tg) {
       view[tg.parentNode.getAttribute('data-k')] = tg.getAttribute('data-v');
@@ -6633,9 +6647,7 @@ OFFDIFF_JS = r'''
     }
     var tr = t.closest && t.closest('.odpt tr[data-u]');
     if (tr) {
-      var uu = tr.getAttribute('data-u');
-      hidden[uu] = !hidden[uu]; tr.classList.toggle('off', !!hidden[uu]);
-      var o3 = tr.closest('.odres'); if (o3 && lastData) draw(o3);
+      toggle(tr.getAttribute('data-u'));
     }
   });
   document.addEventListener('change', function(ev){
@@ -6650,7 +6662,7 @@ OFFDIFF_JS = r'''
   });
   document.addEventListener('keydown', function(ev){
     if (ev.key !== 'Enter' && ev.key !== ' ') return;
-    var p = ev.target.closest && ev.target.closest('.opk');
+    var p = ev.target.closest && (ev.target.closest('.opk') || ev.target.closest('.odchip'));
     if (p) { ev.preventDefault(); p.click(); }
   });
 })();
