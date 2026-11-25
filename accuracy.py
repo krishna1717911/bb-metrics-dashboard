@@ -5951,6 +5951,16 @@ svg .om.opkdim{opacity:.16}
 .odplists .odch{font-size:12px;margin:2px 0 4px}
 .odpe{font-size:12.5px;padding:4px 0}
 .odmv{font-size:11.5px;color:var(--text3);margin-top:2px}
+.odsfg{display:inline-flex;border:1px solid var(--line2);border-radius:999px;overflow:hidden}
+.odsfg button{border:0;background:transparent;color:var(--text2);padding:4px 12px;
+  font:inherit;font-size:12.5px;cursor:pointer}
+.odsfg button[aria-pressed=true]{background:var(--text);color:var(--bg)}
+.odsfv{margin-left:auto}
+.odsofar{margin-top:6px}
+.odsofar .odms{font-size:12.5px;color:var(--text2);margin:4px 0 8px}
+.odsofar .odms b{color:var(--text)}
+.odsofar .odms b.oddn,.odsofar .oddn{color:var(--bad)}
+.odin{color:var(--good)}
 .odplists .odmall{margin-top:6px;background:var(--surface);color:var(--text);
   border:1px solid var(--line2);border-radius:999px;padding:3px 12px;font:inherit;font-size:12.5px;cursor:pointer}
 .odpair .odup{color:var(--good)}
@@ -6655,7 +6665,10 @@ OFFDIFF_JS = r'''
     var head = '<div class="odpctl">compare <button type="button" class="cpsm odpp" aria-label="previous pair"'
       + (k <= 1 ? ' disabled' : '') + '>‹</button><select class="odpk" aria-label="pair">' + opts + '</select>'
       + '<button type="button" class="cpsm odpnx" aria-label="next pair"' + (k >= N - 1 ? ' disabled' : '') + '>›</button>'
-      + '<span class="dim">of ' + N + ' offers ' + esc(j.builder) + ' sent in r' + j.round + '</span></div>';
+      + '<span class="dim">of ' + N + ' offers ' + esc(j.builder) + ' sent in r' + j.round + '</span>'
+      + '<span class="odsfg odsfv" data-k="v">' + [['off', 'this pair'], ['on', 'everything so far']].map(function(z){
+          return '<button type="button" data-v="' + z[0] + '" aria-pressed="' + ((soFar[key] ? 'on' : 'off') === z[0]) + '">' + z[1] + '</button>';
+        }).join('') + '</span></div>';
     function card(x){
       return '<span class="odpo"><i style="background:' + colorOfN(x.n) + '"></i><b>#' + x.n + '</b> +' + x.t_ms + ' ms · score '
         + x.score.toLocaleString() + ' · ' + x.orders + ' orders' + (x.chosen ? ' <span class="tlstar">chosen</span>' : '')
@@ -6692,7 +6705,70 @@ OFFDIFF_JS = r'''
         + '</div><div class="odplists"><div><div class="odch">added in #' + b.n + '</div>' + unitRows(b.added, j.units, addNote)
         + '</div><div><div class="odch">removed (were in #' + (b.vs || a.n) + ')</div>' + unitRows(b.removed, j.units, remNote) + '</div></div>';
     }
-    box.innerHTML = head + '<div class="odpair2">' + card(a) + '<span class="dim">→</span>' + card(b) + '</div>' + body;
+    box.innerHTML = head + '<div class="odpair2">' + card(a) + '<span class="dim">→</span>' + card(b) + '</div>'
+      + (soFar[key] ? soFarHtml(j, k, soFar[key]) : body);
+  }
+  // everything the builder had offered up to and including offer #to, from
+  // the offer-to-offer diffs: when each order first appeared, whether it is
+  // still in #to, and if not, the offer it disappeared in
+  var soFar = {};
+  function soFarHtml(j, k, mode){
+    var cur = {}, first = {}, goneAt = {}, back = {}, to = j.offers[k];
+    for (var i = 0; i <= k; i++) {
+      var o = j.offers[i];
+      if (o.missing) continue;
+      o.added.forEach(function(key){
+        if (goneAt[key]) { back[key] = (back[key] || 0) + 1; delete goneAt[key]; }
+        cur[key] = 1; if (!first[key]) first[key] = o.n;
+      });
+      o.removed.forEach(function(key){ delete cur[key]; goneAt[key] = o.n; });
+    }
+    var inNow = Object.keys(cur), gone = Object.keys(goneAt);
+    var where = {};
+    inNow.forEach(function(key){ sigsOf(j.units[key]).forEach(function(sg){ where[sg] = key; }); });
+    var repack = {};
+    gone.forEach(function(key){
+      var sg = sigsOf(j.units[key]);
+      if (sg.length && sg.every(function(x){ return where[x]; })) repack[key] = where[sg[0]];
+    });
+    var nRe = Object.keys(repack).length;
+    var label = function(key){ var u = j.units[key] || {};
+      return u.kind === 'bundle' ? 'bundle ' + esc((u.bundle || '').slice(0, 10)) + '…' : 'plain tx ' + esc(u.prefix || ''); };
+    var keys = Object.keys(first).filter(function(key){
+      return mode === 'all' || (mode === 'in' ? cur[key] : !cur[key]); });
+    keys.sort(function(a, c){
+      return (cur[a] ? 1 : 0) - (cur[c] ? 1 : 0) || first[a] - first[c] || (a < c ? -1 : 1); });
+    var SHOW = 60;
+    var rows = keys.map(function(key, i){
+      var u = j.units[key] || {}, hide = i >= SHOW ? ' class="odmx" hidden' : '';
+      var what = u.kind === 'bundle'
+        ? 'bundle <span class="dim">' + (u.members || []).length + ' txs</span>' : 'txn';
+      var id = u.kind === 'bundle' ? u.bundle : u.sig;
+      var st = cur[key] ? '<span class="odin">in #' + to.n + '</span>'
+        : repack[key] ? '<span class="dim">removed at #' + goneAt[key] + '</span><div class="odmv">still in #' + to.n
+          + ', inside ' + label(repack[key]) + '</div>'
+        : '<span class="oddn">removed at #' + goneAt[key] + '</span>';
+      return '<tr' + hide + '><td>' + what + '</td><td class="m"><span class="cpv" data-c="' + esc(id || '')
+        + '" role="button" tabindex="0">' + esc((id || '').slice(0, u.kind === 'bundle' ? 16 : 32)) + '…</span></td>'
+        + '<td class="m">' + esc(u.kind === 'bundle' ? ((u.members || [])[0] || {}).prefix || '' : u.prefix || '') + '</td>'
+        + '<td class="n">#' + first[key] + '</td><td>' + st + '</td>'
+        + '<td class="n">' + (back[key] ? 'yes ×' + back[key] : '<span class="dim">—</span>') + '</td></tr>';
+    }).join('');
+    var skipped = j.offers.slice(0, k + 1).filter(function(o){ return o.missing; }).map(function(o){ return '#' + o.n; });
+    return '<div class="odsofar"><div class="odms">by #' + to.n + ': <b>' + Object.keys(first).length
+      + '</b> orders across #1–#' + to.n + ' · <b>' + inNow.length + '</b> in #' + to.n + ' · <b class="oddn">'
+      + (gone.length - nRe) + '</b> removed' + (nRe ? ' · ' + nRe + ' more removed but re-packaged, still in #' + to.n : '')
+      + (skipped.length ? ' · <span class="dim">no contents recorded for ' + skipped.join(', ') + '</span>' : '')
+      + '</div>'
+      + '<div class="odpctl"><span class="dim">show</span><span class="odsfg" data-k="f">'
+      + [['all', 'all'], ['in', 'still in #' + to.n], ['gone', 'removed']].map(function(z){
+          return '<button type="button" data-v="' + z[0] + '" aria-pressed="' + (z[0] === mode) + '">' + z[1] + '</button>';
+        }).join('') + '</span></div>'
+      + (keys.length ? '<div><table class="otab odpl"><tr><th>type</th><th>signature / bundle</th><th>sigprefix</th>'
+        + '<th class="n">first in</th><th>status at #' + to.n + '</th><th class="n">removed, then back</th></tr>' + rows + '</table>'
+        + (keys.length > SHOW ? '<button type="button" class="cpsm odmall">show all ' + keys.length + '</button>' : '') + '</div>'
+        : '<div class="dim odpe">none</div>')
+      + '</div>';
   }
   function stepPair(o, dk){
     var key = pairKey(lastData);
@@ -6899,6 +6975,14 @@ OFFDIFF_JS = r'''
       view[tg.parentNode.getAttribute('data-k')] = tg.getAttribute('data-v');
       tg.parentNode.querySelectorAll('button').forEach(function(z){ z.setAttribute('aria-pressed', String(z === tg)); });
       var o2 = tg.closest('.odres'); if (o2 && lastData) draw(o2);
+      return;
+    }
+    var sf = t.closest && t.closest('.odsfg button');
+    if (sf && lastData) {
+      var g = sf.parentNode.getAttribute('data-k'), kk = pairKey(lastData), v = sf.getAttribute('data-v');
+      if (g === 'v') soFar[kk] = v === 'on' ? (soFar[kk] || 'all') : '';
+      else soFar[kk] = v;
+      renderPair(sf.closest('.odres'));
       return;
     }
     var pp = t.closest && (t.closest('.odpp') || t.closest('.odpnx'));
