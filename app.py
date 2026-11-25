@@ -3167,6 +3167,7 @@ DEP_FREE_PATHS = {HEALTH_PATH, ACCURACY_PATH, ACCURACY_PATH + '/slot',
                   '/tech/offer-timelines', '/tech/offer-timelines/slot',
                   '/tech/offer-diff', '/tech/offer-diff/slot',
                   '/tech/offer-diff/pair', '/tech/offer-diff/progression',
+                  '/tech/offer-diff/builder',
                   '/api/accuracy/export', '/api/accuracy/status',
                   SNAPSHOT_PATH,
                   REWARDS_PATH,
@@ -9532,6 +9533,7 @@ OFFERDIFF_PATH = "/tech/offer-diff"
 OFFERDIFF_PATH_SLOT = OFFERDIFF_PATH + "/slot"
 OFFERDIFF_PATH_PAIR = OFFERDIFF_PATH + "/pair"
 OFFERDIFF_PATH_PROG = OFFERDIFF_PATH + "/progression"
+OFFERDIFF_PATH_BUILD = OFFERDIFF_PATH + "/builder"
 # Our own builders, for highlighting a win in a table full of Titan's.
 OURS_RE = re.compile(r"^ASTRALANE", re.I)
 
@@ -9864,6 +9866,23 @@ def offer_diff_progression(qs):
             relay, clickhouse_main, SOLANA_RPC, slot,
             [u for u in one("u").split(",") if u], one("region") or "all",
             relayer_q=relayer)
+    except ValueError as exc:
+        return {"error": str(exc)[:300]}
+
+
+def offer_diff_builder(qs):
+    """JSON: one builder's every offer in one round, each against the one
+    before it (the winner-progression view's consecutive-offer compare)."""
+    one = lambda k: (qs.get(k, [""])[0] or "").strip()
+    try:
+        slot, rnd = int(one("slot") or "0"), int(one("round") or "-1")
+    except ValueError:
+        slot, rnd = 0, -1
+    if slot <= 0 or rnd < 0 or not one("builder"):
+        return {"error": "need a slot, a round and a builder"}
+    try:
+        return accuracy.builder_progression(relay, clickhouse_main, slot, rnd,
+                                            one("builder"), one("region") or "all")
     except ValueError as exc:
         return {"error": str(exc)[:300]}
 
@@ -10294,6 +10313,7 @@ class Handler(BaseHTTPRequestHandler):
             OFFERDIFF_PATH_SLOT: (self._frag_offerdiff_slot, True),
             OFFERDIFF_PATH_PAIR: (self._frag_offerdiff_pair, True),
             OFFERDIFF_PATH_PROG: (offer_diff_progression, "json"),
+            OFFERDIFF_PATH_BUILD: (offer_diff_builder, "json"),
             DEPLOYHIST_PATH: (self._page_deployments, False),
             lookup.LOOKUP_PATH: (lambda q: lookup_page(q), False),
             SLOTS_PATH: (self._page_slots, False),

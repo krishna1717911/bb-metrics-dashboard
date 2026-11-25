@@ -4348,6 +4348,110 @@ def pair_html(d):
     return "".join(out)
 
 
+# ------------------------------------------------------ builder progression
+#
+# For the winner-progression view's "compare consecutive offers": ONE
+# builder's every offer in one round,
+# in time order, each against the one before it -- what it added, what it
+# removed, and how far its relay score moved. Order-level, from the relay's
+# own record of each offer; nothing is priced or simulated here, so every
+# number is the relay's.
+
+def builder_round_offers(relay_q, connector, slot, rnd, builder, window=None):
+    """{uuid: [item, ...]} for every offer `builder` sent into one round --
+    one query on the table's sort key (connector, slot), not a uuid list."""
+    if window and window[0] and window[1]:
+        f = "%Y-%m-%d %H:%M:%S"
+        bound = (f"ingested_at >= '{window[0]:{f}}' "
+                 f"AND ingested_at <= '{window[1]:{f}}'")
+    else:
+        bound = "ingested_at > now() - INTERVAL 14 DAY"
+    _, rows = relay_q(
+        "SELECT toString(mini_block_uuid) AS uuid, order_index, order_type, "
+        "  base58Encode(signature) AS sig, "
+        "  base58Encode(substring(signature, 1, 16)) AS pfx, "
+        "  bundle_id, bundle_tx_index "
+        f"FROM relay.mini_block_transactions_v2 WHERE {bound} "
+        f"  AND connector_identity = '{_q(connector)}' AND slot = {int(slot)} "
+        f"  AND index_in_slot = {int(rnd)} AND builder_id = '{_q(builder)}' "
+        "ORDER BY uuid, order_index, bundle_tx_index")
+    out = {}
+    for u, oi, ot, sig, pfx, bid, bti in rows:
+        out.setdefault(u, []).append({
+            "order_index": int(oi or 0), "type": ot or "", "sig": sig or "",
+            "prefix": pfx or "", "bundle_id": bid or "",
+            "bundle_tx_index": None if bti in (None, "") else int(bti)})
+    return out
+
+
+def _units_of(items):
+    """An offer's orders: a bundle is one order (keyed by its id, members
+    kept), a plain transaction is one order (keyed by its signature)."""
+    out = {}
+    for it in items:
+        if it["bundle_id"]:
+            u = out.setdefault("b:" + it["bundle_id"], {
+                "kind": "bundle", "bundle": it["bundle_id"], "members": []})
+            u["members"].append({"sig": it["sig"], "prefix": it["prefix"]})
+        else:
+            out.setdefault("t:" + it["sig"], {
+                "kind": "txn", "sig": it["sig"], "prefix": it["prefix"]})
+    return out
+
+
+def builder_progression(relay_q, ch, slot, rnd, builder, region="all"):
+    """Every offer `builder` made in round `rnd` of `slot`, in time order,
+    with what each added and removed against the one before it."""
+    win = slot_window(relay_q, slot)
+    tl = slot_timeline(relay_q, slot, win, region=region)
+    rd = next((r for r in tl.get("rounds") or [] if r["idx"] == int(rnd)), None)
+    if rd is None:
+        raise ValueError("round %s of slot %d is not in the relay's store" % (rnd, slot))
+    offs = sorted((o for o in rd["offers"] if o["builder"] == builder),
+                  key=lambda o: o["at"])
+    if not offs:
+        raise ValueError("%s sent no offer in r%s of slot %d" % (builder, rnd, slot))
+    conn = offs[0].get("connector") or tl.get("connector") or ""
+    contents = builder_round_offers(relay_q, conn, slot, rnd, builder, win)
+    prev, seen, steps, used, last_units, prev_n = None, set(), [], {}, {}, 0
+    for k, o in enumerate(offs):
+        items = contents.get(o["uuid"])
+        units = _units_of(items or [])
+        keys = set(units)
+        if items is None:
+            add = rem = []
+        else:
+            add = sorted(keys - prev) if prev is not None else sorted(keys)
+            rem = sorted(prev - keys) if prev is not None else []
+        for key in add + rem:
+            used[key] = units.get(key) or used.get(key)
+        # a removed order's detail comes from the offer that last had it
+        for key in rem:
+            if used.get(key) is None:
+                used[key] = last_units.get(key)
+        readded = [key for key in add if key in seen]
+        steps.append({
+            "uuid": o["uuid"], "n": k + 1,
+            "t_ms": None if o.get("t_ms") is None else round(o["t_ms"], 2),
+            "score": o["bid"], "fees": o.get("fees"), "jito": o.get("jito"),
+            "pay": o.get("pay"), "cost": o["cost"], "orders": o["n"],
+            "graded": o.get("reason") or "", "chosen": bool(o.get("chosen")),
+            "missing": items is None, "units": len(keys),
+            "txs": sum(1 if u["kind"] == "txn" else len(u["members"])
+                       for u in units.values()),
+            "added": add, "removed": rem, "readded": len(readded),
+            # the offer this one is diffed against: the previous one whose
+            # contents the relay recorded (0 = none, the first)
+            "vs": prev_n})
+        if items is not None:
+            seen |= keys
+            prev, last_units, prev_n = keys, units, k + 1
+    return {"slot": slot, "round": int(rnd), "builder": builder,
+            "connector": conn, "winner": rd.get("won_by") or "",
+            "chosen_ms": None if rd.get("chosen_ms") is None else round(rd["chosen_ms"], 1),
+            "offers": steps, "units": used}
+
+
 # ------------------------------------------------------ winner progression
 #
 # The offer diff page's second mode: several offers from one round's
@@ -5827,6 +5931,30 @@ svg .om.opkdim{opacity:.16}
 .odkey i{display:inline-block;width:14px;height:10px;border-radius:2px;margin-left:8px;
   border:1px solid var(--line3)}
 .odkey i.below{background:radial-gradient(var(--accent-main) 1px,transparent 1.3px) 0 0/4px 4px;opacity:.7}
+
+/* winner progression: compare consecutive offers */
+.odpair{margin:18px 0 6px;padding:14px 16px;border:1px solid var(--line);border-radius:10px;
+  background:var(--surface)}
+.odpair .odch{margin-bottom:10px}
+.odpctl{display:flex;flex-wrap:wrap;align-items:center;gap:8px;font-size:13px;margin-bottom:10px}
+.odpctl select{min-width:260px}
+.odpctl .cpsm{background:var(--surface);color:var(--text);border:1px solid var(--line2);
+  border-radius:999px;padding:3px 12px;font:inherit;font-size:14px;cursor:pointer}
+.odpctl .cpsm:disabled{opacity:.35;cursor:default}
+.odpair2{display:flex;flex-wrap:wrap;align-items:center;gap:8px 12px;font-size:12.5px;margin:4px 0 8px}
+.odpo{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border:1px solid var(--line2);
+  border-radius:999px}
+.odpo i{width:9px;height:9px;border-radius:50%}
+.odpk2{margin:8px 0 10px!important}
+.odpk2 .kpi .kv{font-size:19px}
+.odplists{display:grid;gap:14px;grid-template-columns:repeat(auto-fit,minmax(380px,1fr))}
+.odplists .odch{font-size:12px;margin:2px 0 4px}
+.odpe{font-size:12.5px;padding:4px 0}
+.odmv{font-size:11.5px;color:var(--text3);margin-top:2px}
+.odplists .odmall{margin-top:6px;background:var(--surface);color:var(--text);
+  border:1px solid var(--line2);border-radius:999px;padding:3px 12px;font:inherit;font-size:12.5px;cursor:pointer}
+.odpair .odup{color:var(--good)}
+.odpair .oddn{color:var(--bad)}
 /* offer diff: winner progression */
 .odbar select.odmode{font-weight:600}
 .odbar [hidden]{display:none!important}
@@ -6439,9 +6567,137 @@ OFFDIFF_JS = r'''
       + '<div class="odcard"><div class="odch">reward by declared CU</div><div class="odplot" data-c="decl"></div></div>'
       + '<div class="odcard"><div class="odch">reward by consumed CU</div><div class="odplot" data-c="used"></div></div>'
       + '<div class="odcard odwide"><div class="odch">transactions by CU <span class="dim odcb"></span></div><div class="odplot" data-c="count"></div></div>'
-      + '</div></div>';
+      + '</div>'
+      + '<div class="odpair"><div class="odch">compare consecutive offers <span class="dim">every offer the winner sent in this round, each against the one before it</span></div>'
+      + '<div class="odpairc"></div></div></div>';
     draw(o);
+    loadPair(o);
     if (!stay) o.scrollIntoView({behavior: 'smooth', block: 'start'});
+  }
+  // ---------------------------------------------------------------- consecutive pair
+  // Every offer of the winner in this round (not only the picks), each
+  // against the one before it; the user steps through #k -> #k+1.
+  var buildCache = {}, pairK = {};
+  function pairKey(d){ return d.slot + '|' + d.round + '|' + d.builder; }
+  function colorOfN(n){ var p = palette(Math.max(n, 1)); return p[n - 1]; }
+  function loadPair(o){
+    var d = lastData, key = pairKey(d), box = o.querySelector('.odpairc');
+    if (!box) return;
+    if (buildCache[key]) { renderPair(o); return; }
+    box.innerHTML = '<div class="dmeta">reading every offer ' + esc(d.builder) + ' sent in r' + d.round + '…</div>';
+    var b = bar(String(d.slot));
+    fetch('/tech/offer-diff/builder?slot=' + encodeURIComponent(d.slot) + '&round=' + encodeURIComponent(d.round)
+          + '&builder=' + encodeURIComponent(d.builder)
+          + '&region=' + encodeURIComponent((b && b.getAttribute('data-region')) || 'all'))
+      .then(function(r){ return r.json(); })
+      .then(function(j){
+        buildCache[key] = j;
+        if (lastData && pairKey(lastData) === key) renderPair(o);
+      })
+      .catch(function(e){ box.innerHTML = '<div class="dmeta">could not load: ' + esc(e) + '</div>'; });
+  }
+  function sigsOf(u){
+    return !u ? [] : u.kind === 'bundle' ? (u.members || []).map(function(m){ return m.sig; }) : [u.sig];
+  }
+  // a removed order whose transactions all sit in an added order of the
+  // other offer was re-packaged, not dropped (a plain tx wrapped into a
+  // bundle with its backrun, or a bundle unwrapped / re-bundled)
+  function moves(from, to, units){
+    var where = {}, out = {};
+    to.forEach(function(k){ sigsOf(units[k]).forEach(function(sg){ where[sg] = k; }); });
+    from.forEach(function(k){
+      var sg = sigsOf(units[k]); if (!sg.length) return;
+      var hit = sg.map(function(x){ return where[x]; });
+      if (hit.every(function(x){ return x; })) out[k] = hit[0];
+    });
+    return out;
+  }
+  function unitRows(keys, units, note){
+    var SHOW = 40;
+    if (!keys.length) return '<div class="dim odpe">none</div>';
+    return '<div><table class="otab odpl"><tr><th>type</th><th>signature / bundle</th><th>sigprefix</th></tr>'
+      + keys.map(function(key, i){
+        var u = units[key] || {}, hide = i >= SHOW ? ' class="odmx" hidden' : '';
+        var nt = note && note[key] ? '<div class="odmv">' + note[key] + '</div>' : '';
+        if (u.kind === 'bundle') {
+          var m0 = (u.members || [])[0] || {};
+          return '<tr' + hide + '><td>bundle <span class="dim">' + (u.members || []).length + ' txs</span></td>'
+            + '<td class="m"><span class="cpv" data-c="' + esc(u.bundle) + '" role="button" tabindex="0">'
+            + esc((u.bundle || '').slice(0, 16)) + '…</span>' + nt + '</td><td class="m">' + esc(m0.prefix || '') + '</td></tr>';
+        }
+        return '<tr' + hide + '><td>txn</td><td class="m"><span class="cpv" data-c="' + esc(u.sig || '') + '" role="button" tabindex="0">'
+          + esc((u.sig || '').slice(0, 32)) + '…</span>' + nt + '</td><td class="m">' + esc(u.prefix || '') + '</td></tr>';
+      }).join('') + '</table>'
+      + (keys.length > SHOW ? '<button type="button" class="cpsm odmall">show all ' + keys.length + '</button>' : '')
+      + '</div>';
+  }
+  function delta(v, unit){
+    if (v == null) return '<span class="dim">—</span>';
+    var c = v > 0 ? 'odup' : v < 0 ? 'oddn' : 'dim';
+    return '<span class="' + c + '">' + (v > 0 ? '+' : v < 0 ? '−' : '±0 ') + (v ? Math.abs(v).toLocaleString() : '') + (unit || '') + '</span>';
+  }
+  function renderPair(o){
+    var d = lastData, key = pairKey(d), j = buildCache[key], box = o.querySelector('.odpairc');
+    if (!box || !j) return;
+    if (j.error) { box.innerHTML = '<div class="dmeta aqcap">' + esc(j.error) + '</div>'; return; }
+    var N = j.offers.length;
+    if (N < 2) { box.innerHTML = '<div class="dim">' + esc(j.builder) + ' sent a single offer in this round: nothing to compare.</div>'; return; }
+    var k = Math.min(Math.max(pairK[key] || 1, 1), N - 1);
+    pairK[key] = k;
+    var a = j.offers[k - 1], b = j.offers[k];
+    var opts = j.offers.slice(0, N - 1).map(function(x, i){
+      var y = j.offers[i + 1];
+      return '<option value="' + (i + 1) + '"' + (i + 1 === k ? ' selected' : '') + '>#' + x.n + ' → #' + y.n
+        + '  (+' + x.t_ms + ' → +' + y.t_ms + ' ms' + (y.chosen ? ', chosen' : '')
+        + (function(){ var mvn = Object.keys(moves(y.removed, y.added, j.units)).length, g = y.removed.length - mvn;
+            return (g ? ', −' + g + ' dropped' : '') + (mvn ? ', ' + mvn + ' re-packaged' : ''); })() + ')</option>';
+    }).join('');
+    var head = '<div class="odpctl">compare <button type="button" class="cpsm odpp" aria-label="previous pair"'
+      + (k <= 1 ? ' disabled' : '') + '>‹</button><select class="odpk" aria-label="pair">' + opts + '</select>'
+      + '<button type="button" class="cpsm odpnx" aria-label="next pair"' + (k >= N - 1 ? ' disabled' : '') + '>›</button>'
+      + '<span class="dim">of ' + N + ' offers ' + esc(j.builder) + ' sent in r' + j.round + '</span></div>';
+    function card(x){
+      return '<span class="odpo"><i style="background:' + colorOfN(x.n) + '"></i><b>#' + x.n + '</b> +' + x.t_ms + ' ms · score '
+        + x.score.toLocaleString() + ' · ' + x.orders + ' orders' + (x.chosen ? ' <span class="tlstar">chosen</span>' : '')
+        + ' <span class="dim">graded ' + esc(x.graded) + '</span></span>';
+    }
+    var body;
+    if (b.missing) {
+      body = '<div class="odmiss warn">The relay recorded no contents for #' + b.n + ' (graded ' + esc(b.graded)
+        + '), so its orders cannot be compared. Its score moved ' + delta(b.score - a.score) + '.</div>';
+    } else {
+      var note = b.vs && b.vs !== a.n
+        ? '<div class="odmiss warn">#' + a.n + '’s contents were not recorded, so #' + b.n + ' is diffed against #' + b.vs
+          + ', the last offer whose contents the relay has.</div>' : '';
+      var kept = b.units - b.added.length;
+      var mv = moves(b.removed, b.added, j.units), back = moves(b.added, b.removed, j.units);
+      var label = function(k){ var u = j.units[k] || {};
+        return u.kind === 'bundle' ? 'bundle ' + esc((u.bundle || '').slice(0, 10)) + '…' : 'plain tx ' + esc(u.prefix || ''); };
+      var remNote = {}, addNote = {};
+      Object.keys(mv).forEach(function(k){ remNote[k] = 'still in #' + b.n + ', moved into ' + label(mv[k]); });
+      Object.keys(back).forEach(function(k){ addNote[k] = 're-packaged from ' + label(back[k]) + ' of #' + (b.vs || a.n); });
+      var nMv = Object.keys(mv).length, gone = b.removed.length - nMv;
+      var t = function(l, v, s){ return '<div class="kpi"><div class="kl">' + l + '</div><div class="kv">' + v + '</div>'
+        + (s ? '<div class="ks">' + s + '</div>' : '') + '</div>'; };
+      body = note + '<div class="kpirow odpk2">'
+        + t('relay score', delta(b.score - a.score), a.score.toLocaleString() + ' → ' + b.score.toLocaleString())
+        + t('protocol fees', delta((b.fees || 0) - (a.fees || 0)), (a.fees || 0).toLocaleString() + ' → ' + (b.fees || 0).toLocaleString())
+        + t('Jito tips (raw)', delta((b.jito || 0) - (a.jito || 0)), (a.jito || 0).toLocaleString() + ' → ' + (b.jito || 0).toLocaleString())
+        + t('builder payment', delta((b.pay || 0) - (a.pay || 0)), (a.pay || 0).toLocaleString() + ' → ' + (b.pay || 0).toLocaleString())
+        + t('orders kept', kept.toLocaleString(), 'of #' + (b.vs || a.n) + '’s ' + (b.units - b.added.length + b.removed.length))
+        + t('added', '<span class="odup">+' + b.added.length + '</span>', b.readded ? b.readded + ' had been in an earlier offer' : 'new to this round’s offers')
+        + t('removed', '<span class="' + (gone ? 'oddn' : 'dim') + '">−' + gone + '</span>',
+            nMv ? 'dropped outright; ' + nMv + ' more re-packaged, still in #' + b.n : 'were in #' + (b.vs || a.n))
+        + t('time between', '+' + (b.t_ms - a.t_ms).toFixed(2) + ' ms', '')
+        + '</div><div class="odplists"><div><div class="odch">added in #' + b.n + '</div>' + unitRows(b.added, j.units, addNote)
+        + '</div><div><div class="odch">removed (were in #' + (b.vs || a.n) + ')</div>' + unitRows(b.removed, j.units, remNote) + '</div></div>';
+    }
+    box.innerHTML = head + '<div class="odpair2">' + card(a) + '<span class="dim">→</span>' + card(b) + '</div>' + body;
+  }
+  function stepPair(o, dk){
+    var key = pairKey(lastData);
+    pairK[key] = (pairK[key] || 1) + dk;
+    renderPair(o);
   }
   function toggle(u){
     hidden[u] = !hidden[u];
@@ -6645,12 +6901,16 @@ OFFDIFF_JS = r'''
       var o2 = tg.closest('.odres'); if (o2 && lastData) draw(o2);
       return;
     }
+    var pp = t.closest && (t.closest('.odpp') || t.closest('.odpnx'));
+    if (pp && !pp.disabled) { stepPair(pp.closest('.odres'), pp.classList.contains('odpp') ? -1 : 1); return; }
     var tr = t.closest && t.closest('.odpt tr[data-u]');
     if (tr) {
       toggle(tr.getAttribute('data-u'));
     }
   });
   document.addEventListener('change', function(ev){
+    var pk = ev.target.closest && ev.target.closest('.odpk');
+    if (pk && lastData) { pairK[pairKey(lastData)] = +pk.value; renderPair(pk.closest('.odres')); return; }
     var m = ev.target.closest && ev.target.closest('.odmode');
     if (!m) return;
     mode = m.value === 'prog' ? 'prog' : 'diff';
