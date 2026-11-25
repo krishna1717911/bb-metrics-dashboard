@@ -9790,7 +9790,7 @@ def offer_timeline_page(qs, diff=False):
                               connectors=opts)
     if diff:
         body += ('<div class="aqhead">Open a slot, then click two offers in '
-                 "its race (or two rows' <b>pick</b>): A, then B. The diff "
+                 "its race: A, then B. The diff "
                  "lists what each offer carries that the other does not, "
                  "what each order pays as the relay scores it, and for an "
                  "offer of ours, why it left the other's orders out. A third "

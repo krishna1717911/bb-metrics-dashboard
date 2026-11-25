@@ -4151,7 +4151,7 @@ def pair_bar_html(slot, region="all"):
             '<option value="diff">offer diff</option>'
             '<option value="prog">winner progression</option></select>'
             '<span class="odm-diff odpick odA"><b>A</b> <i>click an offer in '
-            "the race or a row's pick</i></span>"
+            "the race</i></span>"
             '<span class="odm-diff odpick odB"><b>B</b> <i>then a second one</i></span>'
             '<button type="button" class="cpsm odm-diff odswap">swap</button>'
             '<span class="odm-prog odchips" hidden></span>'
@@ -5408,7 +5408,10 @@ def timeline_html(d, names=None, pick=False, region="all"):
             + "</div>")
     out.append(race_html(d, pick))
     if pick:
+        # the offer diff page: the race and the picker only -- the per-round
+        # offer tables below stay on the offer timelines page
         out.append(pair_bar_html(d["slot"], region))
+        return "".join(out)
     for rnd in d["rounds"]:
         n = len(rnd["offers"])
         head = (f'<div class="rhead">round {rnd["idx"]} &middot; '
@@ -6329,7 +6332,7 @@ OFFDIFF_JS = r'''
       b.querySelectorAll('.odm-diff').forEach(function(x){ x.hidden = mode !== 'diff'; });
       b.querySelectorAll('.odm-prog').forEach(function(x){ x.hidden = mode !== 'prog'; });
       var mine = sel.length && sel[0].slot === slot;
-      [['.odA', 0, 'click an offer in the race or a row’s pick'],
+      [['.odA', 0, 'click an offer in the race'],
        ['.odB', 1, 'then a second one']].forEach(function(z){
         var el = b.querySelector(z[0]), s = mine ? sel[z[1]] : null;
         el.classList.toggle('set', !!s);
