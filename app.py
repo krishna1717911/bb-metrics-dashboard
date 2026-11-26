@@ -4066,11 +4066,28 @@ OFFERS_JS = r"""
 // executes, so that page loads this once and re-invokes it after each
 // expansion. The slot explorer still gets the immediate call below, so
 // its behaviour is unchanged.
+// Every slot panel carries its own #offdata/#offwrap pair (ids repeat once
+// several slots are expanded), so each data block is drawn into the wrap of
+// its own container, once. A getElementById lookup only ever found the first
+// pair and left every later slot's race empty.
 window.__renderOffers = function(){
-  var el = document.getElementById('offdata');
-  if(!el) return;
+  document.querySelectorAll('script[id="offdata"]').forEach(function(el){
+    var box = el.parentNode;
+    var wrap = box && box.querySelector('[id="offwrap"]');
+    if(!wrap || wrap.getAttribute('data-drawn')) return;
+    wrap.setAttribute('data-drawn', '1');
+    __renderOne(el, wrap, box.querySelector('[id="offzoomall"]'));
+  });
+  // one listener for the life of the page, however many times we re-render
+  if (!window.__offResized){
+    window.__offResized = true;
+    window.addEventListener('resize', function(){
+      (window.__offCards || []).forEach(function(c){ c._draw(); });
+    });
+  }
+};
+function __renderOne(el, wrap, all){
   var D = JSON.parse(el.textContent);
-  var wrap = document.getElementById('offwrap');
   var NS = 'http://www.w3.org/2000/svg';
   // Time runs DOWN. The spine is the round's clock; each builder gets a column
   // beside it and one bullet per offer, so two builders bidding in the same
@@ -4325,7 +4342,6 @@ window.__renderOffers = function(){
   var cards = D.rounds.map(facet);
   // one control for the lot, because chasing the same button down eight
   // rounds is the whole reason this is annoying
-  var all = document.getElementById('offzoomall');
   if(all) ZOOMS.forEach(function(z){
     var b = document.createElement('button');
     b.type = 'button';
@@ -4339,15 +4355,11 @@ window.__renderOffers = function(){
     });
     all.appendChild(b);
   });
-  // one listener for the life of the page, however many times we re-render
-  window.__offCards = cards;
-  if (!window.__offResized){
-    window.__offResized = true;
-    window.addEventListener('resize', function(){
-      (window.__offCards || []).forEach(function(c){ c._draw(); });
-    });
-  }
-};
+  // keep the cards of every race still on the page; drop collapsed ones
+  window.__offCards = (window.__offCards || []).filter(function(c){
+    return c.isConnected;
+  }).concat(cards);
+}
 window.__renderOffers();
 """
 
